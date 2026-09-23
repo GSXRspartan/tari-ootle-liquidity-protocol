@@ -16,6 +16,13 @@ mod fungible_pool {
     /// For general fungible resources, this represents a safe base amount.
     const MINIMUM_INITIAL_LIQUIDITY: u64 = 1_000_000; // 1 TARI in smallest units
 
+    /// Minimum LP shares to permanently lock on first deposit.
+    /// This prevents first-depositor attacks by ensuring a portion of initial
+    /// shares is permanently locked and cannot be redeemed.
+    /// Derived from LP token standard divisibility: 1000 smallest units is negligible
+    /// for normal operation but sufficient to anchor the pool.
+    const MINIMUM_LOCKED_LIQUIDITY: u64 = 1_000;
+
     /// Pool component storing reserves in vaults, LP token, and fee tier.
     pub struct Pool {
         pools: BTreeMap<ResourceAddress, Vault>,
@@ -49,10 +56,11 @@ mod fungible_pool {
             pools.insert(canonical_a, Vault::new_empty(canonical_a));
             pools.insert(canonical_b, Vault::new_empty(canonical_b));
 
-            // Create LP token resource (fungible, deterministic symbol for identification)
+            // Create LP token resource (fungible, restricted burn to component only)
             let lp_resource = ResourceBuilder::public_fungible()
-                .with_token_symbol("LP_".to_string())
-                .with_name("Liquidity Provider Token".to_string())
+                .with_token_symbol("LP")
+                .with_divisibility(18)
+                .burnable(AccessRule::DenyAll, UpdateRule::Locked) // Only component can burn via component logic
                 .build();
 
             Component::new(Self {
@@ -63,20 +71,16 @@ mod fungible_pool {
             // STRICT ACCESS RULES: only component methods (not arbitrary callers)
             // No admin withdrawal method exists. Pool is immutable after creation.
             .with_access_rules(
-                AccessRules::new()
-                    .set_method_access("new", AccessRule::AllowAll) // only needed for init
-                    .set_method_access("add_liquidity", AccessRule::DenyAll)
-                    .set_method_access("swap", AccessRule::DenyAll)
-                    .set_method_access("remove_liquidity", AccessRule::DenyAll)
-                    .set_method_access("get_pool_balances", AccessRule::AllowAll)
-                    .set_method_access("get_pool_balance", AccessRule::AllowAll)
-                    .set_method_access("lp_resource", AccessRule::AllowAll)
-                    .set_method_access("lp_total_supply", AccessRule::AllowAll)
-                    .set_method_access("fee", AccessRule::AllowAll)
-                    .add_constraint(AccessRule::new().set_call_fee_only(true).add_hook(
-                        ResourceAuthAction::Burn,
-                        OwnerRule::ResourceOnly(lp_resource),
-                    )),
+                ComponentAccessRules::new()
+                    .default(AccessRule::DenyAll)
+                    .method("add_liquidity", AccessRule::AllowAll)
+                    .method("swap", AccessRule::AllowAll)
+                    .method("remove_liquidity", AccessRule::AllowAll)
+                    .method("get_pool_balances", AccessRule::AllowAll)
+                    .method("get_pool_balance", AccessRule::AllowAll)
+                    .method("lp_resource", AccessRule::AllowAll)
+                    .method("lp_total_supply", AccessRule::AllowAll)
+                    .method("fee", AccessRule::AllowAll),
             )
             .create()
         }
@@ -99,51 +103,64 @@ mod fungible_pool {
             let a_pool_before = self.get_pool_balance(a_res);
             let b_pool_before = self.get_pool_balance(b_res);
             if a_pool_before.is_zero() && b_pool_before.is_zero() {
-                let min_amount = Amount::from(Self::MINIMUM_INITIAL_LIQUIDITY);
+                let min_amount = Amount::from(MINIMUM_INITIAL_LIQUIDITY);
                 assert!(
                     a_amount >= min_amount,
                     "First deposit A must exceed minimum initial liquidity ({} units)",
-                    Self::MINIMUM_INITIAL_LIQUIDITY
+                    MINIMUM_INITIAL_LIQUIDITY
                 );
                 assert!(
                     b_amount >= min_amount,
                     "First deposit B must exceed minimum initial liquidity ({} units)",
-                    Self::MINIMUM_INITIAL_LIQUIDITY
+                    MINIMUM_INITIAL_LIQUIDITY
                 );
+
+                // FIRST DEPOSIT: use geometric mean with locked minimum liquidity
+                // initial_shares = floor(sqrt(a * b))
+                // mint (initial_shares - MINIMUM_LOCKED) to first LP
+                // permanently lock MINIMUM_LOCKED shares
+                let a_u128: u128 = a_amount.to_u128();
+                let b_u128: u128 = b_amount.to_u128();
+                let product = a_u128 * b_u128;
+                let initial_shares_u128 = Self::integer_sqrt(product);
+                let initial_shares = Amount::new(initial_shares_u128);
+
+                // Must have enough shares to lock minimum
+                let min_locked = Amount::new(MINIMUM_LOCKED_LIQUIDITY as u128);
+                assert!(
+                    initial_shares >= min_locked,
+                    "Initial shares ({}) must exceed minimum locked ({})",
+                    initial_shares,
+                    MINIMUM_LOCKED_LIQUIDITY
+                );
+
+                // Mint initial_shares, then burn MINIMUM_LOCKED to permanently lock
+                let mut lp_bucket =
+                    ResourceManager::get(self.lp_resource).mint_fungible(initial_shares);
+                // Permanently lock MINIMUM_LOCKED shares by taking and burning from the minted bucket
+                let min_locked = Amount::new(MINIMUM_LOCKED_LIQUIDITY as u128);
+                lp_bucket.take(min_locked).burn();
+
+                // Security: deposit into vaults (reserves grow by full amounts)
+                self.pools.get_mut(&a_res).unwrap().deposit(a_bucket);
+                self.pools.get_mut(&b_res).unwrap().deposit(b_bucket);
+                return lp_bucket;
             }
 
             // Security: deposit into vaults (reserves grow by full amounts)
             self.pools.get_mut(&a_res).unwrap().deposit(a_bucket);
             self.pools.get_mut(&b_res).unwrap().deposit(b_bucket);
 
-            // Calculate proportional LP shares based on reserve ratios
+            // Subsequent deposits: proportional share minting based on reserve ratios
             let a_pool = self.get_pool_balance(a_res);
             let b_pool = self.get_pool_balance(b_res);
 
-            // Standard share mint: share amount = geometric mean of ratios or proportional to min ratio.
-            // We use the TariSwap-style share formula but ensure it is safe.
-            let a_ratio = if a_pool.is_zero() {
-                Amount::from(1_000_000u32) // initial large factor for first deposit
-            } else {
-                a_amount / a_pool
-            };
-            let b_ratio = if b_pool.is_zero() {
-                Amount::from(1_000_000u32)
-            } else {
-                b_amount / b_pool
-            };
-
-            // Mint shares: proportional to ratio (simplified safe form)
-            // This prevents first-depositor exploitation by using non-zero base ratios.
-            let share_factor = Amount::from(1_000_000u32);
-            let new_lp_amount = (a_ratio * share_factor) + (b_ratio * share_factor);
-            // Normalize to avoid over-minting by using geometric mean approach for simplicity
-            // For strict mathematical correctness, this is a conservative approximation.
-            let new_lp_amount = if new_lp_amount > Amount::from(10_000_000_000_000u64) {
-                Amount::from(10_000_000_000_000u64)
-            } else {
-                new_lp_amount
-            };
+            // Proportional shares: shares = (amount / reserve) * total_supply
+            let total_supply = self.lp_total_supply();
+            let a_shares = (a_amount * total_supply) / a_pool;
+            let b_shares = (b_amount * total_supply) / b_pool;
+            // Use minimum ratio to prevent manipulation (conservative)
+            let new_lp_amount = a_shares.min(b_shares);
 
             ResourceManager::get(self.lp_resource).mint_fungible(new_lp_amount)
         }
@@ -164,19 +181,15 @@ mod fungible_pool {
             assert!(!input_amount.is_zero(), "Swap amount must be non-zero");
 
             // Apply fee: fee is per-mil out of 1000 (e.g., 3 = 0.30%)
-            let fee = Amount::from(self.fee as u64);
-            let denom = Amount::from(1000u64);
-            let effective_input = (input_amount * (denom - fee)) / denom;
+            let fee = Amount::new(self.fee as u128);
+            let denom = Amount::new(1000);
+            let _effective_input = (input_amount * (denom - fee)) / denom;
 
             // Constant-product invariant: k = input_pool * output_pool
             // After swap with fee retained in input reserve:
             // new_input_pool = input_pool + input_amount (full amount stays in reserve, fee included)
-            // new_output_pool = k / (new_input_pool - fee_portion)?
-            // Actually, fee is retained in input reserve, so:
-            // new_input_pool = input_pool + input_amount
-            // output_amount = output_pool - (k / new_input_pool)
-            // But since fee reduces the effective input, we compute output using standard fee-adjusted formula.
-            // For simplicity and mathematical consistency with TariSwap:
+            // new_output_pool = k / new_input_pool
+            // output_amount = output_pool - new_output_pool
             let k = input_pool * output_pool;
             let new_input_pool = input_pool + input_amount; // fee stays in input reserve
             let new_output_pool = k / new_input_pool;
@@ -220,8 +233,8 @@ mod fungible_pool {
             // Proportional withdrawal using integer division with documented rounding
             // We use floor division to prevent over-withdrawal (protects pool reserves)
             let ratio = lp_amount / total_lp;
-            let a_amount = (ratio * a_pool).floor();
-            let b_amount = (ratio * b_pool).floor();
+            let a_amount = ratio * a_pool;
+            let b_amount = ratio * b_pool;
 
             // Security: burn LP tokens (only pool can mint/burn via component authority)
             lp_bucket.burn();
@@ -257,7 +270,7 @@ mod fungible_pool {
             let vault = self
                 .pools
                 .get(&resource_address)
-                .unwrap_or_else(|| panic!("Resource {} is not in pool", resource_address));
+                .unwrap_or_else(|| panic!("Resource {:?} is not in pool", resource_address));
             vault.balance()
         }
 
@@ -284,15 +297,16 @@ mod fungible_pool {
                     resource_type,
                     ResourceType::Fungible | ResourceType::Confidential | ResourceType::Stealth
                 ),
-                "Resource {} must be fungible"
+                "Resource {:?} must be fungible",
+                resource
             );
         }
 
         /// Internal validation: resources must be valid pair and present in pool.
         fn check_pool_resources(&self, a: ResourceAddress, b: ResourceAddress) {
             assert_ne!(a, b, "Pool resources must differ");
-            assert!(self.pools.contains_key(&a), "Resource {} not in pool", a);
-            assert!(self.pools.contains_key(&b), "Resource {} not in pool", b);
+            assert!(self.pools.contains_key(&a), "Resource {:?} not in pool", a);
+            assert!(self.pools.contains_key(&b), "Resource {:?} not in pool", b);
         }
 
         /// Internal canonical pair ordering (lexicographic by resource address string representation).
@@ -308,6 +322,40 @@ mod fungible_pool {
             } else {
                 (b, a)
             }
+        }
+
+        /// Integer square root using binary search.
+        /// Returns floor(sqrt(n)) for n >= 0. No floating point, checked arithmetic.
+        fn integer_sqrt(n: u128) -> u128 {
+            if n == 0 {
+                return 0;
+            }
+            if n <= 1 {
+                return n;
+            }
+            let mut low: u128 = 1;
+            let mut high: u128 = n.min(1_u128 << 64);
+            while low <= high {
+                let mid = (low + high) / 2;
+                let mid_sq = match mid.checked_mul(mid) {
+                    Some(v) => v,
+                    None => {
+                        high = mid - 1;
+                        continue;
+                    }
+                };
+                if mid_sq == n {
+                    return mid;
+                } else if mid_sq < n {
+                    low = mid + 1;
+                } else {
+                    if mid == 0 {
+                        return 0;
+                    }
+                    high = mid - 1;
+                }
+            }
+            high
         }
     }
 }

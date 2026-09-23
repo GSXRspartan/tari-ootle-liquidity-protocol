@@ -7,17 +7,14 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-# Referenced from upstream tari-ootle repository when building in proper environment
-# These paths assume the template is built within the tari-ootle workspace
-# or with cargo install tari-template-lib
-
-tari_template_abi = { path = "../../bindings/template_abi" }
-tari_template_lib = { path = "../../template_lib" }
-
-# If building standalone with installed crates:
-# tari_template_abi = { version = "0.40", package = "tari_template_abi" }
-# tari_template_lib = { version = "0.40", package = "tari_template_lib" }
+# Pinned to development HEAD (2d6083e6cc7c98cde93dacebe2fb76b17703f588) for compatibility with local C:\tmp-tari checkout
+tari_template_abi = { git = "https://github.com/tari-project/tari-ootle.git", rev = "2d6083e6cc7c98cde93dacebe2fb76b17703f588" }
+tari_template_lib = { git = "https://github.com/tari-project/tari-ootle.git", rev = "2d6083e6cc7c98cde93dacebe2fb76b17703f588" }
 
 [profile.release]
 opt-level = "z"
 lto = true
+panic = "abort"
+
+[features]
+default = []
