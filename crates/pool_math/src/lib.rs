@@ -39,6 +39,7 @@ fn safe_mul_u64(a: u64, b: u64) -> Result<u64, PoolMathError> {
     Ok(result as u64)
 }
 
+#[allow(dead_code)]
 fn safe_div_u64(a: u64, b: u64) -> Result<u64, PoolMathError> {
     if b == 0 {
         return Err(PoolMathError::ZeroReserve);
@@ -59,6 +60,41 @@ fn safe_add_u64(a: u64, b: u64) -> Result<u64, PoolMathError> {
         return Err(PoolMathError::Overflow);
     }
     Ok(result as u64)
+}
+
+/// Integer square root using binary search.
+/// Returns floor(sqrt(n)) for n >= 0.
+/// No floating point, checked arithmetic, O(log n) steps.
+pub fn integer_sqrt(n: u128) -> u128 {
+    if n == 0 {
+        return 0;
+    }
+    if n <= 1 {
+        return n;
+    }
+    let mut low: u128 = 1;
+    let mut high: u128 = n.min(1_u128 << 64);
+    while low <= high {
+        let mid = (low + high) / 2;
+        let mid_sq = match mid.checked_mul(mid) {
+            Some(v) => v,
+            None => {
+                high = mid - 1;
+                continue;
+            }
+        };
+        if mid_sq == n {
+            return mid;
+        } else if mid_sq < n {
+            low = mid + 1;
+        } else {
+            if mid == 0 {
+                return 0;
+            }
+            high = mid - 1;
+        }
+    }
+    high
 }
 
 /// Calculate the fee-adjusted input amount.
@@ -185,7 +221,9 @@ pub fn verify_swap_invariant(
 /// Example: 30 = 0.30%.
 pub fn compute_fee_amount(amount: u64, fee_basis_points: u32) -> Result<u64, PoolMathError> {
     if fee_basis_points > FEE_DENOMINATOR {
-        return Err(PoolMathError::InvalidFee { fee: fee_basis_points });
+        return Err(PoolMathError::InvalidFee {
+            fee: fee_basis_points,
+        });
     }
     let amount_128 = amount as u128;
     let fee_128 = fee_basis_points as u128;
@@ -327,5 +365,70 @@ mod tests {
     fn test_compute_fee_amount() {
         assert_eq!(compute_fee_amount(10000, 30).unwrap(), 30);
         assert_eq!(compute_fee_amount(1, 30).unwrap(), 0); // rounds down
+    }
+
+    #[test]
+    fn integer_sqrt_exact_squares() {
+        assert_eq!(integer_sqrt(0), 0);
+        assert_eq!(integer_sqrt(1), 1);
+        assert_eq!(integer_sqrt(4), 2);
+        assert_eq!(integer_sqrt(9), 3);
+        assert_eq!(integer_sqrt(16), 4);
+        assert_eq!(integer_sqrt(100), 10);
+        assert_eq!(integer_sqrt(10000), 100);
+        assert_eq!(integer_sqrt(1_000_000), 1000);
+        assert_eq!(integer_sqrt(1_000_000_000_000), 1_000_000);
+    }
+
+    #[test]
+    fn integer_sqrt_non_squares() {
+        assert_eq!(integer_sqrt(2), 1);
+        assert_eq!(integer_sqrt(3), 1);
+        assert_eq!(integer_sqrt(5), 2);
+        assert_eq!(integer_sqrt(8), 2);
+        assert_eq!(integer_sqrt(10), 3);
+        assert_eq!(integer_sqrt(15), 3);
+        assert_eq!(integer_sqrt(17), 4);
+        assert_eq!(integer_sqrt(99), 9);
+    }
+
+    #[test]
+    fn integer_sqrt_property_r_squared_le_n() {
+        for i in [
+            2,
+            3,
+            5,
+            10,
+            17,
+            100,
+            1000,
+            10000,
+            1_000_000,
+            1_000_000_000_000,
+        ] {
+            let r = integer_sqrt(i);
+            assert!(r * r <= i, "r*r <= n failed: {}*{} <= {}", r, r, i);
+            assert!(
+                (r + 1) * (r + 1) > i,
+                "(r+1)^2 > n failed: {} > {}",
+                (r + 1) * (r + 1),
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn integer_sqrt_large_values() {
+        // Test near u64::MAX
+        let n = u64::MAX as u128;
+        let r = integer_sqrt(n);
+        assert!(r.checked_mul(r).is_some_and(|v| v <= n));
+        assert!((r + 1).checked_mul(r + 1).is_none_or(|v| v > n));
+
+        // Test u128 max
+        let n = u128::MAX;
+        let r = integer_sqrt(n);
+        assert!(r.checked_mul(r).is_some_and(|v| v <= n));
+        assert!((r + 1).checked_mul(r + 1).is_none_or(|v| v > n));
     }
 }

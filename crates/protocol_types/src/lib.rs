@@ -1,4 +1,4 @@
-use pool_math::{PoolMathError, DEFAULT_FEE, FEE_DENOMINATOR};
+use pool_math::{DEFAULT_FEE, FEE_DENOMINATOR};
 use serde::{Deserialize, Serialize};
 
 /// Pool identifier derived deterministically from pair and fee tier.
