@@ -7,10 +7,10 @@ C:\Users\pdark\Documents\Codex\2026-09-22\tari-ootle-liquidity-protocol
 2026-09-22
 
 ## 3. Git commit count
-6 commits total (root + docs + math + licenses + scaffold)
+7 commits total
 
 ## 4. Latest commit hash
-7c3a418
+223cc2f
 
 ## 5. Tari Ootle upstream commit
 Development branch; shallow clone inspected 2026-09-22
