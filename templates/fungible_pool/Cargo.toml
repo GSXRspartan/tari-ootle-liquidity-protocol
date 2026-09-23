@@ -1,0 +1,23 @@
+[package]
+name = "fungible_pool"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Referenced from upstream tari-ootle repository when building in proper environment
+# These paths assume the template is built within the tari-ootle workspace
+# or with cargo install tari-template-lib
+
+tari_template_abi = { path = "../../bindings/template_abi" }
+tari_template_lib = { path = "../../template_lib" }
+
+# If building standalone with installed crates:
+# tari_template_abi = { version = "0.40", package = "tari_template_abi" }
+# tari_template_lib = { version = "0.40", package = "tari_template_lib" }
+
+[profile.release]
+opt-level = "z"
+lto = true

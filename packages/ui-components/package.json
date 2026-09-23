@@ -1,0 +1,21 @@
+{
+  "name": "@tari-ootle/ui-components",
+  "version": "0.1.0",
+  "description": "Shared React UI components for Tari Ootle protocol",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist"],
+  "scripts": {
+    "build": "echo 'No build configured for components'",
+    "typecheck": "echo 'No TypeScript configured'",
+    "lint": "echo 'No lint configured'",
+    "test": "echo 'No tests configured'"
+  },
+  "dependencies": {
+    "react": "^19.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0"
+  },
+  "license": "MIT"
+}
