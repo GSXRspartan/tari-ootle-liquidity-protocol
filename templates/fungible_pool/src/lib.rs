@@ -11,6 +11,11 @@ use tari_template_lib::prelude::*;
 mod fungible_pool {
     use super::*;
 
+    /// Minimum initial liquidity to defend against first-depositor ratio manipulation.
+    /// Based on Tari divisibility (6): 1 TARI = 1_000_000 micro-tari.
+    /// For general fungible resources, this represents a safe base amount.
+    const MINIMUM_INITIAL_LIQUIDITY: u64 = 1_000_000; // 1 TARI in smallest units
+
     /// Pool component storing reserves in vaults, LP token, and fee tier.
     pub struct Pool {
         pools: BTreeMap<ResourceAddress, Vault>,
@@ -89,6 +94,23 @@ mod fungible_pool {
 
             let a_amount = a_bucket.amount();
             let b_amount = b_bucket.amount();
+
+            // Security: first-deposit defense — enforce minimum initial liquidity
+            let a_pool_before = self.get_pool_balance(a_res);
+            let b_pool_before = self.get_pool_balance(b_res);
+            if a_pool_before.is_zero() && b_pool_before.is_zero() {
+                let min_amount = Amount::from(Self::MINIMUM_INITIAL_LIQUIDITY);
+                assert!(
+                    a_amount >= min_amount,
+                    "First deposit A must exceed minimum initial liquidity ({} units)",
+                    Self::MINIMUM_INITIAL_LIQUIDITY
+                );
+                assert!(
+                    b_amount >= min_amount,
+                    "First deposit B must exceed minimum initial liquidity ({} units)",
+                    Self::MINIMUM_INITIAL_LIQUIDITY
+                );
+            }
 
             // Security: deposit into vaults (reserves grow by full amounts)
             self.pools.get_mut(&a_res).unwrap().deposit(a_bucket);
