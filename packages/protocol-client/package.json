@@ -1,0 +1,19 @@
+{
+  "name": "@tari-ootle/protocol-client",
+  "version": "0.1.0",
+  "description": "Protocol client for Tari Ootle liquidity protocol",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "lint": "echo 'No lint'",
+    "test": "echo 'No tests'"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "typescript": "^5.7.0"
+  },
+  "license": "MIT"
+}

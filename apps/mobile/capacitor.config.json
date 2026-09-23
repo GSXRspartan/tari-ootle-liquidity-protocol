@@ -1,0 +1,17 @@
+{
+  "appId": "com.tari.ootle.liquidity",
+  "appName": "Tari Ootle Liquidity",
+  "webDir": "www",
+  "bundledWebRuntime": false,
+  "plugins": {
+    "SplashScreen": {
+      "launchShowDuration": 0
+    }
+  },
+  "android": {
+    "buildOptions": {
+      "keystorePath": "release.keystore",
+      "keystoreAlias": "tari-ootle"
+    }
+  }
+}

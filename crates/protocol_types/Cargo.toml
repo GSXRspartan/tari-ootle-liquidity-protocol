@@ -1,0 +1,11 @@
+[package]
+name = "protocol_types"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+pool_math = { path = "../pool_math" }
+serde = { version = "1.0", features = ["derive"] }
+
+[dev-dependencies]

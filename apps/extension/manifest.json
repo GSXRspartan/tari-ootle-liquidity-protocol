@@ -1,0 +1,45 @@
+{
+  "manifest_version": 3,
+  "name": "Tari Ootle Liquidity Protocol Wallet",
+  "version": "0.1.0",
+  "description": "Browser extension signer for the Tari Ootle liquidity protocol. Non-custodial, permission-based.",
+  "permissions": [
+    "storage",
+    "activeTab",
+    "tabs",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://localhost:3000/*",
+    "https://*.github.io/*",
+    "https://indexer.esmeralda.tari.com/*"
+  ],
+  "background": {
+    "service_worker": "service_worker.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://localhost:3000/*", "https://*.github.io/*"],
+      "js": ["content_script.js"],
+      "run_at": "document_start"
+    }
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self';",
+    "sandbox": "sandbox allow-scripts allow-same-origin; script-src 'self'; object-src 'self';"
+  },
+  "minimum_chrome_version": "88"
+}

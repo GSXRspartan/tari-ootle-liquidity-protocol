@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <title>Tari Ootle Signer</title>
+  <style>
+    body { font-family: system-ui, sans-serif; width: 320px; padding: 1rem; margin: 0; }
+    h1 { font-size: 1.1rem; margin-bottom: 0.5rem; }
+    .status { padding: 0.5rem; border-radius: 4px; background: #f0f8ff; margin: 0.5rem 0; }
+    button { padding: 0.5rem 1rem; font-size: 1rem; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <h1>Tari Ootle Signer</h1>
+  <div class="status" id="status">Ready</div>
+  <button onclick="connectSite()">Approve Site</button>
+  <script>
+    function connectSite() {
+      document.getElementById('status').textContent = 'Site approved (scaffold)';
+    }
+  </script>
+</body>
+</html>

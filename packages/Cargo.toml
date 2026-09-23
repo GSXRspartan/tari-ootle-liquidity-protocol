@@ -1,0 +1,14 @@
+[workspace]
+members = [
+    "protocol-client",
+    "wallet-adapter",
+    "ootle-wallet-core",
+    "ui-components"
+]
+
+[package]
+name = "tari-ootle-liquidity-workspace"
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
