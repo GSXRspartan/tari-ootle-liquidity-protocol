@@ -82,13 +82,21 @@ mod nft_marketplace {
         /// Atomically transfers the escrowed NFT to `buyer_account` and the exact quoted payment
         /// to the immutable seller settlement account. Any failed deposit reverts the whole sale.
         pub fn buy(&mut self, payment: Bucket, buyer_account: ComponentAddress) {
-            assert_eq!(self.effective_status(), ListingStatus::Active, "Listing is not active");
+            assert_eq!(
+                self.effective_status(),
+                ListingStatus::Active,
+                "Listing is not active"
+            );
             assert_eq!(
                 payment.resource_address(),
                 self.quote_resource,
                 "Incorrect quote resource"
             );
-            assert_eq!(payment.amount(), self.price, "Payment must equal the listed price");
+            assert_eq!(
+                payment.amount(),
+                self.price,
+                "Payment must equal the listed price"
+            );
 
             let nft = self.nft_vault.withdraw_non_fungible(self.nft_id.clone());
             self.status = ListingStatus::Sold;
