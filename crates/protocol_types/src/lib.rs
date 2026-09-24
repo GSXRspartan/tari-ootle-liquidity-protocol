@@ -90,6 +90,89 @@ pub enum PrivacyBoundary {
     UnknownUnsupported,
 }
 
+/// A liquidity-backed XTM L1 ↔ canonical TARI L2 atomic swap. This is not a bridge: it
+/// exchanges the two participants' existing inventory and must never appear as an AMM reserve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FastXtmTariSwapState {
+    QuoteRequested,
+    QuoteReceived,
+    QuoteAccepted,
+    InventoryReserved,
+    LongDeadlineLegFunded,
+    BothLegsFunded,
+    ClaimArmed,
+    PreimageRevealed,
+    Completed,
+    QuoteExpired,
+    RefundWait,
+    Refunded,
+    TerminalFailure,
+}
+
+/// Settlement-critical terms supplied by an authenticated provider quote. The identical SHA-256
+/// hashlock is committed on both chains; L1 and L2 deadlines are deliberately separate units.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FastXtmTariSwapTerms {
+    pub sha256_hashlock_hex: String,
+    pub xtm_amount: u64,
+    pub tari_amount: u64,
+    pub l1_refund_height: u64,
+    pub l2_refund_epoch: u64,
+    pub quote_expiry_unix: u64,
+    pub provider_quote_id: String,
+}
+
+impl FastXtmTariSwapTerms {
+    /// The L1 funder is refunded later than the L2 funder. Actual height/epoch conversion and
+    /// confirmation policy are adapter responsibilities; equal or inverted deadlines are unsafe.
+    pub fn has_asymmetric_refunds(&self) -> bool {
+        self.l1_refund_height > self.l2_refund_epoch
+    }
+}
+
+/// Crash-recoverable, idempotent protocol state. Network adapters must record verified L1/L2
+/// transaction IDs separately and may only advance this machine after finality policy succeeds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FastXtmTariSwap {
+    pub terms: FastXtmTariSwapTerms,
+    pub state: FastXtmTariSwapState,
+}
+
+impl FastXtmTariSwap {
+    pub fn new(terms: FastXtmTariSwapTerms) -> Self {
+        Self {
+            terms,
+            state: FastXtmTariSwapState::QuoteRequested,
+        }
+    }
+
+    /// Rejects skipping the inventory/funding barrier or exposing a preimage before both HTLCs.
+    pub fn advance(&mut self, next: FastXtmTariSwapState) -> bool {
+        use FastXtmTariSwapState::*;
+        let valid = matches!(
+            (self.state, next),
+            (QuoteRequested, QuoteReceived)
+                | (QuoteReceived, QuoteAccepted)
+                | (QuoteAccepted, InventoryReserved)
+                | (InventoryReserved, LongDeadlineLegFunded)
+                | (LongDeadlineLegFunded, BothLegsFunded)
+                | (BothLegsFunded, ClaimArmed)
+                | (ClaimArmed, PreimageRevealed)
+                | (PreimageRevealed, Completed)
+                | (_, QuoteExpired)
+                | (
+                    LongDeadlineLegFunded | BothLegsFunded | ClaimArmed,
+                    RefundWait
+                )
+                | (RefundWait, Refunded)
+        );
+        if valid {
+            self.state = next;
+        }
+        valid
+    }
+}
+
 /// Deployment-pinned stablecoin facts. Addresses are configuration, not metadata-derived identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StablecoinAdapter {
@@ -541,5 +624,33 @@ mod eligibility_tests {
         };
         assert!(!adapter.private_conversion_is_usable());
         assert!(adapter.direct_revealed_boundary_is_usable());
+    }
+
+    #[test]
+    fn fast_xtm_tari_swap_never_reveals_before_both_legs_are_armed() {
+        let terms = FastXtmTariSwapTerms {
+            sha256_hashlock_hex: "00".repeat(32),
+            xtm_amount: 1,
+            tari_amount: 1,
+            l1_refund_height: 200,
+            l2_refund_epoch: 100,
+            quote_expiry_unix: 1,
+            provider_quote_id: "quote".to_string(),
+        };
+        assert!(terms.has_asymmetric_refunds());
+        let mut swap = FastXtmTariSwap::new(terms);
+        assert!(!swap.advance(FastXtmTariSwapState::PreimageRevealed));
+        for state in [
+            FastXtmTariSwapState::QuoteReceived,
+            FastXtmTariSwapState::QuoteAccepted,
+            FastXtmTariSwapState::InventoryReserved,
+            FastXtmTariSwapState::LongDeadlineLegFunded,
+            FastXtmTariSwapState::BothLegsFunded,
+            FastXtmTariSwapState::ClaimArmed,
+            FastXtmTariSwapState::PreimageRevealed,
+            FastXtmTariSwapState::Completed,
+        ] {
+            assert!(swap.advance(state));
+        }
     }
 }
