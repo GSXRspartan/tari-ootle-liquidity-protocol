@@ -104,6 +104,114 @@ pub struct TransactionPreview {
     pub privacy_disclosure: String,
 }
 
+/// Resource type as reported by the Ootle engine (`ResourceType`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResourceKind {
+    Fungible,
+    Confidential,
+    Stealth,
+    NonFungible,
+}
+
+/// Authoritative-as-possible facts about a resource, used to classify pool eligibility (OPUS-08).
+///
+/// `is_canonical_tari` and `kind` are on-chain-authoritative (address identity and
+/// `ResourceType`, exactly what the pool template itself checks). The `*_allowed` / `*_mutable`
+/// fields describe recall/freeze authority; the pool template CANNOT read these in Ootle v0.41.1,
+/// so they can only be populated off-chain from indexer substate and are therefore ADVISORY
+/// (indexer-trusted), never a security guarantee. `None` means "not inspected / unknown".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceSecurityFacts {
+    pub address: String,
+    /// Exact-address match against the canonical native Tari resource. Authoritative.
+    pub is_canonical_tari: bool,
+    /// Engine `ResourceType`. Authoritative (on-chain enforced by the pool template).
+    pub kind: ResourceKind,
+    /// Recall rule permits recall by someone other than a non-existent owner. Advisory (indexer).
+    pub recall_possible: Option<bool>,
+    /// Freeze rule permits freezing a vault of this resource. Advisory (indexer).
+    pub freeze_possible: Option<bool>,
+    /// Recall/freeze rules are mutable (could be enabled later). Advisory (indexer).
+    pub security_rules_mutable: Option<bool>,
+}
+
+/// Pool eligibility verdict. The protocol/client derives this from [`ResourceSecurityFacts`];
+/// the frontend MUST NOT invent its own classification.
+///
+/// On-chain-ENFORCED verdicts (the pool template rejects at `Pool::new`):
+///   * [`CanonicalTari`](ResourceEligibility::CanonicalTari)
+///   * [`EligiblePublicFungible`](ResourceEligibility::EligiblePublicFungible)
+///   * [`UnsupportedResourceType`](ResourceEligibility::UnsupportedResourceType)
+///
+/// ADVISORY-only verdicts (cannot be enforced by the template in v0.41.1 — see OPUS-08; derived
+/// from indexer substate, which is untrusted):
+///   * [`UnsafeRecallable`](ResourceEligibility::UnsafeRecallable)
+///   * [`UnsafeFreezable`](ResourceEligibility::UnsafeFreezable)
+///   * [`UnsafeMutableRules`](ResourceEligibility::UnsafeMutableRules)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResourceEligibility {
+    CanonicalTari,
+    EligiblePublicFungible,
+    UnsafeRecallable,
+    UnsafeFreezable,
+    UnsafeMutableRules,
+    UnsupportedResourceType,
+    Unknown,
+}
+
+impl ResourceEligibility {
+    /// True only for verdicts the on-chain pool template itself enforces at creation.
+    pub fn is_on_chain_enforced(&self) -> bool {
+        matches!(
+            self,
+            ResourceEligibility::CanonicalTari
+                | ResourceEligibility::EligiblePublicFungible
+                | ResourceEligibility::UnsupportedResourceType
+        )
+    }
+
+    /// True if a resource with this verdict must never be routed into a public-fungible pool.
+    pub fn is_unsafe(&self) -> bool {
+        matches!(
+            self,
+            ResourceEligibility::UnsafeRecallable
+                | ResourceEligibility::UnsafeFreezable
+                | ResourceEligibility::UnsafeMutableRules
+                | ResourceEligibility::UnsupportedResourceType
+        )
+    }
+}
+
+/// Classify a resource for public-fungible pool eligibility from authoritative facts.
+///
+/// Precedence mirrors the real threat: the on-chain type boundary is decided first (canonical
+/// Tari, then type), then — only for otherwise type-eligible fungibles — the advisory recall/
+/// freeze/mutability signals (when available from the indexer) can DOWNGRADE the verdict to an
+/// `Unsafe*` value. When those advisory signals are absent (`None`) the verdict stays at the
+/// type-derived value, because the template does not (and cannot) reject on them.
+pub fn classify_resource(facts: &ResourceSecurityFacts) -> ResourceEligibility {
+    // Authoritative, on-chain-enforced boundary first.
+    if facts.is_canonical_tari {
+        return ResourceEligibility::CanonicalTari;
+    }
+    if facts.kind != ResourceKind::Fungible {
+        return ResourceEligibility::UnsupportedResourceType;
+    }
+    // Type-eligible public fungible. Apply advisory downgrades if (and only if) the indexer
+    // supplied the relevant rule facts. A mutable-rules signal is the most dangerous because a
+    // currently-safe resource could be made recallable/freezable later.
+    if facts.security_rules_mutable == Some(true) {
+        return ResourceEligibility::UnsafeMutableRules;
+    }
+    if facts.recall_possible == Some(true) {
+        return ResourceEligibility::UnsafeRecallable;
+    }
+    if facts.freeze_possible == Some(true) {
+        return ResourceEligibility::UnsafeFreezable;
+    }
+    ResourceEligibility::EligiblePublicFungible
+}
+
 /// Capability matrix for the protocol.
 /// Source of truth: this file and docs/ROUTE_MATRIX.md.
 pub fn initial_route_matrix() -> Vec<RouteDescriptor> {
@@ -158,4 +266,94 @@ pub fn initial_route_matrix() -> Vec<RouteDescriptor> {
             fee_tier_available: None,
         },
     ]
+}
+
+#[cfg(test)]
+mod eligibility_tests {
+    use super::*;
+
+    fn facts(kind: ResourceKind, tari: bool) -> ResourceSecurityFacts {
+        ResourceSecurityFacts {
+            address: "resource_test".to_string(),
+            is_canonical_tari: tari,
+            kind,
+            recall_possible: None,
+            freeze_possible: None,
+            security_rules_mutable: None,
+        }
+    }
+
+    #[test]
+    fn canonical_tari_is_eligible_regardless_of_type() {
+        // Native Tari is Stealth-typed; the exact-address match must win.
+        let f = facts(ResourceKind::Stealth, true);
+        assert_eq!(classify_resource(&f), ResourceEligibility::CanonicalTari);
+        assert!(classify_resource(&f).is_on_chain_enforced());
+    }
+
+    #[test]
+    fn plain_public_fungible_is_eligible() {
+        let f = facts(ResourceKind::Fungible, false);
+        assert_eq!(
+            classify_resource(&f),
+            ResourceEligibility::EligiblePublicFungible
+        );
+        assert!(classify_resource(&f).is_on_chain_enforced());
+    }
+
+    #[test]
+    fn confidential_stealth_nft_are_unsupported() {
+        for k in [
+            ResourceKind::Confidential,
+            ResourceKind::Stealth,
+            ResourceKind::NonFungible,
+        ] {
+            let f = facts(k, false);
+            assert_eq!(
+                classify_resource(&f),
+                ResourceEligibility::UnsupportedResourceType
+            );
+            assert!(classify_resource(&f).is_unsafe());
+        }
+    }
+
+    #[test]
+    fn recallable_fungible_is_advisory_unsafe() {
+        let mut f = facts(ResourceKind::Fungible, false);
+        f.recall_possible = Some(true);
+        assert_eq!(classify_resource(&f), ResourceEligibility::UnsafeRecallable);
+        // Advisory only: NOT enforced on-chain by the template.
+        assert!(!classify_resource(&f).is_on_chain_enforced());
+        assert!(classify_resource(&f).is_unsafe());
+    }
+
+    #[test]
+    fn freezable_fungible_is_advisory_unsafe() {
+        let mut f = facts(ResourceKind::Fungible, false);
+        f.freeze_possible = Some(true);
+        assert_eq!(classify_resource(&f), ResourceEligibility::UnsafeFreezable);
+    }
+
+    #[test]
+    fn mutable_rules_take_precedence_over_current_safe_state() {
+        let mut f = facts(ResourceKind::Fungible, false);
+        f.recall_possible = Some(false);
+        f.freeze_possible = Some(false);
+        f.security_rules_mutable = Some(true);
+        assert_eq!(
+            classify_resource(&f),
+            ResourceEligibility::UnsafeMutableRules
+        );
+    }
+
+    #[test]
+    fn missing_advisory_facts_keep_type_verdict() {
+        // With no indexer rule facts, a type-eligible fungible stays eligible (the template
+        // does not reject on unknown recall/freeze state).
+        let f = facts(ResourceKind::Fungible, false);
+        assert_eq!(
+            classify_resource(&f),
+            ResourceEligibility::EligiblePublicFungible
+        );
+    }
 }

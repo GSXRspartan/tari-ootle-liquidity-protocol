@@ -33,14 +33,17 @@ mod fungible_pool {
 
     impl Pool {
         /// Initialize a new pool for the given pair and fee.
-        /// Resources must be fungible, different from each other, and include native Tari.
+        /// Each resource must be pool-eligible (canonical native Tari or an ordinary public
+        /// fungible — see `validate_pool_resource`) and the two must differ.
         pub fn new(a_addr: ResourceAddress, b_addr: ResourceAddress, fee: u16) -> Component<Self> {
             // Security: pair must be distinct
             assert!(a_addr != b_addr, "Pool pair resources must differ");
 
-            // Security: both resources must exist and be fungible
-            Self::validate_fungible_resource(a_addr);
-            Self::validate_fungible_resource(b_addr);
+            // Security (OPUS-08): both resources must be pool-eligible by authoritative type/address.
+            // NOTE: this enforces the resource-TYPE boundary only; it cannot screen recall/freeze
+            // authority (the v0.41.1 template ABI does not expose those rules). See validate_pool_resource.
+            Self::validate_pool_resource(a_addr);
+            Self::validate_pool_resource(b_addr);
 
             // Security: fee must be within safe range (1..=100 => 0.1%..10.0%)
             assert!(
@@ -370,15 +373,45 @@ mod fungible_pool {
             self.fee
         }
 
-        /// Internal validation: resource must exist and be fungible.
-        fn validate_fungible_resource(resource: ResourceAddress) {
+        /// Internal validation: is this the canonical native Tari resource?
+        ///
+        /// Native Tari is `STEALTH_TARI_RESOURCE_ADDRESS` (a `Stealth`-typed resource). Identity is
+        /// the exact, engine-defined address — never name/symbol/metadata — so a look-alike token
+        /// cannot impersonate it.
+        fn is_canonical_tari(resource: ResourceAddress) -> bool {
+            resource == STEALTH_TARI_RESOURCE_ADDRESS
+        }
+
+        /// Internal validation: resource eligibility for an ORDINARY PUBLIC-FUNGIBLE pool (OPUS-08).
+        ///
+        /// This is the narrowest safe policy the v0.41.1 template ABI can enforce ON-CHAIN, and it
+        /// is derived purely from authoritative resource state (address + `ResourceType`), never
+        /// from metadata:
+        ///   * canonical native Tari (exact `STEALTH_TARI_RESOURCE_ADDRESS`) — allowed;
+        ///   * `ResourceType::Fungible` (ordinary public fungible) — allowed;
+        ///   * everything else (`Confidential`, non-Tari `Stealth`, `NonFungible`) — rejected, so
+        ///     confidential/stealth/NFT assets cannot ride into a public pool merely because a
+        ///     `ResourceType` parse succeeds.
+        ///
+        /// LIMITATION — READ THIS (OPUS-08 residual, cannot be fixed permissionlessly in v0.41.1):
+        /// The template ABI exposes ONLY `resource_type()` / `divisibility()` / `total_supply()`
+        /// for a foreign resource (`ResourceAction` has no "get access rules"). A template therefore
+        /// CANNOT determine whether a candidate fungible is `recallable` or `freezable`, or whether
+        /// its rules are mutable. A public fungible whose issuer holds a recall right can, after
+        /// being pooled, forcibly withdraw the pool's holdings of that token (draining reserves);
+        /// a freezable one can lock the pool's vault (DoS). This check does NOT and cannot screen
+        /// those. Screening them requires either off-chain (indexer-sourced, untrusted) inspection
+        /// or a future engine API. See docs/SECURITY_AUDIT_OPUS.md (OPUS-08).
+        fn validate_pool_resource(resource: ResourceAddress) {
+            if Self::is_canonical_tari(resource) {
+                return;
+            }
             let resource_type = ResourceManager::get(resource).resource_type();
             assert!(
-                matches!(
-                    resource_type,
-                    ResourceType::Fungible | ResourceType::Confidential | ResourceType::Stealth
-                ),
-                "Resource {:?} must be fungible",
+                matches!(resource_type, ResourceType::Fungible),
+                "Resource {:?} is not eligible: only canonical native Tari or an ordinary public \
+                 fungible (ResourceType::Fungible) may be pooled; confidential, non-Tari stealth, \
+                 and non-fungible resources are rejected",
                 resource
             );
         }
