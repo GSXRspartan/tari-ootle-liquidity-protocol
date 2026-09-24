@@ -54,6 +54,8 @@ jobs:
         run: cargo fmt --manifest-path crates/protocol_types/Cargo.toml -- --check
       - name: rustfmt (fungible_pool template)
         run: cargo fmt --manifest-path templates/fungible_pool/Cargo.toml -- --check
+      - name: rustfmt (nft_marketplace template)
+        run: cargo fmt --manifest-path templates/nft_marketplace/Cargo.toml -- --check
       - name: rustfmt (audit_engine_tests)
         run: cargo fmt --manifest-path audit_engine_tests/Cargo.toml -- --check
 
@@ -74,6 +76,9 @@ jobs:
       # ---- Build the on-chain template to WASM (release) ----
       - name: build fungible_pool WASM
         run: cargo build --manifest-path templates/fungible_pool/Cargo.toml --release --target wasm32-unknown-unknown
+
+      - name: build nft_marketplace WASM
+        run: cargo build --manifest-path templates/nft_marketplace/Cargo.toml --release --target wasm32-unknown-unknown
 
       - name: Record WASM size + SHA256
         run: |

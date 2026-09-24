@@ -1,0 +1,33 @@
+// Minimal public-NFT fixture used only by the real marketplace engine tests.
+use tari_template_lib::prelude::*;
+
+#[template]
+mod test_nft_faucet {
+    use super::*;
+
+    pub struct TestNftFaucet {
+        vault: Vault,
+        nft_id: NonFungibleId,
+    }
+
+    impl TestNftFaucet {
+        pub fn mint_one(nft_id: NonFungibleId, symbol: String) -> Component<Self> {
+            let immutable_data = metadata!["name" => "Engine test NFT"];
+            let mutable_data = ();
+            let nft = ResourceBuilder::non_fungible()
+                .with_token_symbol(symbol)
+                .initial_supply_with_data(vec![(nft_id.clone(), (&immutable_data, &mutable_data))]);
+
+            Component::new(Self {
+                vault: Vault::from_bucket(nft),
+                nft_id,
+            })
+            .with_access_rules(AccessRules::allow_all())
+            .create()
+        }
+
+        pub fn take_nft(&mut self) -> Bucket {
+            self.vault.withdraw_non_fungible(self.nft_id.clone())
+        }
+    }
+}
