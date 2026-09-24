@@ -60,11 +60,56 @@ impl FeeTier {
 /// Route capability status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RouteStatus {
-    Tested,
+    EngineTested,
+    WalletTested,
+    EsmeraldaTested,
     Experimental,
     DesignOnly,
     Blocked,
     Disabled,
+}
+
+/// Market primitives are intentionally separate: an NFT inventory or a revealed stealth
+/// boundary must never be silently routed through the public-fungible AMM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MarketClass {
+    PublicFungibleConstantProduct,
+    StealthRevealedBoundary,
+    NftInventoryBondingCurve,
+    StablecoinGateway,
+    Unsupported,
+}
+
+/// Visibility that must be disclosed before signing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PrivacyBoundary {
+    Public,
+    PublicWrappedStablecoin,
+    PrivateWalletPublicMarketBoundary,
+    PrivateStablecoinConversion,
+    UnknownUnsupported,
+}
+
+/// Deployment-pinned stablecoin facts. Addresses are configuration, not metadata-derived identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StablecoinAdapter {
+    pub issuer_component: String,
+    pub private_resource: ResourceAddress,
+    pub wrapped_public_resource: ResourceAddress,
+    pub issuer_controlled: bool,
+    pub user_permissionless_conversion: bool,
+    pub holder_revealed_bucket_supported: bool,
+    pub source_revision: String,
+}
+
+impl StablecoinAdapter {
+    pub fn private_conversion_is_usable(&self) -> bool {
+        self.user_permissionless_conversion && !self.issuer_controlled
+    }
+
+    pub fn direct_revealed_boundary_is_usable(&self) -> bool {
+        self.holder_revealed_bucket_supported
+    }
 }
 
 /// Route description for the capability matrix.
@@ -75,6 +120,62 @@ pub struct RouteDescriptor {
     pub status: RouteStatus,
     pub notes: String,
     pub fee_tier_available: Option<u32>,
+    pub market_class: MarketClass,
+    pub privacy_boundary: PrivacyBoundary,
+}
+
+/// Capability-only planner. Discovery, quotes, and transaction construction remain wallet and
+/// indexer responsibilities; this prevents blocked paths being presented as executable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoutePlan {
+    pub hops: Vec<(String, String)>,
+    pub status: RouteStatus,
+    pub market_class: MarketClass,
+    pub privacy_boundary: PrivacyBoundary,
+}
+
+pub fn plan_route(from: &str, to: &str) -> RoutePlan {
+    let direct_public_quote = |boundary| RoutePlan {
+        hops: vec![(from.to_string(), to.to_string())],
+        status: RouteStatus::Experimental,
+        market_class: MarketClass::PublicFungibleConstantProduct,
+        privacy_boundary: boundary,
+    };
+
+    match (from, to) {
+        ("PublicFungible", "WrappedStablecoin")
+        | ("WrappedStablecoin", "PublicFungible")
+        | ("TariNative", "WrappedStablecoin")
+        | ("WrappedStablecoin", "TariNative") => {
+            direct_public_quote(PrivacyBoundary::PublicWrappedStablecoin)
+        }
+        ("PublicFungible", "TariNative") | ("TariNative", "PublicFungible") => {
+            direct_public_quote(PrivacyBoundary::PrivateWalletPublicMarketBoundary)
+        }
+        ("PrivateStablecoin", "WrappedStablecoin") | ("WrappedStablecoin", "PrivateStablecoin") => {
+            RoutePlan {
+                hops: vec![(from.to_string(), to.to_string())],
+                status: RouteStatus::Blocked,
+                market_class: MarketClass::StablecoinGateway,
+                privacy_boundary: PrivacyBoundary::PrivateStablecoinConversion,
+            }
+        }
+        ("PrivateStablecoin", "TariNative")
+        | ("TariNative", "PrivateStablecoin")
+        | ("PrivateStablecoin", "PublicFungible")
+        | ("PublicFungible", "PrivateStablecoin") => RoutePlan {
+            hops: vec![(from.to_string(), to.to_string())],
+            status: RouteStatus::DesignOnly,
+            market_class: MarketClass::StealthRevealedBoundary,
+            privacy_boundary: PrivacyBoundary::PrivateWalletPublicMarketBoundary,
+        },
+        _ => RoutePlan {
+            hops: vec![(from.to_string(), to.to_string())],
+            status: RouteStatus::Blocked,
+            market_class: MarketClass::Unsupported,
+            privacy_boundary: PrivacyBoundary::UnknownUnsupported,
+        },
+    }
 }
 
 /// Pool metadata (read-only, non-authoritative from indexer).
@@ -222,6 +323,8 @@ pub fn initial_route_matrix() -> Vec<RouteDescriptor> {
             status: RouteStatus::Experimental,
             notes: "Requires native Tari resource validation; TariSwap template supports fungible pairs including Tari resource.".to_string(),
             fee_tier_available: Some(DEFAULT_FEE),
+            market_class: MarketClass::PublicFungibleConstantProduct,
+            privacy_boundary: PrivacyBoundary::PrivateWalletPublicMarketBoundary,
         },
         RouteDescriptor {
             from: "PublicFungible".to_string(),
@@ -229,6 +332,26 @@ pub fn initial_route_matrix() -> Vec<RouteDescriptor> {
             status: RouteStatus::Experimental,
             notes: "Standard AMM route; tested with integer math; requires pool deployment and indexer integration.".to_string(),
             fee_tier_available: Some(DEFAULT_FEE),
+            market_class: MarketClass::PublicFungibleConstantProduct,
+            privacy_boundary: PrivacyBoundary::Public,
+        },
+        RouteDescriptor {
+            from: "PublicFungible".to_string(),
+            to: "WrappedStablecoin".to_string(),
+            status: RouteStatus::Experimental,
+            notes: "Uses the existing public-fungible pool only after the exact wrapper is configured as a reviewed issuer-controlled quote asset; no private conversion is implied.".to_string(),
+            fee_tier_available: Some(DEFAULT_FEE),
+            market_class: MarketClass::PublicFungibleConstantProduct,
+            privacy_boundary: PrivacyBoundary::PublicWrappedStablecoin,
+        },
+        RouteDescriptor {
+            from: "TariNative".to_string(),
+            to: "WrappedStablecoin".to_string(),
+            status: RouteStatus::Experimental,
+            notes: "Uses the existing canonical-Tari/public-fungible pool; the AMM boundary is public and the wrapper remains issuer-controlled.".to_string(),
+            fee_tier_available: Some(DEFAULT_FEE),
+            market_class: MarketClass::PublicFungibleConstantProduct,
+            privacy_boundary: PrivacyBoundary::PublicWrappedStablecoin,
         },
         RouteDescriptor {
             from: "StealthAsset".to_string(),
@@ -236,6 +359,8 @@ pub fn initial_route_matrix() -> Vec<RouteDescriptor> {
             status: RouteStatus::Blocked,
             notes: "Stealth resource enters public pool; amounts revealed at boundary; upstream TariSwap allows stealth/fungible but AMM privacy leakage must be explicitly disclosed.".to_string(),
             fee_tier_available: Some(DEFAULT_FEE),
+            market_class: MarketClass::StealthRevealedBoundary,
+            privacy_boundary: PrivacyBoundary::PrivateWalletPublicMarketBoundary,
         },
         RouteDescriptor {
             from: "StealthAsset".to_string(),
@@ -243,20 +368,44 @@ pub fn initial_route_matrix() -> Vec<RouteDescriptor> {
             status: RouteStatus::Blocked,
             notes: "Similar privacy leakage as stealth/Tari route; requires feature gate and user disclosure.".to_string(),
             fee_tier_available: Some(DEFAULT_FEE),
+            market_class: MarketClass::StealthRevealedBoundary,
+            privacy_boundary: PrivacyBoundary::PrivateWalletPublicMarketBoundary,
         },
         RouteDescriptor {
             from: "WrappedStablecoin".to_string(),
             to: "TariNative".to_string(),
-            status: RouteStatus::Blocked,
-            notes: "Requires upstream stable-coin template; admin controls must not be included in permissionless AMM.".to_string(),
+            status: RouteStatus::Experimental,
+            notes: "The public wrapper uses the existing canonical-Tari/public-fungible AMM; it remains an issuer-controlled quote asset.".to_string(),
             fee_tier_available: Some(DEFAULT_FEE),
+            market_class: MarketClass::PublicFungibleConstantProduct,
+            privacy_boundary: PrivacyBoundary::PublicWrappedStablecoin,
         },
         RouteDescriptor {
             from: "PrivateStablecoin".to_string(),
             to: "PublicFungible".to_string(),
-            status: RouteStatus::Blocked,
-            notes: "Direct private AMM not safe today; use wrapped public version first.".to_string(),
+            status: RouteStatus::DesignOnly,
+            notes: "Holder-controlled revealed same-resource buckets are source-proven; a dedicated revealed-boundary adapter and issuer-risk engine tests are still required.".to_string(),
             fee_tier_available: Some(DEFAULT_FEE),
+            market_class: MarketClass::StealthRevealedBoundary,
+            privacy_boundary: PrivacyBoundary::PrivateWalletPublicMarketBoundary,
+        },
+        RouteDescriptor {
+            from: "PrivateStablecoin".to_string(),
+            to: "TariNative".to_string(),
+            status: RouteStatus::DesignOnly,
+            notes: "Holder-controlled revealed same-resource buckets are source-proven; a dedicated revealed-boundary adapter and issuer-risk engine tests are still required.".to_string(),
+            fee_tier_available: Some(DEFAULT_FEE),
+            market_class: MarketClass::StealthRevealedBoundary,
+            privacy_boundary: PrivacyBoundary::PrivateWalletPublicMarketBoundary,
+        },
+        RouteDescriptor {
+            from: "PrivateStablecoin".to_string(),
+            to: "WrappedStablecoin".to_string(),
+            status: RouteStatus::Blocked,
+            notes: "The inspected wrapper conversion is issuer-admin-gated and per-user limited; this is distinct from direct revealed-boundary trading.".to_string(),
+            fee_tier_available: None,
+            market_class: MarketClass::StablecoinGateway,
+            privacy_boundary: PrivacyBoundary::PrivateStablecoinConversion,
         },
         RouteDescriptor {
             from: "NFTCollection".to_string(),
@@ -264,6 +413,8 @@ pub fn initial_route_matrix() -> Vec<RouteDescriptor> {
             status: RouteStatus::Blocked,
             notes: "NFT liquidity requires separate non-fungible design; no upstream NFT pool template exists.".to_string(),
             fee_tier_available: None,
+            market_class: MarketClass::NftInventoryBondingCurve,
+            privacy_boundary: PrivacyBoundary::UnknownUnsupported,
         },
     ]
 }
@@ -355,5 +506,40 @@ mod eligibility_tests {
             classify_resource(&f),
             ResourceEligibility::EligiblePublicFungible
         );
+    }
+
+    #[test]
+    fn wrapped_stablecoin_routes_are_public_and_private_conversion_is_blocked() {
+        let public_quote = plan_route("TariNative", "WrappedStablecoin");
+        assert_eq!(public_quote.status, RouteStatus::Experimental);
+        assert_eq!(
+            public_quote.privacy_boundary,
+            PrivacyBoundary::PublicWrappedStablecoin
+        );
+
+        let private_conversion = plan_route("PublicFungible", "PrivateStablecoin");
+        assert_eq!(private_conversion.status, RouteStatus::DesignOnly);
+        assert_eq!(
+            private_conversion.privacy_boundary,
+            PrivacyBoundary::PrivateWalletPublicMarketBoundary
+        );
+
+        let wrapper_gateway = plan_route("PrivateStablecoin", "WrappedStablecoin");
+        assert_eq!(wrapper_gateway.status, RouteStatus::Blocked);
+    }
+
+    #[test]
+    fn issuer_controlled_gateway_is_not_permissionless() {
+        let adapter = StablecoinAdapter {
+            issuer_component: "component_issuer".to_string(),
+            private_resource: ResourceAddress::new("resource_private"),
+            wrapped_public_resource: ResourceAddress::new("resource_wrapped"),
+            issuer_controlled: true,
+            user_permissionless_conversion: false,
+            holder_revealed_bucket_supported: true,
+            source_revision: "bef1a89".to_string(),
+        };
+        assert!(!adapter.private_conversion_is_usable());
+        assert!(adapter.direct_revealed_boundary_is_usable());
     }
 }

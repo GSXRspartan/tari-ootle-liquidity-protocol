@@ -7,7 +7,9 @@
 
 use tari_ootle_common_types::substate_type::SubstateType;
 use tari_ootle_transaction::args;
-use tari_template_lib::types::{Amount, ComponentAddress, NonFungibleAddress, ResourceAddress};
+use tari_template_lib::types::{
+    constants::TARI_TOKEN, Amount, ComponentAddress, NonFungibleAddress, ResourceAddress,
+};
 use tari_template_test_tooling::TemplateTest;
 
 const CRATE_PATH: &str = env!("CARGO_MANIFEST_DIR");
@@ -127,6 +129,116 @@ fn add_liquidity(pt: &mut PoolTest, a_amt: Amount, b_amt: Amount) {
             .put_last_instruction_output_on_workspace("lp")
             .call_method(account, "deposit", args![Workspace("lp")]);
     pt.t.build_and_execute(tx, vec![proof]).expect_success();
+}
+
+/// Public-wrapper market regression. `wUSD` is an ordinary public fungible fixture, which proves
+/// the AMM lane used by a reviewed wrapper without claiming to test the issuer-gated private
+/// stablecoin conversion contract. Native Tari is the engine's canonical `TARI_TOKEN`.
+#[test]
+fn e06_tari_wstable_public_wrapper_lifecycle() {
+    let mut t = TemplateTest::new(
+        CRATE_PATH,
+        ["../templates/fungible_pool", "templates/faucet"],
+    );
+    let (wrapper_faucet, wrapped) = create_faucet(&mut t, "wUSD");
+    let pool_template = t.get_template_address("Pool");
+    let result = t.execute_expect_success(
+        t.transaction()
+            .call_function(pool_template, "new", args![TARI_TOKEN, wrapped, 30u16])
+            .build_and_seal(t.secret_key()),
+        vec![],
+    );
+    let pool = result
+        .expect_success()
+        .up_iter()
+        .find(|(address, substate)| {
+            address.is_component()
+                && *substate
+                    .substate_value()
+                    .component()
+                    .unwrap()
+                    .template_address()
+                    == pool_template
+        })
+        .unwrap()
+        .0
+        .as_component_address()
+        .unwrap();
+    let lp = result
+        .expect_success()
+        .up_iter()
+        .find(|(address, _)| address.is_resource())
+        .unwrap()
+        .0
+        .as_resource_address()
+        .unwrap();
+
+    let (account, proof, _) = t.create_funded_account();
+    for _ in 0..2 {
+        t.build_and_execute(
+            t.transaction()
+                .call_method(wrapper_faucet, "take_free_coins", args![])
+                .put_last_instruction_output_on_workspace("wrapped")
+                .call_method(account, "deposit", args![Workspace("wrapped")]),
+            vec![],
+        )
+        .expect_success();
+    }
+
+    let initial = Amount::from(10_000_000u64);
+    t.build_and_execute(
+        t.transaction()
+            .call_method(account, "withdraw", args![TARI_TOKEN, initial])
+            .put_last_instruction_output_on_workspace("tari")
+            .call_method(account, "withdraw", args![wrapped, initial])
+            .put_last_instruction_output_on_workspace("wrapped")
+            .call_method(
+                pool,
+                "add_liquidity",
+                args![Workspace("tari"), Workspace("wrapped")],
+            )
+            .put_last_instruction_output_on_workspace("lp")
+            .call_method(account, "deposit", args![Workspace("lp")]),
+        vec![proof.clone()],
+    )
+    .expect_success();
+
+    for (input, output) in [(TARI_TOKEN, wrapped), (wrapped, TARI_TOKEN)] {
+        t.build_and_execute(
+            t.transaction()
+                .call_method(
+                    account,
+                    "withdraw",
+                    args![input, Amount::from(1_000_000u64)],
+                )
+                .put_last_instruction_output_on_workspace("input")
+                .call_method(
+                    pool,
+                    "swap",
+                    args![Workspace("input"), output, Amount::from(1u64)],
+                )
+                .put_last_instruction_output_on_workspace("output")
+                .call_method(account, "deposit", args![Workspace("output")]),
+            vec![proof.clone()],
+        )
+        .expect_success();
+    }
+
+    let lp_held: Amount = t.call_method(account, "balance", args![lp], vec![]);
+    t.build_and_execute(
+        t.transaction()
+            .call_method(account, "withdraw", args![lp, lp_held])
+            .put_last_instruction_output_on_workspace("lp")
+            .call_method(pool, "remove_liquidity", args![Workspace("lp")])
+            .put_last_instruction_output_on_workspace("redeemed")
+            .call_method(account, "deposit", args![Workspace("redeemed.0")])
+            .call_method(account, "deposit", args![Workspace("redeemed.1")]),
+        vec![proof],
+    )
+    .expect_success();
+
+    let locked: Amount = t.call_method(pool, "locked_lp_supply", args![], vec![]);
+    assert_eq!(locked, Amount::from(1_000u64));
 }
 
 // ---------------------------------------------------------------------------

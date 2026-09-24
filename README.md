@@ -20,13 +20,16 @@ A public, permissionless, non-custodial liquidity protocol for Tari Ootle.
 
 | Priority | Route | Status |
 |----------|-------|--------|
-| P0 | Public Fungible / Tari Native | Experimental |
-| P1 | Public Fungible / Public Fungible | Experimental |
-| P2 | Stealth / Tari Native | Blocked (privacy disclosure required) |
-| P2 | Stealth / Public Fungible | Blocked |
-| P3 | Wrapped Stablecoin / Tari | Blocked (upstream admin controls must be excluded) |
-| P3 | Private Stablecoin Direct / Public | Blocked |
-| P4 | NFT Collection / Tari Native | Blocked (separate non-fungible design needed) |
+| P0 | Public Fungible / Tari Native | EXPERIMENTAL — public AMM boundary; canonical Tari address only |
+| P1 | Public Fungible / Public Fungible | EXPERIMENTAL |
+| P1 | Public Fungible / wSTABLE | EXPERIMENTAL — public market with a reviewed issuer-controlled quote asset |
+| P1 | Tari / wSTABLE | EXPERIMENTAL — public market with a reviewed issuer-controlled quote asset |
+| P2 | Stealth / Tari Native | BLOCKED — requires dedicated revealed-boundary engine proof |
+| P2 | Stealth / wSTABLE | BLOCKED — requires dedicated revealed-boundary engine proof |
+| P3 | Private Stablecoin / Tari or Public Fungible | DESIGN_ONLY — holder-revealed boundary is source-proven; dedicated adapter and issuer-risk tests required |
+| P3 | Private Stablecoin / wSTABLE gateway | BLOCKED — inspected wrapper conversion is issuer-admin-gated |
+| P4 | NFT Collection / Tari Native or wSTABLE | BLOCKED — separate inventory primitive required |
+| P4 | Generic Confidential / Tari or wSTABLE | BLOCKED — hidden amounts cannot drive public constant-product arithmetic |
 
 ## Architecture
 - `crates/pool_math`: integer constant-product AMM math (no floats).

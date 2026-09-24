@@ -440,15 +440,13 @@ mod fungible_pool {
             assert!(self.pools.contains_key(&b), "Resource {:?} not in pool", b);
         }
 
-        /// Internal canonical pair ordering (lexicographic by resource address string representation).
+        /// Internal canonical pair ordering using `ResourceAddress`'s engine-defined `Ord`.
+        /// Never derive security-critical identity ordering from a debug/display string.
         fn canonical_pair(
             a: ResourceAddress,
             b: ResourceAddress,
         ) -> (ResourceAddress, ResourceAddress) {
-            // For simplicity in WASM, compare string representations
-            let a_str = format!("{:?}", a);
-            let b_str = format!("{:?}", b);
-            if a_str <= b_str {
+            if a <= b {
                 (a, b)
             } else {
                 (b, a)
