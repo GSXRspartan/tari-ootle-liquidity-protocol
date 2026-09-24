@@ -110,7 +110,7 @@ Assumptions: the engine's vault/bucket/resource authorization behaves as in the 
 | OPUS-05 | HIGH | `swap` has no on-chain `min_output` → no slippage/sandwich protection | Fixed | AMM / MEV |
 | OPUS-06 | MEDIUM | Unchecked `u128` product in first-deposit sqrt → silent wrap in release WASM | Fixed | Overflow |
 | OPUS-07 | MEDIUM | Version drift: manifest tag vs stale lock rev → non-reproducible build | Fixed | Supply chain |
-| OPUS-08 | MEDIUM | Confidential/Stealth resources accepted; AMM assumes cleartext amounts | Open (documented) | Resource eligibility |
+| OPUS-08 | HIGH | Hostile/eligible pool resources (type + recall/freeze) | Type facet FIXED; recall/freeze OPEN (engine limitation) | Resource eligibility |
 | OPUS-09 | LOW | "Engine tests" were `assert!(true)` stubs with false claims | Fixed (real engine tests added) | Test coverage |
 | OPUS-10 | LOW | Indexer JSON trusted without validation; fee defaults to 30 on error | Open (documented) | Indexer/frontend trust |
 | OPUS-11 | LOW | Extension listener lacks origin validation; content scripts match all `*.github.io` | Open (scaffold) | Wallet/extension |
@@ -317,18 +317,72 @@ optional dev-deps and the broken `test` feature, moved engine tests into a stand
 
 ---
 
-### OPUS-08 (MEDIUM, open) — Confidential/Stealth resources accepted by an amount-based AMM
+### OPUS-08 (HIGH) — Hostile/eligible resources for pooling — PARTIALLY FIXED (type policy enforced; recall/freeze OPEN by engine limitation)
 
-**Cause.** `validate_fungible_resource` accepts `Fungible | Confidential | Stealth`. The AMM reads
-`bucket.amount()` and vault balances as cleartext integers and publishes reserves via
-`get_pool_balance`. For confidential resources whose amounts are commitments, this is at best a
-privacy leak (reserves and swap amounts become public) and at worst incorrect accounting. Native
-Tari is `Stealth`, so the pool inherently reveals amounts for the Tari side.
+**Root cause (two facets).**
+1. *Type facet:* `validate_fungible_resource` accepted `Fungible | Confidential | Stealth`, so
+   confidential/stealth (and, by the loose check, effectively any non-fungible surprise) could ride
+   into an amount-based public pool that reads `bucket.amount()`/`vault.balance()` as cleartext.
+2. *Authority facet:* a pooled resource whose issuer holds a **recall** or **freeze** right can act
+   on the pool's OWN reserve vault after deposit — authorization for recall/freeze is the resource's
+   rule (checked against the caller), **not** the vault owner's consent (`engine/tests/templates/recall`,
+   `ResourceManager::recall_fungible_amount(vault_id, amount)` / `freeze_vault(vault_id)`).
 
-**Status.** Documentation/behaviour issue, not fixed in code (matching upstream, which also accepts
-these types). Recommendation: for the first release, restrict pools to `Fungible` (and the specific
-native-Tari resource) unless confidential-amount semantics under this engine are proven, and never
-label such pools "private" in the UI (see Privacy Boundary). Left open pending a product decision.
+**Actual exploitability (protocol vs market risk).**
+- **Attack A — recall (PROTOCOL SECURITY / custody):** attacker issues a fungible with
+  `recallable(allow_all)`, pools it, lures counter-liquidity, then recalls the pool's holdings of
+  that token straight out of the reserve vault — no swap, no LP burn. Reserves drop below what LPs
+  are owed; combined with retained LP the attacker extracts more than their share. **Real theft.**
+- **Attack B — freeze (DoS / griefing):** a `freezable` token lets the attacker freeze the pool's
+  vault of that token, so swaps outputting it and removals of it revert. Funds are locked, not
+  stolen. **Real DoS.**
+- **Attack C — mint inflation (TOKEN ISSUER / MARKET risk, NOT an AMM exploit):** the issuer minting
+  more of their token elsewhere does **not** touch the pool's vault balance or LP accounting (LP
+  value is proportional to the pool's own reserves, not global supply). This is ordinary issuer/
+  market risk and is **not** classified as a pool exploit.
+
+**Resource rules involved.** `ResourceAccessRules::{recall, freeze, mint}` and their `UpdateRule`s;
+`OwnerRule`. Recall/freeze are `DenyAll` by default but an issuer can enable them (and, if the
+updater rule is not `Locked`, enable them *later*).
+
+**The hard limit (why this cannot be closed permissionlessly on-chain in v0.41.1).** A template can
+introspect a foreign resource only through `ResourceManager`, whose `ResourceAction` enum exposes
+`GetResourceInfo` (→ `ResourceInfo { resource_type, divisibility }`) and `GetTotalSupply` — and
+**nothing else**. There is **no** action to read a resource's mint/burn/recall/freeze/owner rules or
+their mutability. Therefore `Pool::new` **cannot** detect a recallable/freezable/mutable-rule
+fungible. Rule-based permissionless screening is **impossible** at the template layer on this engine
+revision. (Verified: `crates/template_lib/src/args/types.rs::ResourceAction`,
+`crates/template_lib_types/src/resource_type.rs::ResourceInfo`,
+`crates/template_lib/src/resource/manager.rs`.)
+
+**What was fixed (enforced on-chain).** `validate_pool_resource` now derives eligibility from
+authoritative resource state only — the narrowest safe policy the ABI supports:
+- canonical native Tari (exact `STEALTH_TARI_RESOURCE_ADDRESS`) — allowed (Part 5 exception);
+- `ResourceType::Fungible` — allowed;
+- `Confidential`, non-Tari `Stealth`, `NonFungible` — **rejected** (closes the fake-Tari and
+  unsupported-type facets; keeps stealth/confidential/NFT behind their own routes per Part 6).
+Engine tests `resource01/02/03/07/09/10` (in `audit_engine_tests/tests/opus08_eligibility.rs`)
+assert this policy.
+
+**What remains OPEN (cannot be fixed here).** Recall/freeze screening of ordinary public fungibles.
+A recallable or freezable fungible is still `ResourceType::Fungible` and is therefore ACCEPTED by
+the on-chain check (engine tests `resource04/05` document this; `opus08_recall_demo.rs` demonstrates
+the actual reserve drain). Mitigations, none of which is a permissionless on-chain fix:
+- **Client-side advisory classification (added):** `protocol_types::ResourceEligibility` +
+  `classify_resource`, mirrored in `protocol-client` (`classifyResource`). The client derives
+  `CanonicalTari` / `EligiblePublicFungible` / `UnsupportedResourceType` authoritatively, and
+  `UnsafeRecallable` / `UnsafeFreezable` / `UnsafeMutableRules` from indexer substate — clearly
+  marked **advisory / indexer-trusted, not a guarantee** (`is_on_chain_enforced()` distinguishes
+  them). The frontend must not invent its own classification.
+- **Governance allow-list** (deferred; the prompt discourages a centralized list, and it is only
+  warranted because the engine lacks introspection — a product decision, not an automatic fix).
+- **Upstream engine support** to expose resource access rules to templates (or a vault flag opting
+  out of recall/freeze), which would make a permissionless on-chain check possible.
+
+**Status.** Type facet **FIXED and enforced** (engine tests written; run in Linux CI). Recall/freeze
+facet **OPEN — not fixable permissionlessly in v0.41.1**; risk is disclosed in-code, demonstrated by
+an engine test, and surfaced via the advisory client classification. This is why the pool must be
+restricted to canonical Tari + vetted fungibles before any funded use.
 
 ---
 
@@ -502,35 +556,61 @@ Tests:
 - `e04_slippage_min_output_enforced` — a swap demanding an impossible `min_output` is rejected
   atomically (exercises OPUS-05).
 
-**Execution status — BLOCKED ON THIS HOST (environment, not code).** The template itself compiles
-to WASM offline against v0.41.1 (verified; artifact hashed below). The engine test binary does NOT
-build on this **Windows** host because `tari_engine` hard-pins `wasmer = { features = ["cranelift"] }`
-and `wasmer-compiler-cranelift` emits `compile_error!("The Cranelift compiler backend is not
-supported on Windows. Use the V8 backend instead.")`. Cargo feature unification cannot remove a
-feature a dependency selects, so the engine cannot be built natively here, and WSL on this machine
-is non-functional (its ext4 vhdx is on an unattached drive). The harness, API usage, faucet, and
-`TemplateTest` wiring are complete and are expected to run on Linux/macOS (or a Windows host with a
-V8-backed engine build) without change.
+Added in the OPUS-08 run (`audit_engine_tests/tests/`):
+- `opus08_eligibility.rs` — `resource01/02/03/07/09/10` assert the on-chain type policy (safe
+  fungible + canonical Tari accepted; non-Tari stealth rejected; same-pair rejected; metadata
+  ignored) and `resource04/05` document that recallable/freezable fungibles remain accepted.
+- `opus08_recall_demo.rs` — `recallable_token_can_be_drained_from_pool_reserves` demonstrates the
+  residual recall drain against pool reserves.
+- `pool_economics.rs` — `e11` second independent LP, `e05`/`e12` locked-minimum survives full exit,
+  and `first_depositor_cannot_steal_victim_share` (Part 13 attacker/victim runtime regression).
+- New `hostile` test template mints the recallable/freezable/stealth/symbol-"TARI"/safe resources
+  and can recall from an arbitrary vault. It **compiles to WASM (verified locally)**.
 
-Because engine execution could not be performed, **no finding in this report is claimed as
-"engine-proven."** The critical/high findings are instead established rigorously from (a) the exact
-semantics of the pinned engine source — `Amount` integer division (`amount/ops.rs`), the resource
-owner mint/burn override (`runtime/tracker_auth.rs`), and access-rule defaults (`access_rules.rs`) —
-and (b) a differential against the authoritative upstream builtin `liquidity_pool`, which documents
-the identical integer-truncation and fee traps. The engine tests above are the mechanism to confirm
-these on a supported OS and to guard against regressions; running them is the immediate next step.
+**Execution status — PREPARED, NOT YET EXECUTED (Linux CI created; not run in this session).**
+The templates compile to WASM offline against v0.41.1 (`fungible_pool` and `hostile` both verified;
+artifact hashed below), and every engine-test file passes `rustfmt` parsing locally. The engine
+*test binary* does NOT build on this **Windows** host: `tari_engine` hard-pins
+`wasmer = { features = ["cranelift"] }` and `wasmer-compiler-cranelift` emits
+`compile_error!("The Cranelift compiler backend is not supported on Windows. Use the V8 backend
+instead.")`. Cargo feature unification cannot remove a feature a dependency selects, and WSL on this
+machine is non-functional (its ext4 vhdx is on an unattached drive). A Linux workflow,
+`.github/workflows/security-engine-tests.yml` (ubuntu-latest, `contents: read`, triggers on
+pull_request / push to main / push to `security/**`), runs the full suite with real
+`tari_template_test_tooling`; it never skips the engine suite and fails if it cannot compile.
+
+Per the audit's own rule, **no finding is claimed as "engine-proven" and no engine test is claimed
+as PASS**, because the suite has not yet executed (this session cannot run Linux CI and does not
+push). The critical/high findings remain established from (a) the exact semantics of the pinned
+engine source — `Amount` integer division (`amount/ops.rs`), the resource owner mint/burn override
+(`runtime/tracker_auth.rs`), access-rule defaults (`access_rules.rs`), and the absence of any
+access-rule read in `ResourceAction` (`args/types.rs`) — and (b) a differential against the
+authoritative upstream builtin `liquidity_pool`. Running the Linux CI is the immediate next step and
+the mechanism that converts these into runtime evidence.
 
 ### Off-chain Rust tests (do run here)
 
 `crates/pool_math` (the off-chain **reference** math, NOT the code that ships): 32 tests pass
-(16 unit + 2 `amm_cycle` + 14 `protocol_tests`). `crates/protocol_types`: 0 tests. These give false
-comfort if mistaken for template coverage — the template reimplements its own math and does not call
-`pool_math`.
+(16 unit + 2 `amm_cycle` + 14 `protocol_tests`). `crates/protocol_types`: **7 tests pass** (the new
+`classify_resource` eligibility tests). These give false comfort if mistaken for template coverage —
+the template reimplements its own math and does not call `pool_math`.
+
+### Build artifact (current, post-OPUS-08)
+
+- Path: `templates/fungible_pool/target/wasm32-unknown-unknown/release/fungible_pool.wasm`
+- Size: 243,227 bytes
+- SHA256: `588c644cd28c27be2eceec7c432c34b70726b493c6ac355c216407c5afd1021e`
+- Source: branch `security/audit-opus-fixes`; Ootle rev `4732f65` (v0.41.1); release profile
+  (`opt-level="z"`, `lto`, `panic=abort`), features `precision`, `extra-arith`.
+- Rebuild + verify: `cargo build --manifest-path templates/fungible_pool/Cargo.toml --release
+  --target wasm32-unknown-unknown && sha256sum <path>`.
 
 ## Remaining Risks
 
-1. **OPUS-08 hostile reserve resources** (recall/freeze/mint by attacker) — no eligibility screening
-   yet. Highest residual theft/DoS risk. Blocker for arbitrary-token pools.
+1. **OPUS-08 recall/freeze by a hostile reserve resource** — the type policy is now enforced, but
+   recall/freeze of a pooled public fungible CANNOT be screened on-chain in v0.41.1 (no access-rule
+   introspection in the template ABI). Highest residual theft/DoS risk. Blocker for arbitrary-token
+   pools until a governance allow-list or an upstream engine API lands.
 2. **Property/fuzz coverage on the shipping template** — only a handful of engine cases exist; the
    large-scale randomized add/swap/remove balance-conservation fuzzing (invariants I1–I10) is not yet
    implemented against the WASM template.
@@ -543,16 +623,19 @@ comfort if mistaken for template coverage — the template reimplements its own 
 ## Mainnet/Testnet Readiness
 
 **Esmeralda with small test funds: CONDITIONAL / NOT YET.** The five critical/high correctness bugs
-are fixed and source-proven (engine tests written but not executed here — env blocker), and the
-WASM builds reproducibly. But before even a small-fund test:
-restrict pools to native Tari + a vetted fungible (mitigating OPUS-08), delete the misleading stub
-tests and faucet, and confirm the engine-test run is green in the target environment. A test-fund
-trial is only defensible with those constraints and with acceptance that the signer/frontend is still
-scaffolding.
+are fixed and source-proven, the OPUS-08 type policy is enforced, and both templates build to WASM
+reproducibly. But the engine suite has not yet executed (Linux CI is created but not run in this
+session), and the OPUS-08 recall/freeze facet is unfixable on-chain in v0.41.1. Before even a
+small-fund test: (1) get the Linux CI run green (real runtime evidence); (2) restrict pools to
+canonical Tari + a vetted/allow-listed fungible so the recall/freeze vector cannot be introduced;
+(3) delete the misleading stub tests and the broken bundled faucet. A test-fund trial is only
+defensible with those constraints and with acceptance that the signer/frontend is still scaffolding.
 
-**Mainnet: NO.** OPUS-08 (hostile-resource eligibility) is unresolved, there is no fuzz/property
-suite on the shipping template, and there is no audited signer. Do not label any Tari/stealth pool
-"private". A full external audit is required after OPUS-08 and the fuzzing gap are closed.
+**Mainnet: NO.** The OPUS-08 recall/freeze facet is unresolved and cannot be closed permissionlessly
+on this engine revision, the engine suite has not been executed, there is no fuzz/property suite on
+the shipping template, and there is no audited signer. Do not label any Tari/stealth pool "private".
+A full external audit is required after the OPUS-08 authority facet, the CI execution, and the
+fuzzing gap are closed.
 
 > Nothing here is "production-safe because no exploit was found." Several previously-claimed
 > guarantees were false; the burden of proof is on green engine/fuzz evidence, not on absence of a
