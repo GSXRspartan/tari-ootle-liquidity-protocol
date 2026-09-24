@@ -84,8 +84,9 @@ reproducible) rather than the mutable tag reference.
 ## Architecture Reviewed
 
 Two-resource constant-product AMM as a single Ootle component:
-- State: `pools: BTreeMap<ResourceAddress, Vault>` (2 reserve vaults), `lp_resource`, `fee`
-  (per-mil /1000), `locked_lp_vault` (permanently-locked minimum LP shares).
+- State: `pools: BTreeMap<ResourceAddress, Vault>` (2 reserve vaults), `lp_resource`, `fee_bps`
+  (basis points /10_000; 30 bps = 0.30%; max 1000 bps = 10%), `locked_lp_vault` (permanently-locked
+  minimum LP shares).
 - Methods: `new` (constructor), `add_liquidity`, `swap`, `remove_liquidity`, plus read-only
   getters. LP tokens are a public fungible minted/burned by the component.
 - No admin/upgrade/withdraw method exists (confirmed) — the risk was the opposite: an *implicit*
@@ -116,6 +117,7 @@ Assumptions: the engine's vault/bucket/resource authorization behaves as in the 
 | OPUS-11 | LOW | Extension listener lacks origin validation; content scripts match all `*.github.io` | Open (scaffold) | Wallet/extension |
 | OPUS-12 | INFO | `canonical_pair` orders by `{:?}` Debug string | Open (documented) | Robustness |
 | OPUS-13 | LOW | Bundled `faucet` template mints native Tari (impossible) → dead/misleading | Open (documented) | Repo hygiene |
+| OPUS-14 | MEDIUM | Fee-unit mismatch: contract charged per-mil (fee=30 → 3.0%) while protocol/UI advertise 30 bps (0.30%) — a 10× overcharge | Fixed (engine-verified pending) | AMM fee units |
 
 ---
 
@@ -236,8 +238,9 @@ not grow. Traders get the full no-fee output. Economic purpose defeated; violate
 profit), computed in 192-bit precision to avoid `k` overflow:
 `output = output_pool * effective_input / (input_pool + effective_input)`.
 
-**Regression test.** `e03_swap_charges_fee_growing_k` asserts `k` strictly increases (engine;
-written, execution env-blocked). Also a direct arithmetic consequence of using the full input.
+**Regression test.** `e03_swap_charges_fee_growing_k` asserts `k` strictly increases, the reserve
+delta equals the FULL input, and the output matches the exact fee-adjusted constant-product value
+(engine). Also a direct arithmetic consequence of using the full input.
 
 ---
 
@@ -436,6 +439,37 @@ Recommend deleting or replacing the bundled one.
 
 ---
 
+### OPUS-14 (MEDIUM) — Fee-unit mismatch: contract charged 3.0% while protocol advertised 0.30%
+
+**File/function:** `new` (fee storage/validation), `swap` (fee application).
+
+**Cause.** The contract stored `fee: u16` and applied it **per-mil out of 1000**
+(inherited from upstream TariSwap, which documents fee as per-mil and validates `0..100`):
+`effective_input = input * (1000 - fee) / 1000`. Meanwhile the protocol spec, `pool_math`
+(`FEE_DENOMINATOR = 10_000`, `DEFAULT_FEE = 30` basis points), `protocol_types`
+(`FeeTier { basis_points }`), the route matrix, and the UI all express the default tier as
+**30 basis points = 0.30%**. With `fee = 30` the contract therefore charged **3.0%** — ten times
+the advertised fee. (Earlier the fee was not charged at all — OPUS-03; once charging was restored,
+the unit mismatch surfaced.)
+
+**Impact.** Every trade on a 30-bps pool paid a 3% fee: a deterministic 10× overcharge relative to
+the advertised tier. No theft of principal and no broken invariant (100% of the fee still went to
+LPs), but users were silently over-charged versus the documented economics. Severity MEDIUM
+(economic harm to every trader, but bounded by the pool's chosen tier and still capped at 10%).
+
+**Fix.** Convert the contract to **basis points**: `fee_bps: u16`, `FEE_DENOMINATOR_BPS = 10_000`,
+`effective_input = input * (10_000 - fee_bps) / 10_000`, constructor range `1..=1000` bps
+(0.01%..10%, same ceiling as the old per-mil `0..=100`). This intentionally DIVERGES from upstream
+TariSwap (per-mil) to match the protocol's own units; the divergence is documented in
+`docs/TARISWAP_SECURITY_DIFF.md`.
+
+**Regression test.** `e03_swap_charges_fee_growing_k` and `e03b_reverse_swap_fee_grows_k` pin the
+exact 30-bps output (90,661,089 for reserves 1e9/1e9 and input 1e8); the pure-math twin
+`swap_output_30bps_default_tier` in `pool_math` asserts the same value and explicitly asserts it is
+NOT the per-mil value (88,422,971). Engine-verification pending the next Linux CI run.
+
+---
+
 ## Economic Attack Analysis
 
 - **First-depositor / share inflation.** `MINIMUM_INITIAL_LIQUIDITY` (1e6) rejects dust first
@@ -499,9 +533,12 @@ metadata and a product decision). Tracked as OPUS-08.
 ## AMM Math Analysis
 
 Constant product with fee retained in the input reserve. Output derived independently:
-`Δy = y·(Δx·(1000−f)/1000) / (x + Δx·(1000−f)/1000)`, floor. Matches upstream builtin (fee-adjusted
-input drives price; full input deposited). All multiplications are done in 192-bit precision to
-avoid `u128` overflow of `x·y` and `Δx·y`. Zero-output and empty-reserve cases assert-and-abort.
+`Δy = y·(Δx·(10_000−f)/10_000) / (x + Δx·(10_000−f)/10_000)`, floor, where `f` is the fee in
+**basis points** (30 bps = 0.30%; OPUS-14 — pre-fix the code divided by 1000, a per-mil scale,
+over-charging 10×). Matches upstream builtin (fee-adjusted input drives price; full input
+deposited); note the intentional unit difference from upstream TariSwap's per-mil scale. All
+multiplications are done in 192-bit precision to avoid `u128` overflow of `x·y` and `Δx·y`.
+Zero-output and empty-reserve cases assert-and-abort.
 
 ## Rounding Analysis
 
@@ -551,10 +588,16 @@ Tests:
   receives `sqrt(a*b) − MINIMUM_LOCKED` LP (exercises OPUS-02 fix; pre-fix mint is denied).
 - `e02_redemption_returns_reserves` — full redemption returns ≈ all reserves (exercises OPUS-01 fix;
   pre-fix returns zero).
-- `e03_swap_charges_fee_growing_k` — constant product strictly increases after a swap (exercises
-  OPUS-03 fix; pre-fix `k` is flat).
+- `e03_swap_charges_fee_growing_k` — constant product strictly increases after a swap; reserve
+  delta equals the FULL input; output pinned to the exact 30-bps (0.30%) value 90,661,089
+  (exercises OPUS-03 and OPUS-14; pre-fix `k` is flat, per-mil fee=30 would deliver 88,422,971).
+- `e03b_reverse_swap_fee_grows_k` — the reverse direction (B→A) with identical 30-bps semantics
+  and the same pinned exact output.
 - `e04_slippage_min_output_enforced` — a swap demanding an impossible `min_output` is rejected
   atomically (exercises OPUS-05).
+- `e05_micro_swap_rounding` — integer rounding at micro scale under the 30-bps tier (3-unit swap
+  pays effective input 2 and receives exactly 1 unit, k still grows; 1-unit swap floors to
+  effective input 0 and must abort — never a free trade).
 
 Added in the OPUS-08 run (`audit_engine_tests/tests/`):
 - `opus08_eligibility.rs` — `resource01/02/03/07/09/10` assert the on-chain type policy (safe
@@ -567,39 +610,30 @@ Added in the OPUS-08 run (`audit_engine_tests/tests/`):
 - New `hostile` test template mints the recallable/freezable/stealth/symbol-"TARI"/safe resources
   and can recall from an arbitrary vault. It **compiles to WASM (verified locally)**.
 
-**Execution status — PREPARED, NOT YET EXECUTED (Linux CI created; not run in this session).**
-The templates compile to WASM offline against v0.41.1 (`fungible_pool` and `hostile` both verified;
-artifact hashed below), and every engine-test file passes `rustfmt` parsing locally. The engine
-*test binary* does NOT build on this **Windows** host: `tari_engine` hard-pins
-`wasmer = { features = ["cranelift"] }` and `wasmer-compiler-cranelift` emits
-`compile_error!("The Cranelift compiler backend is not supported on Windows. Use the V8 backend
-instead.")`. Cargo feature unification cannot remove a feature a dependency selects, and WSL on this
-machine is non-functional (its ext4 vhdx is on an unattached drive). A Linux workflow,
-`.github/workflows/security-engine-tests.yml` (ubuntu-latest, `contents: read`, triggers on
-pull_request / push to main / push to `security/**`), runs the full suite with real
-`tari_template_test_tooling`; it never skips the engine suite and fails if it cannot compile.
-
-Per the audit's own rule, **no finding is claimed as "engine-proven" and no engine test is claimed
-as PASS**, because the suite has not yet executed (this session cannot run Linux CI and does not
-push). The critical/high findings remain established from (a) the exact semantics of the pinned
-engine source — `Amount` integer division (`amount/ops.rs`), the resource owner mint/burn override
-(`runtime/tracker_auth.rs`), access-rule defaults (`access_rules.rs`), and the absence of any
-access-rule read in `ResourceAction` (`args/types.rs`) — and (b) a differential against the
-authoritative upstream builtin `liquidity_pool`. Running the Linux CI is the immediate next step and
-the mechanism that converts these into runtime evidence.
+**Execution status — FIRST REAL RUN DONE (Linux CI, 2026-09-24): 3 PASS / 1 FAIL.** The GitHub
+Actions workflow `.github/workflows/security-engine-tests.yml` executed the suite against the real
+engine: `e01`, `e02`, `e04` PASS. `e03` FAILED — root cause was a TEST funding bug, not a contract
+bug: `TestFaucet::take_free_coins` pays a single 1e9 payout which `add_liquidity(1e9, 1e9)` fully
+consumed, so the swap's `withdraw` failed with "Required: 100000000, Available: 0" before the
+contract executed. Funding was doubled and e03 now pins the exact fee-adjusted output. A NEW CI RUN
+IS REQUIRED to validate the OPUS-14 basis-point fix and the extended suite (e03/e03b/e05); until
+then no pass/fail of the new tests is claimed.
 
 ### Off-chain Rust tests (do run here)
 
-`crates/pool_math` (the off-chain **reference** math, NOT the code that ships): 32 tests pass
-(16 unit + 2 `amm_cycle` + 14 `protocol_tests`). `crates/protocol_types`: **7 tests pass** (the new
-`classify_resource` eligibility tests). These give false comfort if mistaken for template coverage —
-the template reimplements its own math and does not call `pool_math`.
+`crates/pool_math` (the off-chain **reference** math, NOT the code that ships): 36 tests pass
+(20 unit + 2 `amm_cycle` + 14 `protocol_tests`), including the OPUS-14 fee-unit regressions
+(`fee_tier_policy_bps_scale`, `swap_output_30bps_default_tier`). `crates/protocol_types`: **7 tests
+pass** (the `classify_resource` eligibility tests). These give false comfort if mistaken for
+template coverage — the template reimplements its own math and does not call `pool_math`.
 
-### Build artifact (current, post-OPUS-08)
+### Build artifact (current, post-OPUS-14)
 
 - Path: `templates/fungible_pool/target/wasm32-unknown-unknown/release/fungible_pool.wasm`
-- Size: 243,227 bytes
-- SHA256: `588c644cd28c27be2eceec7c432c34b70726b493c6ac355c216407c5afd1021e`
+- Size: 243,262 bytes
+- SHA256: `23cb507a47593c1782a269d772f35f526b7aebea2f63c0caaaff58d8a2a050de`
+- Previous (pre-OPUS-14): 243,227 bytes,
+  `588c644cd28c27be2eceec7c432c34b70726b493c6ac355c216407c5afd1021e`
 - Source: branch `security/audit-opus-fixes`; Ootle rev `4732f65` (v0.41.1); release profile
   (`opt-level="z"`, `lto`, `panic=abort`), features `precision`, `extra-arith`.
 - Rebuild + verify: `cargo build --manifest-path templates/fungible_pool/Cargo.toml --release

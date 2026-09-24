@@ -1,8 +1,11 @@
 // Fungible Liquidity Pool Template for Tari Ootle
 // MIT License — non-custodial, permissionless, no admin withdrawal
 // Uses upstream TariSwap constant-product model with strict access rules
-// Fee scale: per-mil out of 1000 (3 = 0.30%, 30 = 3.00%)
-// Default fee: 3 (0.30%) — 100% to LP reserves, 0% developer/protocol fee
+// Fee scale: BASIS POINTS out of 10_000 (30 = 0.30%, 1000 = 10.00%).
+// NOTE: this DIFFERS intentionally from upstream TariSwap, which uses per-mil out of 1000
+// (see docs/TARISWAP_SECURITY_DIFF.md). Basis points match the protocol spec, pool_math,
+// protocol_types (FeeTier), and the UI display (0.30%).
+// Default fee: 30 bps = 0.30% — 100% to LP reserves, 0% developer/protocol fee
 
 use tari_template_abi::rust::collections::BTreeMap;
 use tari_template_lib::prelude::*;
@@ -10,6 +13,13 @@ use tari_template_lib::prelude::*;
 #[template]
 mod fungible_pool {
     use super::*;
+
+    /// Fee denominator in basis points: fee_bps / 10_000 = fee fraction.
+    /// 30 bps = 0.30%; the maximum supported tier is 1000 bps = 10.00%.
+    const FEE_DENOMINATOR_BPS: u128 = 10_000;
+
+    /// Maximum protocol-supported fee tier: 1000 bps = 10.00%.
+    const MAX_FEE_BPS: u16 = 1_000;
 
     /// Minimum initial liquidity to defend against first-depositor ratio manipulation.
     /// Based on Tari divisibility (6): 1 TARI = 1_000_000 micro-tari.
@@ -27,15 +37,20 @@ mod fungible_pool {
     pub struct Pool {
         pools: BTreeMap<ResourceAddress, Vault>,
         lp_resource: ResourceAddress,
-        fee: u16,               // per-mil out of 1000; 3 = 0.30%; max 100 = 10.00%
+        fee_bps: u16, // basis points out of 10_000; 30 = 0.30%; max 1000 = 10.00%
         locked_lp_vault: Vault, // Permanently holds MINIMUM_LOCKED_LIQUIDITY shares
     }
 
     impl Pool {
-        /// Initialize a new pool for the given pair and fee.
-        /// Each resource must be pool-eligible (canonical native Tari or an ordinary public
-        /// fungible — see `validate_pool_resource`) and the two must differ.
-        pub fn new(a_addr: ResourceAddress, b_addr: ResourceAddress, fee: u16) -> Component<Self> {
+        /// Initialize a new pool for the given pair and fee tier.
+        /// `fee_bps` is in basis points (30 = 0.30%). Each resource must be pool-eligible
+        /// (canonical native Tari or an ordinary public fungible — see `validate_pool_resource`)
+        /// and the two must differ.
+        pub fn new(
+            a_addr: ResourceAddress,
+            b_addr: ResourceAddress,
+            fee_bps: u16,
+        ) -> Component<Self> {
             // Security: pair must be distinct
             assert!(a_addr != b_addr, "Pool pair resources must differ");
 
@@ -45,10 +60,10 @@ mod fungible_pool {
             Self::validate_pool_resource(a_addr);
             Self::validate_pool_resource(b_addr);
 
-            // Security: fee must be within safe range (1..=100 => 0.1%..10.0%)
+            // Security: fee must be within safe range (1..=1000 bps => 0.01%..10.00%)
             assert!(
-                fee > 0 && fee <= 100,
-                "Pool fee must be in range 1..100 (per-mil out of 1000)"
+                fee_bps > 0 && fee_bps <= MAX_FEE_BPS,
+                "Pool fee must be in range 1..1000 basis points (30 bps = 0.30%)"
             );
 
             // Security: fix resource pairing deterministically to prevent substitution
@@ -89,7 +104,7 @@ mod fungible_pool {
             Component::new(Self {
                 pools,
                 lp_resource,
-                fee,
+                fee_bps,
                 locked_lp_vault,
             })
             .with_address_allocation(allocation)
@@ -106,7 +121,7 @@ mod fungible_pool {
                     .method("lp_resource", AccessRule::AllowAll)
                     .method("lp_total_supply", AccessRule::AllowAll)
                     .method("locked_lp_supply", AccessRule::AllowAll)
-                    .method("fee", AccessRule::AllowAll),
+                    .method("fee_bps", AccessRule::AllowAll),
             )
             .create()
         }
@@ -236,12 +251,13 @@ mod fungible_pool {
             let input_amount = input_bucket.amount();
             assert!(!input_amount.is_zero(), "Swap amount must be non-zero");
 
-            // Apply the fee: fee is per-mil out of 1000 (e.g. 3 = 0.30%). The fee-reduced input
-            // is what drives the price move, but the FULL input is deposited into the reserve,
-            // so the fee difference stays in the pool as LP profit and the constant product grows.
-            let fee = Amount::new(self.fee as u128);
-            let denom = Amount::new(1000);
-            let effective_input = Self::mul_div(input_amount, denom - fee, denom);
+            // Apply the fee: fee_bps is in basis points out of 10_000 (30 bps = 0.30%). The
+            // fee-reduced input is what drives the price move, but the FULL input is deposited
+            // into the reserve, so the fee difference stays in the pool as LP profit and the
+            // constant product grows.
+            let fee_bps = Amount::new(self.fee_bps as u128);
+            let denom = Amount::new(FEE_DENOMINATOR_BPS);
+            let effective_input = Self::mul_div(input_amount, denom - fee_bps, denom);
             assert!(
                 effective_input.is_positive(),
                 "Swap input too small to yield any output after fee"
@@ -369,9 +385,9 @@ mod fungible_pool {
             self.locked_lp_vault.balance()
         }
 
-        /// Read fee tier.
-        pub fn fee(&self) -> u16 {
-            self.fee
+        /// Read fee tier in basis points (30 bps = 0.30%).
+        pub fn fee_bps(&self) -> u16 {
+            self.fee_bps
         }
 
         /// Internal validation: is this the canonical native Tari resource?

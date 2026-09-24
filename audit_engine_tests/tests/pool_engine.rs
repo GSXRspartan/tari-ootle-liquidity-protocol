@@ -196,22 +196,25 @@ fn e02_redemption_returns_reserves() {
 
 /// Fee / invariant: after a swap the constant product k must strictly INCREASE (fee retained
 /// for LPs). Pre-fix the swap used the full input in the k-division and discarded the fee.
+/// (OPUS-14) The fee is in BASIS POINTS out of 10_000: 30 bps = 0.30%. Pre-OPUS-14 the
+/// contract divided by 1000 (per-mil), so fee=30 charged 3.0% — 10x the advertised 0.30%.
 ///
-/// Exact integer expectation for this test (fee = 30 per-mil = 3.0%, reserves 1e9/1e9, input
+/// Exact integer expectation for this test (fee = 30 bps = 0.30%, reserves 1e9/1e9, input
 /// 100_000_000):
-///   effective_input = 100_000_000 * (1000 - 30) / 1000          = 97_000_000
-///   output          = 1e9 * 97_000_000 / (1e9 + 97_000_000)     = 88_422_971  (floor)
+///   effective_input = 100_000_000 * (10_000 - 30) / 10_000      = 99_700_000
+///   output          = 1e9 * 99_700_000 / (1e9 + 99_700_000)     = 90_661_089  (floor)
 ///   reserve_a_after = 1_100_000_000   (FULL input deposited; fee stays in reserve for LPs)
-///   reserve_b_after = 911_577_029
+///   reserve_b_after = 909_338_911
 ///   k_before        = 1_000_000_000_000_000_000
-///   k_after         = 1_002_734_731_900_000_000   (> k_before by 2_734_731_900_000_000)
+///   k_after         = 1_000_272_802_100_000_000   (> k_before by 272_802_100_000_000)
+///   fee-free output = 90_909_090 (trader must receive strictly less)
 ///
-/// NOTE: CI failure of this test on 2026-09-24 was NOT a contract bug — the account held only
+/// NOTE: the earlier CI failure of this test was NOT a contract bug — the account held only
 /// the single 1e9 faucet payout, which add_liquidity consumed, so the swap's withdraw failed
 /// with "Required: 100000000, Available: 0" before the contract ever executed.
 #[test]
 fn e03_swap_charges_fee_growing_k() {
-    let mut pt = setup(30); // fee is per-mil out of 1000: 30 = 3.0%
+    let mut pt = setup(30); // fee is in basis points: 30 = 0.30%
     add_liquidity(
         &mut pt,
         Amount::from(1_000_000_000u64),
@@ -239,19 +242,19 @@ fn e03_swap_charges_fee_growing_k() {
     let actual_output = account_balance(pt.b, &mut pt).to_u128() - acct_b_before;
 
     // Independent reference calculation (no floats, floor division) matching the template:
-    let effective_input = 100_000_000u128 * 970 / 1000;
+    let effective_input = 100_000_000u128 * 9_970 / 10_000;
     let expected_output = b0 * effective_input / (a0 + effective_input);
     let fee_free_output = b0 * 100_000_000u128 / (a0 + 100_000_000u128);
     let k_delta = k1 - k0;
 
     println!(
-        "e03 diagnostics: reserve_a_before={} reserve_b_before={} input=100000000 fee_bps_per_mil=30 \
+        "e03 diagnostics: reserve_a_before={} reserve_b_before={} input=100000000 fee_bps=30 \
          effective_input={} expected_output={} actual_output={} reserve_a_after={} \
          reserve_b_after={} k_before={} k_after={} k_delta={}",
         a0, b0, effective_input, expected_output, actual_output, a1, b1, k0, k1, k_delta
     );
 
-    // FULL input lands in the reserve — the fee (3_000_000 of input) stays with the LPs.
+    // FULL input lands in the reserve — the fee (30_000 of input) stays with the LPs.
     assert_eq!(
         a1,
         a0 + 100_000_000u128,
@@ -271,13 +274,20 @@ fn e03_swap_charges_fee_growing_k() {
         k0,
         k1
     );
+    // OPUS-14 guard: fee must be charged at the ADVERTISED 30 bps (0.30%), not 10x.
+    // With 30 bps the trader receives 90_661_089; a 10x (per-mil) fee would deliver only
+    // 88_422_971. Pin the exact value so a fee-unit regression cannot slip through.
+    assert_eq!(
+        actual_output, 90_661_089u128,
+        "output must match the 30-bps (0.30%) fee tier exactly"
+    );
 }
 
 /// Reverse direction (B -> A): identical fee semantics must hold symmetrically.
-/// effective_input = 97_000_000, output = 88_422_971, k_after = 1_002_734_731_900_000_000.
+/// effective_input = 99_700_000, output = 90_661_089, k_after = 1_000_272_802_100_000_000.
 #[test]
 fn e03b_reverse_swap_fee_grows_k() {
-    let mut pt = setup(30); // fee is per-mil out of 1000: 30 = 3.0%
+    let mut pt = setup(30); // fee is in basis points: 30 = 0.30%
     add_liquidity(
         &mut pt,
         Amount::from(1_000_000_000u64),
@@ -304,7 +314,7 @@ fn e03b_reverse_swap_fee_grows_k() {
     let k1 = a1 * b1;
     let actual_output = account_balance(pt.a, &mut pt).to_u128() - acct_a_before;
 
-    let effective_input = 100_000_000u128 * 970 / 1000;
+    let effective_input = 100_000_000u128 * 9_970 / 10_000;
     let expected_output = a0 * effective_input / (b0 + effective_input);
 
     println!(
@@ -331,6 +341,10 @@ fn e03b_reverse_swap_fee_grows_k() {
     assert_eq!(
         actual_output, expected_output,
         "reverse-direction output mismatch"
+    );
+    assert_eq!(
+        actual_output, 90_661_089u128,
+        "reverse-direction output must match the 30-bps (0.30%) fee tier exactly"
     );
     assert!(
         k1 > k0,
@@ -368,13 +382,17 @@ fn e04_slippage_min_output_enforced() {
     println!("e04 rejected as expected: {:?}", reason);
 }
 
-/// Integer rounding at micro scale (documents behavior, does not weaken assertions):
-///   * a 3-unit swap pays effective input 3*970/1000 = 2 (floor) and receives exactly
+/// Integer rounding at micro scale (documents behavior, does not weaken assertions), under the
+/// 30-bps (0.30%) fee tier:
+///   * a 3-unit swap pays effective input 3*9_970/10_000 = 2 (floor) and receives exactly
 ///     1_000_000_000 * 2 / (1_000_000_000 + 2) = 1 unit out; k still grows;
-///   * a 1-unit swap has effective input 970/1000 = 0 and must ABORT (never a free trade).
+///   * a 1-unit swap has effective input 9_970/10_000 = 0 and must ABORT (never a free trade).
+///
+/// No sequence of such micro-swaps can create free value: every successful trade strictly
+/// decreases the trader's combined input+output value (fee floor + output floor).
 #[test]
 fn e05_micro_swap_rounding() {
-    let mut pt = setup(30); // 3.0% fee
+    let mut pt = setup(30); // fee is in basis points: 30 = 0.30%
     add_liquidity(
         &mut pt,
         Amount::from(1_000_000_000u64),
