@@ -88,12 +88,18 @@ fn setup(fee: u16) -> PoolTest {
 
 fn fund(pt: &mut PoolTest, faucet: ComponentAddress) {
     let account = pt.account;
-    let tx =
-        pt.t.transaction()
-            .call_method(faucet, "take_free_coins", args![])
-            .put_last_instruction_output_on_workspace("coins")
-            .call_method(account, "deposit", args![Workspace("coins")]);
-    pt.t.build_and_execute(tx, vec![]).expect_success();
+    // TestFaucet::take_free_coins pays out exactly 1_000_000_000 units per call. The engine
+    // tests deposit up to 1_000_000_000 into the pool AND then swap up to 100_000_000 more, so
+    // the account needs 2 payouts of each resource; a single payout left it with 0 and made the
+    // swap's `withdraw` fail with "Required: 100000000, Available: 0" (e03 CI failure).
+    for _ in 0..2 {
+        let tx =
+            pt.t.transaction()
+                .call_method(faucet, "take_free_coins", args![])
+                .put_last_instruction_output_on_workspace("coins")
+                .call_method(account, "deposit", args![Workspace("coins")]);
+        pt.t.build_and_execute(tx, vec![]).expect_success();
+    }
 }
 
 // NOTE: `resource` comes BEFORE `&mut pt` so a `pt.<field>` argument is read (Copy) before the
@@ -190,9 +196,22 @@ fn e02_redemption_returns_reserves() {
 
 /// Fee / invariant: after a swap the constant product k must strictly INCREASE (fee retained
 /// for LPs). Pre-fix the swap used the full input in the k-division and discarded the fee.
+///
+/// Exact integer expectation for this test (fee = 30 per-mil = 3.0%, reserves 1e9/1e9, input
+/// 100_000_000):
+///   effective_input = 100_000_000 * (1000 - 30) / 1000          = 97_000_000
+///   output          = 1e9 * 97_000_000 / (1e9 + 97_000_000)     = 88_422_971  (floor)
+///   reserve_a_after = 1_100_000_000   (FULL input deposited; fee stays in reserve for LPs)
+///   reserve_b_after = 911_577_029
+///   k_before        = 1_000_000_000_000_000_000
+///   k_after         = 1_002_734_731_900_000_000   (> k_before by 2_734_731_900_000_000)
+///
+/// NOTE: CI failure of this test on 2026-09-24 was NOT a contract bug — the account held only
+/// the single 1e9 faucet payout, which add_liquidity consumed, so the swap's withdraw failed
+/// with "Required: 100000000, Available: 0" before the contract ever executed.
 #[test]
 fn e03_swap_charges_fee_growing_k() {
-    let mut pt = setup(30); // 3.0% fee
+    let mut pt = setup(30); // fee is per-mil out of 1000: 30 = 3.0%
     add_liquidity(
         &mut pt,
         Amount::from(1_000_000_000u64),
@@ -202,6 +221,7 @@ fn e03_swap_charges_fee_growing_k() {
     let a0 = pool_balance(pt.a, &mut pt).to_u128();
     let b0 = pool_balance(pt.b, &mut pt).to_u128();
     let k0 = a0 * b0;
+    let acct_b_before = account_balance(pt.b, &mut pt).to_u128();
 
     let (a, b, account, pool, proof) = (pt.a, pt.b, pt.account, pt.pool, pt.account_proof.clone());
     let tx =
@@ -216,10 +236,105 @@ fn e03_swap_charges_fee_growing_k() {
     let a1 = pool_balance(pt.a, &mut pt).to_u128();
     let b1 = pool_balance(pt.b, &mut pt).to_u128();
     let k1 = a1 * b1;
-    println!("e03 k0={} k1={}", k0, k1);
+    let actual_output = account_balance(pt.b, &mut pt).to_u128() - acct_b_before;
+
+    // Independent reference calculation (no floats, floor division) matching the template:
+    let effective_input = 100_000_000u128 * 970 / 1000;
+    let expected_output = b0 * effective_input / (a0 + effective_input);
+    let fee_free_output = b0 * 100_000_000u128 / (a0 + 100_000_000u128);
+    let k_delta = k1 - k0;
+
+    println!(
+        "e03 diagnostics: reserve_a_before={} reserve_b_before={} input=100000000 fee_bps_per_mil=30 \
+         effective_input={} expected_output={} actual_output={} reserve_a_after={} \
+         reserve_b_after={} k_before={} k_after={} k_delta={}",
+        a0, b0, effective_input, expected_output, actual_output, a1, b1, k0, k1, k_delta
+    );
+
+    // FULL input lands in the reserve — the fee (3_000_000 of input) stays with the LPs.
+    assert_eq!(
+        a1,
+        a0 + 100_000_000u128,
+        "full input must be deposited into the input reserve"
+    );
+    assert_eq!(
+        actual_output, expected_output,
+        "engine output does not match exact fee-adjusted constant-product math"
+    );
+    assert!(
+        actual_output < fee_free_output,
+        "trader received the fee-free output; fee not retained"
+    );
     assert!(
         k1 > k0,
         "fee NOT charged: k did not grow (k0={} k1={})",
+        k0,
+        k1
+    );
+}
+
+/// Reverse direction (B -> A): identical fee semantics must hold symmetrically.
+/// effective_input = 97_000_000, output = 88_422_971, k_after = 1_002_734_731_900_000_000.
+#[test]
+fn e03b_reverse_swap_fee_grows_k() {
+    let mut pt = setup(30); // fee is per-mil out of 1000: 30 = 3.0%
+    add_liquidity(
+        &mut pt,
+        Amount::from(1_000_000_000u64),
+        Amount::from(1_000_000_000u64),
+    );
+
+    let a0 = pool_balance(pt.a, &mut pt).to_u128();
+    let b0 = pool_balance(pt.b, &mut pt).to_u128();
+    let k0 = a0 * b0;
+    let acct_a_before = account_balance(pt.a, &mut pt).to_u128();
+
+    let (a, b, account, pool, proof) = (pt.a, pt.b, pt.account, pt.pool, pt.account_proof.clone());
+    let tx =
+        pt.t.transaction()
+            .call_method(account, "withdraw", args![b, Amount::from(100_000_000u64)])
+            .put_last_instruction_output_on_workspace("in")
+            .call_method(pool, "swap", args![Workspace("in"), a, Amount::from(1u64)])
+            .put_last_instruction_output_on_workspace("out")
+            .call_method(account, "deposit", args![Workspace("out")]);
+    pt.t.build_and_execute(tx, vec![proof]).expect_success();
+
+    let a1 = pool_balance(pt.a, &mut pt).to_u128();
+    let b1 = pool_balance(pt.b, &mut pt).to_u128();
+    let k1 = a1 * b1;
+    let actual_output = account_balance(pt.a, &mut pt).to_u128() - acct_a_before;
+
+    let effective_input = 100_000_000u128 * 970 / 1000;
+    let expected_output = a0 * effective_input / (b0 + effective_input);
+
+    println!(
+        "e03b diagnostics: reserve_a_before={} reserve_b_before={} input=100000000 \
+         effective_input={} expected_output={} actual_output={} reserve_a_after={} \
+         reserve_b_after={} k_before={} k_after={} k_delta={}",
+        a0,
+        b0,
+        effective_input,
+        expected_output,
+        actual_output,
+        a1,
+        b1,
+        k0,
+        k1,
+        k1 - k0
+    );
+
+    assert_eq!(
+        b1,
+        b0 + 100_000_000u128,
+        "full input must reach the reserve"
+    );
+    assert_eq!(
+        actual_output, expected_output,
+        "reverse-direction output mismatch"
+    );
+    assert!(
+        k1 > k0,
+        "fee NOT charged in reverse direction (k0={} k1={})",
         k0,
         k1
     );
@@ -251,4 +366,66 @@ fn e04_slippage_min_output_enforced() {
             .build_and_seal(pt.t.secret_key());
     let reason = pt.t.execute_expect_failure(sealed, vec![proof]);
     println!("e04 rejected as expected: {:?}", reason);
+}
+
+/// Integer rounding at micro scale (documents behavior, does not weaken assertions):
+///   * a 3-unit swap pays effective input 3*970/1000 = 2 (floor) and receives exactly
+///     1_000_000_000 * 2 / (1_000_000_000 + 2) = 1 unit out; k still grows;
+///   * a 1-unit swap has effective input 970/1000 = 0 and must ABORT (never a free trade).
+#[test]
+fn e05_micro_swap_rounding() {
+    let mut pt = setup(30); // 3.0% fee
+    add_liquidity(
+        &mut pt,
+        Amount::from(1_000_000_000u64),
+        Amount::from(1_000_000_000u64),
+    );
+
+    let a0 = pool_balance(pt.a, &mut pt).to_u128();
+    let b0 = pool_balance(pt.b, &mut pt).to_u128();
+    let k0 = a0 * b0;
+
+    let (a, b, account, pool, proof) = (pt.a, pt.b, pt.account, pt.pool, pt.account_proof.clone());
+    let tx =
+        pt.t.transaction()
+            .call_method(account, "withdraw", args![a, Amount::from(3u64)])
+            .put_last_instruction_output_on_workspace("in")
+            .call_method(pool, "swap", args![Workspace("in"), b, Amount::from(1u64)])
+            .put_last_instruction_output_on_workspace("out")
+            .call_method(account, "deposit", args![Workspace("out")]);
+    pt.t.build_and_execute(tx, vec![proof]).expect_success();
+
+    let a1 = pool_balance(pt.a, &mut pt).to_u128();
+    let b1 = pool_balance(pt.b, &mut pt).to_u128();
+    let k1 = a1 * b1;
+    println!(
+        "e05 micro-swap: a0={} b0={} a1={} b1={} k0={} k1={} k_delta={}",
+        a0,
+        b0,
+        a1,
+        b1,
+        k0,
+        k1,
+        k1 - k0
+    );
+    assert_eq!(a1, a0 + 3u128, "3-unit swap must deposit the full input");
+    assert_eq!(b1, b0 - 1u128, "3-unit swap output must floor to exactly 1");
+    assert!(
+        k1 > k0,
+        "3-unit swap must still grow k (k0={} k1={})",
+        k0,
+        k1
+    );
+
+    // 1-unit swap: effective input floors to 0 -> must abort, never a free trade.
+    let sealed =
+        pt.t.transaction()
+            .call_method(account, "withdraw", args![a, Amount::from(1u64)])
+            .put_last_instruction_output_on_workspace("in")
+            .call_method(pool, "swap", args![Workspace("in"), b, Amount::from(1u64)])
+            .put_last_instruction_output_on_workspace("out")
+            .call_method(account, "deposit", args![Workspace("out")])
+            .build_and_seal(pt.t.secret_key());
+    let reason = pt.t.execute_expect_failure(sealed, vec![proof]);
+    println!("e05 1-unit swap rejected as expected: {:?}", reason);
 }
