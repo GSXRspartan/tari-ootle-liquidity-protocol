@@ -411,7 +411,10 @@ fn e05_micro_swap_rounding() {
             .call_method(pool, "swap", args![Workspace("in"), b, Amount::from(1u64)])
             .put_last_instruction_output_on_workspace("out")
             .call_method(account, "deposit", args![Workspace("out")]);
-    pt.t.build_and_execute(tx, vec![proof]).expect_success();
+    // `proof` (NonFungibleAddress) is not Copy; clone here so the same authorization identity
+    // stays available for the 1-unit rejection transaction below.
+    pt.t.build_and_execute(tx, vec![proof.clone()])
+        .expect_success();
 
     let a1 = pool_balance(pt.a, &mut pt).to_u128();
     let b1 = pool_balance(pt.b, &mut pt).to_u128();
