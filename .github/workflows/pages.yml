@@ -20,15 +20,23 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      # pnpm MUST be installed before setup-node so any pnpm-aware step can find it. (Previously
+      # setup-node ran with `cache: 'pnpm'` before pnpm existed → "Unable to locate executable
+      # file: pnpm".) Pin to pnpm 9 to honor package.json `engines.pnpm >= 9.0.0`.
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: 'pnpm'
-      - name: Install pnpm
-        run: npm install -g pnpm
+      # NOTE: this repo currently ships no pnpm-lock.yaml (only a stray npm package-lock.json), so
+      # setup-node's `cache: 'pnpm'` and `--frozen-lockfile` cannot be used yet — both need a
+      # committed pnpm-lock.yaml. Once one is generated and committed, re-add `cache: 'pnpm'` above
+      # and switch this to `--frozen-lockfile` for reproducible, cached installs.
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: pnpm install --no-frozen-lockfile
       - name: Build static web app
         run: pnpm --filter @tari-ootle/web build
       - name: Upload artifact

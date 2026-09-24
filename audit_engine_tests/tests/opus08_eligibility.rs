@@ -1,7 +1,7 @@
 // OPUS-08 resource-eligibility engine tests.
 //
 // Proves the ON-CHAIN type policy enforced by Pool::new (validate_pool_resource):
-//   * canonical native Tari (XTR) and ordinary public fungibles are accepted;
+//   * canonical native Tari (TARI_TOKEN) and ordinary public fungibles are accepted;
 //   * confidential / non-Tari stealth / non-fungible resources are rejected;
 //   * a same-resource pair is rejected;
 //   * metadata (e.g. a token that calls itself "TARI") does not affect eligibility.
@@ -14,9 +14,8 @@
 
 use tari_ootle_common_types::substate_type::SubstateType;
 use tari_ootle_transaction::args;
-use tari_template_lib::models::ComponentAddress;
-use tari_template_lib::prelude::{Amount, XTR};
-use tari_template_lib::types::ResourceAddress;
+use tari_template_lib::types::constants::TARI_TOKEN;
+use tari_template_lib::types::{Amount, ComponentAddress, ResourceAddress};
 use tari_template_test_tooling::TemplateTest;
 
 const CRATE_PATH: &str = env!("CARGO_MANIFEST_DIR");
@@ -87,13 +86,13 @@ fn resource01_safe_public_fungible_pair_accepted() {
     );
 }
 
-// RESOURCE02 — canonical native Tari (XTR) paired with a fungible is accepted.
+// RESOURCE02 — canonical native Tari (TARI_TOKEN) paired with a fungible is accepted.
 #[test]
 fn resource02_canonical_tari_accepted() {
     let mut t = new_test();
     let b = faucet_fungible(&mut t, "BBB");
     assert!(
-        try_create_pool(&mut t, XTR, b, 3),
+        try_create_pool(&mut t, TARI_TOKEN, b, 3),
         "canonical Tari pair should be accepted"
     );
 }
@@ -106,12 +105,12 @@ fn resource03_fake_tari_is_just_a_fungible_not_canonical() {
     let mut t = new_test();
     let fake_tari = hostile_resource(&mut t, "symbol_tari_fungible");
     assert_ne!(
-        fake_tari, XTR,
+        fake_tari, TARI_TOKEN,
         "fake Tari must have a different address than canonical Tari"
     );
     // It is accepted only as an ordinary fungible, paired here with the real Tari.
     assert!(
-        try_create_pool(&mut t, XTR, fake_tari, 3),
+        try_create_pool(&mut t, TARI_TOKEN, fake_tari, 3),
         "fake Tari should pool as an ordinary fungible"
     );
 }

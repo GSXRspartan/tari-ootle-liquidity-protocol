@@ -10,9 +10,7 @@
 
 use tari_ootle_common_types::substate_type::SubstateType;
 use tari_ootle_transaction::args;
-use tari_template_lib::models::ComponentAddress;
-use tari_template_lib::prelude::Amount;
-use tari_template_lib::types::{NonFungibleAddress, ResourceAddress};
+use tari_template_lib::types::{Amount, ComponentAddress, NonFungibleAddress, ResourceAddress};
 use tari_template_test_tooling::TemplateTest;
 
 const CRATE_PATH: &str = env!("CARGO_MANIFEST_DIR");
@@ -139,7 +137,9 @@ fn remove_all_lp(ctx: &mut Ctx, acc: ComponentAddress, proof: &NonFungibleAddres
         .expect_success();
 }
 
-fn bal(ctx: &mut Ctx, acc: ComponentAddress, r: ResourceAddress) -> Amount {
+// `acc`/`r` (both Copy) precede `&mut ctx` so any `ctx.<field>` argument is read before the mutable
+// borrow — avoids E0503 (no two-phase borrow for a free function's `&mut` argument).
+fn bal(acc: ComponentAddress, r: ResourceAddress, ctx: &mut Ctx) -> Amount {
     ctx.t.call_method(acc, "balance", args![r], vec![])
 }
 
@@ -162,7 +162,7 @@ fn e11_second_independent_lp_can_provide() {
 
     let (lp2, p2) = funded_lp(&mut ctx, 0);
     add_liquidity(&mut ctx, lp2, &p2, 5_000_000, 5_000_000);
-    let lp2_shares = bal(&mut ctx, lp2, ctx.lp);
+    let lp2_shares = bal(lp2, ctx.lp, &mut ctx);
     println!("e11 second LP shares = {}", lp2_shares);
     assert!(
         lp2_shares.is_positive(),
@@ -224,13 +224,13 @@ fn first_depositor_cannot_steal_victim_share() {
 
     // Victim adds 100x proportional liquidity.
     let (victim, vp) = funded_lp(&mut ctx, 0);
-    let victim_a_before = bal(&mut ctx, victim, ctx.a);
+    let victim_a_before = bal(victim, ctx.a, &mut ctx);
     add_liquidity(&mut ctx, victim, &vp, 100_000_000, 100_000_000);
 
     // Attacker exits everything.
-    let atk_a_before = bal(&mut ctx, attacker, ctx.a);
+    let atk_a_before = bal(attacker, ctx.a, &mut ctx);
     remove_all_lp(&mut ctx, attacker, &ap);
-    let atk_a_gained = bal(&mut ctx, attacker, ctx.a) - atk_a_before;
+    let atk_a_gained = bal(attacker, ctx.a, &mut ctx) - atk_a_before;
     println!("first-depositor: attacker A recovered = {}", atk_a_gained);
 
     // Attacker must not extract more than roughly what they contributed (1_000_000); certainly not
@@ -248,7 +248,7 @@ fn first_depositor_cannot_steal_victim_share() {
 
     // Victim exits and must recover ~their full contribution.
     remove_all_lp(&mut ctx, victim, &vp);
-    let victim_a_after = bal(&mut ctx, victim, ctx.a);
+    let victim_a_after = bal(victim, ctx.a, &mut ctx);
     // Net change vs before adding = -deposit + returned; returned should be ~= deposit.
     let victim_net = victim_a_before - victim_a_after; // small (rounding/locked share)
     println!("first-depositor: victim net A cost = {}", victim_net);

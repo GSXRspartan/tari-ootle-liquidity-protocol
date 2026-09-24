@@ -7,9 +7,7 @@
 
 use tari_ootle_common_types::substate_type::SubstateType;
 use tari_ootle_transaction::args;
-use tari_template_lib::models::ComponentAddress;
-use tari_template_lib::prelude::Amount;
-use tari_template_lib::types::{NonFungibleAddress, ResourceAddress};
+use tari_template_lib::types::{Amount, ComponentAddress, NonFungibleAddress, ResourceAddress};
 use tari_template_test_tooling::TemplateTest;
 
 const CRATE_PATH: &str = env!("CARGO_MANIFEST_DIR");
@@ -98,12 +96,15 @@ fn fund(pt: &mut PoolTest, faucet: ComponentAddress) {
     pt.t.build_and_execute(tx, vec![]).expect_success();
 }
 
-fn account_balance(pt: &mut PoolTest, resource: ResourceAddress) -> Amount {
+// NOTE: `resource` comes BEFORE `&mut pt` so a `pt.<field>` argument is read (Copy) before the
+// mutable borrow is taken — avoids E0503 at call sites (two-phase borrow does not apply to a free
+// function's explicit `&mut` argument).
+fn account_balance(resource: ResourceAddress, pt: &mut PoolTest) -> Amount {
     let acc = pt.account;
     pt.t.call_method(acc, "balance", args![resource], vec![])
 }
 
-fn pool_balance(pt: &mut PoolTest, resource: ResourceAddress) -> Amount {
+fn pool_balance(resource: ResourceAddress, pt: &mut PoolTest) -> Amount {
     let pool = pt.pool;
     pt.t.call_method(pool, "get_pool_balance", args![resource], vec![])
 }
@@ -135,7 +136,7 @@ fn e01_permissionless_add_liquidity_and_lp_received() {
         Amount::from(10_000_000u64),
         Amount::from(10_000_000u64),
     );
-    let lp_held = account_balance(&mut pt, pt.lp);
+    let lp_held = account_balance(pt.lp, &mut pt);
     println!("e01 LP held by non-creator provider = {}", lp_held);
     assert!(lp_held.is_positive(), "non-creator provider received no LP");
     // total minted = floor(sqrt(1e7*1e7)) = 1e7; locked minimum = 1000
@@ -156,9 +157,9 @@ fn e02_redemption_returns_reserves() {
         Amount::from(10_000_000u64),
     );
 
-    let lp_held = account_balance(&mut pt, pt.lp);
-    let a_before = account_balance(&mut pt, pt.a);
-    let b_before = account_balance(&mut pt, pt.b);
+    let lp_held = account_balance(pt.lp, &mut pt);
+    let a_before = account_balance(pt.a, &mut pt);
+    let b_before = account_balance(pt.b, &mut pt);
 
     let (lp, account, pool, proof) = (pt.lp, pt.account, pt.pool, pt.account_proof.clone());
     let tx =
@@ -171,8 +172,8 @@ fn e02_redemption_returns_reserves() {
             .call_method(account, "deposit", args![Workspace("out.1")]);
     pt.t.build_and_execute(tx, vec![proof]).expect_success();
 
-    let a_ret = account_balance(&mut pt, pt.a) - a_before;
-    let b_ret = account_balance(&mut pt, pt.b) - b_before;
+    let a_ret = account_balance(pt.a, &mut pt) - a_before;
+    let b_ret = account_balance(pt.b, &mut pt) - b_before;
     println!("e02 returned a={} b={}", a_ret, b_ret);
     // Provider held 9_999_000 of 10_000_000 total supply; expect ~9_999_000 of each.
     assert!(
@@ -198,8 +199,8 @@ fn e03_swap_charges_fee_growing_k() {
         Amount::from(1_000_000_000u64),
     );
 
-    let a0 = pool_balance(&mut pt, pt.a).to_u128();
-    let b0 = pool_balance(&mut pt, pt.b).to_u128();
+    let a0 = pool_balance(pt.a, &mut pt).to_u128();
+    let b0 = pool_balance(pt.b, &mut pt).to_u128();
     let k0 = a0 * b0;
 
     let (a, b, account, pool, proof) = (pt.a, pt.b, pt.account, pt.pool, pt.account_proof.clone());
@@ -212,8 +213,8 @@ fn e03_swap_charges_fee_growing_k() {
             .call_method(account, "deposit", args![Workspace("out")]);
     pt.t.build_and_execute(tx, vec![proof]).expect_success();
 
-    let a1 = pool_balance(&mut pt, pt.a).to_u128();
-    let b1 = pool_balance(&mut pt, pt.b).to_u128();
+    let a1 = pool_balance(pt.a, &mut pt).to_u128();
+    let b1 = pool_balance(pt.b, &mut pt).to_u128();
     let k1 = a1 * b1;
     println!("e03 k0={} k1={}", k0, k1);
     assert!(

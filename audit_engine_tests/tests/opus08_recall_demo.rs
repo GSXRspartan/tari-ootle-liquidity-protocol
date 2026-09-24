@@ -10,9 +10,7 @@ use std::collections::BTreeMap;
 
 use tari_ootle_common_types::substate_type::SubstateType;
 use tari_ootle_transaction::args;
-use tari_template_lib::models::ComponentAddress;
-use tari_template_lib::prelude::Amount;
-use tari_template_lib::types::{NonFungibleAddress, ResourceAddress, VaultId};
+use tari_template_lib::types::{Amount, ComponentAddress, ResourceAddress, VaultId};
 use tari_template_test_tooling::TemplateTest;
 
 const CRATE_PATH: &str = env!("CARGO_MANIFEST_DIR");
@@ -165,7 +163,3 @@ fn recallable_token_can_be_drained_from_pool_reserves() {
         "recall must have reduced the pool's evil reserve (custody compromised)"
     );
 }
-
-// Silence unused-import warnings if the harness types shift.
-#[allow(dead_code)]
-fn _types(_: Option<NonFungibleAddress>) {}
