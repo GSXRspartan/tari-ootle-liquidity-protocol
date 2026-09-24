@@ -105,6 +105,7 @@ mod fungible_pool {
                     .method("get_pool_balance", AccessRule::AllowAll)
                     .method("lp_resource", AccessRule::AllowAll)
                     .method("lp_total_supply", AccessRule::AllowAll)
+                    .method("locked_lp_supply", AccessRule::AllowAll)
                     .method("fee", AccessRule::AllowAll),
             )
             .create()
