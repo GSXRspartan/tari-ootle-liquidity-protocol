@@ -4,6 +4,12 @@ export interface IndexerProvider {
 }
 
 export * from './marketplace';
+export * from './execution';
+export * from './ootle';
+export * from './amm';
+export * from './history';
+export * from './execution_flow';
+export * from './chains/minotari';
 
 export interface IndexerResponse<T> {
   data: T;

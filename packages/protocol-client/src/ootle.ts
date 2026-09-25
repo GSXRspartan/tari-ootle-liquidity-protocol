@@ -9,7 +9,7 @@
  * an on-chain value.
  */
 import {
-  AuthoritativeRead,
+  ExecutionAuthoritativeRead,
   Freshness,
   FreshnessIdentity,
   isAuthoritativeSource,
@@ -80,7 +80,7 @@ function field(envelope: EnvelopeInput, name: string): string {
 
 /** Readback provider interface for pools (separate from any pool discovery/search). */
 export interface PoolReadbackProvider {
-  readPool(poolComponent: string): Promise<AuthoritativeRead<PoolState>>;
+  readPool(poolComponent: string): Promise<ExecutionAuthoritativeRead<PoolState>>;
 }
 
 export function parsePoolState(envelope: EnvelopeInput): PoolState {
@@ -99,9 +99,9 @@ export function parsePoolState(envelope: EnvelopeInput): PoolState {
 }
 
 export interface OotleReadbackProvider extends PoolReadbackProvider {
-  readListing(listingAddress: string): Promise<AuthoritativeRead<Listing>>;
-  readItemOffer(offerAddress: string): Promise<AuthoritativeRead<ItemOffer>>;
-  readCollectionBid(bidAddress: string): Promise<AuthoritativeRead<CollectionBid>>;
+  readListing(listingAddress: string): Promise<ExecutionAuthoritativeRead<Listing>>;
+  readItemOffer(offerAddress: string): Promise<ExecutionAuthoritativeRead<ItemOffer>>;
+  readCollectionBid(bidAddress: string): Promise<ExecutionAuthoritativeRead<CollectionBid>>;
 }
 
 /**
@@ -113,7 +113,7 @@ export function createOotleReadbackProvider(reader: AuthoritativeSubstateReader,
   if (!isAuthoritativeSource(source)) {
     throw new Error('Ootle readback must be backed by an authoritative source (CHAIN_NODE or WALLET_PROVIDER)');
   }
-  async function readEnvelope(address: string, expectedTemplate: string): Promise<AuthoritativeRead<EnvelopeInput>> {
+  async function readEnvelope(address: string, expectedTemplate: string): Promise<ExecutionAuthoritativeRead<EnvelopeInput>> {
     let envelope: OotleSubstateEnvelope | undefined;
     try {
       envelope = await reader.readComponent(address);
@@ -128,7 +128,7 @@ export function createOotleReadbackProvider(reader: AuthoritativeSubstateReader,
     return { status: 'FOUND', value: withSource, freshness: freshness(withSource) };
   }
   return {
-    async readPool(poolComponent: string): Promise<AuthoritativeRead<PoolState>> {
+    async readPool(poolComponent: string): Promise<ExecutionAuthoritativeRead<PoolState>> {
       const read = await readEnvelope(poolComponent, 'Pool');
       if (read.status === 'UNAVAILABLE') return { status: 'UNAVAILABLE', reason: read.reason };
       try {
@@ -137,7 +137,7 @@ export function createOotleReadbackProvider(reader: AuthoritativeSubstateReader,
         return { status: 'UNAVAILABLE', reason: (error as Error).message };
       }
     },
-    async readListing(address: string): Promise<AuthoritativeRead<Listing>> {
+    async readListing(address: string): Promise<ExecutionAuthoritativeRead<Listing>> {
       const read = await readEnvelope(address, 'FixedPriceListing');
       if (read.status === 'UNAVAILABLE') return { status: 'UNAVAILABLE', reason: read.reason };
       const e = read.value;
@@ -157,7 +157,7 @@ export function createOotleReadbackProvider(reader: AuthoritativeSubstateReader,
         freshness: read.freshness,
       };
     },
-    async readItemOffer(address: string): Promise<AuthoritativeRead<ItemOffer>> {
+    async readItemOffer(address: string): Promise<ExecutionAuthoritativeRead<ItemOffer>> {
       const read = await readEnvelope(address, 'ItemOffer');
       if (read.status === 'UNAVAILABLE') return { status: 'UNAVAILABLE', reason: read.reason };
       const e = read.value;
@@ -177,7 +177,7 @@ export function createOotleReadbackProvider(reader: AuthoritativeSubstateReader,
         freshness: read.freshness,
       };
     },
-    async readCollectionBid(address: string): Promise<AuthoritativeRead<CollectionBid>> {
+    async readCollectionBid(address: string): Promise<ExecutionAuthoritativeRead<CollectionBid>> {
       const read = await readEnvelope(address, 'CollectionBid');
       if (read.status === 'UNAVAILABLE') return { status: 'UNAVAILABLE', reason: read.reason };
       const e = read.value;
@@ -211,4 +211,5 @@ function optionalField(e: EnvelopeInput, name: string): string | undefined {
 function normalizeStatus<T extends string>(raw: string, allowed: T[], fallback: T): T {
   return (allowed as string[]).includes(raw) ? (raw as T) : fallback;
 }
+
 

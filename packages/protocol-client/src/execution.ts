@@ -55,7 +55,7 @@ export type ExecutionOutcomeStatus =
   | 'CANCELLED'
   | 'CONFLICTED';
 
-export type AuthoritativeRead<T> =
+export type ExecutionAuthoritativeRead<T> =
   | { status: 'FOUND'; value: T; freshness: Freshness }
   | { status: 'UNAVAILABLE'; reason: string };
 
