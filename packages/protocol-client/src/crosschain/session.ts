@@ -26,8 +26,7 @@ export type CrossChainSessionState =
   | 'FAILED_TERMINAL';
 
 /** Event that drives a validated transition. */
-export type CrossChainEvent =
-  | { kind: 'ACCEPT_QUOTE'; nowUnixMs: number }
+export type CrossChainEvent =  | { kind: 'ACCEPT_QUOTE'; nowUnixMs: number }
   | { kind: 'QUOTE_EXPIRED_UNFUNDED'; nowUnixMs: number }
   | { kind: 'BEGIN_L1_FUNDING'; deadlineSafetyEvidence: string }
   /**
@@ -39,12 +38,12 @@ export type CrossChainEvent =
   | { kind: 'L1_FUND_ACKNOWLEDGED'; l1TxId: string; walletPreimageHex?: string; hashHex?: string }
   | { kind: 'L1_FUND_UNKNOWN'; transportError: string }
   | { kind: 'L1_FUND_REJECTED'; reason: string }
-  | { kind: 'L1_VERIFIED_FUNDED'; evidence: { l1TxId: string; confirmations: string; hashMatches: boolean; amountExact: boolean; amountAuthoritative?: boolean; deadlineSafe: boolean; hashFromScriptHex?: string } }
+  | { kind: 'L1_VERIFIED_FUNDED'; evidence: L1VerificationEvidence }
   | { kind: 'BEGIN_L2_FUNDING'; deadlineSafetyEvidence: string }
   | { kind: 'L2_FUND_ACKNOWLEDGED'; l2TxId: string }
   | { kind: 'L2_FUND_UNKNOWN'; transportError: string }
   | { kind: 'L2_FUND_REJECTED'; reason: string }
-  | { kind: 'L2_VERIFIED_FUNDED'; evidence: { l2TxId: string; hashExact: boolean; amountExact: boolean; deadlineSafe: boolean } }
+  | { kind: 'L2_VERIFIED_FUNDED'; evidence: L2VerificationEvidence }
   | { kind: 'ARM_CLAIM'; deadlineSafetyEvidence: string; claimConstructibleEvidence: string }
   | { kind: 'REVEAL_SECRET'; claimTxId?: string; unknownResult?: boolean }
   | { kind: 'OBSERVE_CLAIM_COMMITTED'; preimage: string }
@@ -84,6 +83,49 @@ export const TERMINAL_STATES: ReadonlySet<string> = new Set(['CLAIMED', 'REFUNDE
 
 export class IllegalTransitionError extends Error {}
 
+/**
+ * Authoritative L1 evidence required before the second leg may be funded and before the
+ * claim may be armed. Every field must be affirmative AND the read must not be a provider
+ * assertion — `applyEvent` REFUSES to record a verification that is not fully proven, so a
+ * caller cannot hand-forge a verification stamp.
+ */
+export interface L1VerificationEvidence {
+  l1TxId: string;
+  confirmations: string;
+  hashMatches: boolean;
+  amountExact: boolean;
+  /** Must be true: the amount is proven by chain/wallet evidence, not remembered intent. */
+  amountAuthoritative: boolean;
+  deadlineSafe: boolean;
+  /** The observed refund height must be AHEAD of the current tip by a safety margin. */
+  deadlineFresh: boolean;
+  confirmationsSufficient: boolean;
+  /** Read source; 'PROVIDER_ASSERTION' is never sufficient (invariant 11). */
+  source: string;
+  observedHashHex?: string;
+  observedAmountRaw?: string;
+  observedRefundHeight?: string;
+  observedCurrentHeight?: string;
+  observedClaimPubKeyHex?: string;
+  observedRefundPubKeyHex?: string;
+  hashFromScriptHex?: string;
+  verifiedAtUnixMs: number;
+}
+
+/** Authoritative L2 (Ootle ScriptPath) evidence, same fail-closed discipline. */
+export interface L2VerificationEvidence {
+  l2TxId: string;
+  hashExact: boolean;
+  amountExact: boolean;
+  deadlineSafe: boolean;
+  claimantExact: boolean;
+  unspent: boolean;
+  /** Must be 'AUTHORITATIVE' — a cached/read-model read never settles. */
+  source: 'AUTHORITATIVE' | 'CACHED';
+  observedAmountRaw?: string;
+  verifiedAtUnixMs: number;
+}
+
 export interface CrossChainSessionRecord {
   sessionId: string;
   state: CrossChainSessionState;
@@ -112,6 +154,16 @@ export interface CrossChainSessionRecord {
   requiredL1Confirmations: string;
   createdAtUnixMs: number;
   updatedAtUnixMs: number;
+  /**
+   * Authoritative L1 evidence stamp. ABSENT means the first leg was never authoritatively
+   * verified — and second-leg funding / claim arming are refused in that case, regardless
+   * of what the durable state otherwise says (cross-layer invariant 2).
+   */
+  l1Verification?: L1VerificationEvidence;
+  /** Authoritative L2 evidence stamp. Required before CLAIM_ARMED. */
+  l2Verification?: L2VerificationEvidence;
+  /** Where the deadline margins used at the last irreversible phase came from. */
+  deadlineEvidenceSource?: 'AUTHORITATIVE' | 'CALLER_ASSERTED';
   /** Evidence that the irreversible secret-bearing claim was submitted. */
   secretRevealedAtUnixMs?: number;
   /** Secret NEVER lives here — see CrossChainSecretStore. */
@@ -195,16 +247,44 @@ function updated(record: CrossChainSessionRecord, event: CrossChainEvent, target
     case 'L2_FUND_ACKNOWLEDGED':
       return { ...next, l2TxId: String(event.l2TxId) };
     case 'L1_VERIFIED_FUNDED': {
-      const withTx: CrossChainSessionRecord = { ...next, l1TxId: event.evidence.l1TxId };
+      // SECURITY: the state machine itself refuses to record a verification that is not
+      // fully proven. A caller cannot forge a stamp to unlock second-leg funding or claim
+      // arming (cross-layer invariant 2).
+      const e = event.evidence;
+      const gaps: string[] = [];
+      if (!e.hashMatches) gaps.push('hashMatches');
+      if (!e.amountExact) gaps.push('amountExact');
+      if (!e.amountAuthoritative) gaps.push('amountAuthoritative');
+      if (!e.deadlineSafe) gaps.push('deadlineSafe');
+      if (!e.deadlineFresh) gaps.push('deadlineFresh');
+      if (!e.confirmationsSufficient) gaps.push('confirmationsSufficient');
+      if (!e.observedHashHex || !/^[0-9a-f]{64}$/.test(e.observedHashHex)) gaps.push('observedHashHex');
+      if (e.source === 'PROVIDER_ASSERTION' || e.source === '') gaps.push('authoritativeSource');
+      if (gaps.length > 0) {
+        throw new IllegalTransitionError(`L1_VERIFIED_FUNDED refused: unproven evidence ${gaps.join(', ')}`);
+      }
+      const withTx: CrossChainSessionRecord = { ...next, l1TxId: String(e.l1TxId) };
       // Bind H from AUTHORITATIVE script readback when the quote did not fix it
       // (TARI_TO_XTM: the counterparty's L1 wallet generates S; H is read from the chain).
-      if (event.evidence.hashFromScriptHex && (!withTx.hashH || withTx.hashH === '')) {
-        return { ...withTx, hashH: event.evidence.hashFromScriptHex };
+      if (e.hashFromScriptHex && (!withTx.hashH || withTx.hashH === '')) {
+        return { ...withTx, hashH: e.hashFromScriptHex, l1Verification: e };
       }
-      return withTx;
+      return { ...withTx, l1Verification: e };
     }
-    case 'L2_VERIFIED_FUNDED':
-      return { ...next, l2TxId: event.evidence.l2TxId };
+    case 'L2_VERIFIED_FUNDED': {
+      const e = event.evidence;
+      const gaps: string[] = [];
+      if (!e.hashExact) gaps.push('hashExact');
+      if (!e.amountExact) gaps.push('amountExact');
+      if (!e.deadlineSafe) gaps.push('deadlineSafe');
+      if (!e.claimantExact) gaps.push('claimantExact');
+      if (!e.unspent) gaps.push('unspent');
+      if (e.source !== 'AUTHORITATIVE') gaps.push('authoritativeSource');
+      if (gaps.length > 0) {
+        throw new IllegalTransitionError(`L2_VERIFIED_FUNDED refused: unproven evidence ${gaps.join(', ')}`);
+      }
+      return { ...next, l2TxId: String(e.l2TxId), l2Verification: e };
+    }
     case 'REVEAL_SECRET':
       return { ...next, secretRevealedAtUnixMs: Date.now() };
     case 'CLAIM_ACKNOWLEDGED':

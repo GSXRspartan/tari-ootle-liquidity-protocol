@@ -72,8 +72,19 @@ export class InMemorySecretStore implements CrossChainSecretStore {
   async ingestExternalSecret(sessionId: string, secretHex: SecretHex): Promise<SecretPublicPart> {
     if (!/^[0-9a-f]{64}$/.test(secretHex)) throw new Error('external preimage must be 64 lowercase hex chars');
     const bytes = hexToBytes(secretHex);
-    this.secrets.set(sessionId, bytes);
     const hashH = bytesToHex(await sha256(bytes));
+    // SECURITY (duplicate-secret-id attack): a session that already holds a preimage may
+    // NEVER be silently overwritten with a different one. A provider that returned a second,
+    // different S on a retry would otherwise re-point an already-funded HTLC at a preimage
+    // nobody else can satisfy, permanently stranding the funds. Re-ingesting the IDENTICAL
+    // secret is idempotent and allowed.
+    const existingHash = this.hashes.get(sessionId);
+    if (existingHash !== undefined && existingHash !== hashH) {
+      throw new Error(
+        `Refusing to replace an existing preimage for session ${sessionId} (stored ${existingHash.slice(0, 8)}…, offered ${hashH.slice(0, 8)}…) — a funded session's preimage is immutable`,
+      );
+    }
+    this.secrets.set(sessionId, bytes);
     this.hashes.set(sessionId, hashH);
     return { hashH, secretLengthBytes: bytes.length };
   }
@@ -112,10 +123,46 @@ export interface EncryptedSecretPersistence {
 /**
  * TEST-ONLY: a coordinator gate that refuses any persistence path carrying plaintext S.
  * Used in tests to prove ordinary history/JSON serialization never contains S.
+ *
+ * SECURITY: matching is case-insensitive and also covers the common re-encodings a leak
+ * would take (uppercase hex, 0x-prefixed hex, base64 of the raw bytes, and the base64 of
+ * the hex string). Matching only the exact lowercase hex would let a case-flip or a base64
+ * serialization slip through while still being a complete disclosure of the preimage.
  */
 export function assertNoSecretInJson(json: string, secretHex: SecretHex): void {
   if (secretHex.length === 0) throw new Error('empty secret');
-  if (json.includes(secretHex)) throw new Error('SECRET LEAKED into serializable state');
+  const lower = secretHex.toLowerCase();
+  const raw = hexToBytes(lower);
+  const candidates = new Set<string>([lower, lower.toUpperCase(), `0x${lower}`, `0x${lower.toUpperCase()}`]);
+  // base64 of the raw bytes and of the hex text (two classic serialization mistakes).
+  const asText = new TextEncoder().encode(lower);
+  for (const bytes of [raw, asText]) {
+    const asBase64 = base64Encode(bytes);
+    candidates.add(asBase64);
+    candidates.add(asBase64.replace(/=+$/, ''));
+  }
+  const haystack = json.toLowerCase();
+  for (const candidate of candidates) {
+    if (candidate.length >= 8 && haystack.includes(candidate.toLowerCase())) {
+      throw new Error('SECRET LEAKED into serializable state');
+    }
+  }
+}
+
+/** Dependency-free base64 (this module is browser-targeted; no Node Buffer). */
+function base64Encode(bytes: Uint8Array): string {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  let out = '';
+  for (let i = 0; i < bytes.length; i += 3) {
+    const b0 = bytes[i];
+    const b1 = bytes[i + 1];
+    const b2 = bytes[i + 2];
+    out += alphabet[b0 >> 2];
+    out += alphabet[((b0 & 0x03) << 4) | ((b1 ?? 0) >> 4)];
+    out += b1 === undefined ? '=' : alphabet[((b1 & 0x0f) << 2) | ((b2 ?? 0) >> 6)];
+    out += b2 === undefined ? '=' : alphabet[b2 & 0x3f];
+  }
+  return out;
 }
 
 /**

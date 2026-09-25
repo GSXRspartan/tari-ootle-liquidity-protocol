@@ -299,16 +299,37 @@ function encodeU64Varint(value: bigint): number[] {
   return out;
 }
 
+/**
+ * Decodes the u64 LEB128 varint used by CheckHeightVerify, matching the ENGINE exactly.
+ *
+ * Traced engine behavior (integer-encoding 3.0.4 `u64::decode_var`, consumed by
+ * `Opcode::from_bytes` at infrastructure/tari_script/src/op_codes.rs:363):
+ *  - Non-minimal (overlong) encodings are ACCEPTED by the engine, so we accept them too
+ *    (a stricter decoder would disagree with the chain on a script the chain accepts).
+ *  - The accumulator is a `u64` and the loop breaks once `shift > 63`, so a 10th byte
+ *    contributes ONLY bit 63: `(byte & 0x7f) << 63` silently DROPS the byte's upper six
+ *    bits. A naive BigInt decoder returns a value ABOVE u64 and would disagree with the
+ *    engine about the refund height — i.e. it could conclude "refund not reachable yet"
+ *    for an output the chain WILL let the funder refund.
+ *
+ * SECURITY: an encoding whose true value is not representable in u64 is refused outright
+ * rather than silently truncated, because we cannot model what the chain will do with it.
+ */
 function decodeU64Varint(bytes: Uint8Array): [bigint, number] {
   let result = 0n;
   let shift = 0n;
   let size = 0;
   for (const byte of bytes) {
+    if (size >= 10) throw new Error('Minotari varint too long');
     result |= BigInt(byte & 0x7f) << shift;
     size += 1;
-    if ((byte & 0x80) === 0) return [result, size];
+    if ((byte & 0x80) === 0) {
+      if (result > 0xffffffffffffffffn) {
+        throw new Error('Minotari varint exceeds u64 — cannot model engine truncation; refusing');
+      }
+      return [result, size];
+    }
     shift += 7n;
-    if (size > 10) throw new Error('Minotari varint too long');
   }
   throw new Error('Truncated Minotari varint');
 }

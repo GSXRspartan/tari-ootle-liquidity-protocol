@@ -44,6 +44,8 @@ export interface ReservationLedger {
   markFunded(reservationId: string): Promise<Reservation>;
   requestRelease(reservationId: string, evidenceOperationId: string, reason: 'SETTLED' | 'REFUNDED' | 'QUOTE_EXPIRED'): Promise<Reservation>;
   completeRelease(reservationId: string): Promise<Reservation>;
+  /** Release unfunded reservations whose quote TTL has passed (never touches FUNDED). */
+  expireUnfunded(nowUnixMs: number): Promise<Reservation[]>;
 }
 
 /**
@@ -55,6 +57,8 @@ export class InMemoryReservationLedger implements ReservationLedger {
   private readonly reservedXtm = new Map<string, bigint>();
   private readonly reservedTari = new Map<string, bigint>();
   private readonly reservations = new Map<string, Reservation>();
+  /** SECURITY: a quote may back AT MOST ONE reservation — blocks quote replay. */
+  private readonly quoteReservations = new Map<string, string>();
 
   constructor(private readonly ads: Record<string, ProviderAdvertisement>) {}
 
@@ -80,6 +84,12 @@ export class InMemoryReservationLedger implements ReservationLedger {
     const xtm = requireRawAmount(input.xtmRawAmount, 'xtmRawAmount');
     const tari = requireRawAmount(input.tariRawAmount, 'tariRawAmount');
     if (xtm === 0n && tari === 0n) throw new Error('Reservation amounts cannot both be zero');
+    // Quote replay: the same quote must never fund two different reservations, otherwise a
+    // stale/expired quote could be re-accepted to double-draw advertised inventory.
+    const quoteOwner = this.quoteReservations.get(input.quoteId);
+    if (quoteOwner !== undefined && quoteOwner !== input.reservationId) {
+      throw new Error(`Quote ${input.quoteId} is already reserved by ${quoteOwner} — refusing quote replay`);
+    }
     const existing = this.reservations.get(input.reservationId);
     if (existing) {
       // Idempotent retry: identical terms return the same reservation.
@@ -115,6 +125,7 @@ export class InMemoryReservationLedger implements ReservationLedger {
     this.reservedXtm.set(input.providerId, (this.reservedXtm.get(input.providerId) ?? 0n) + xtm);
     this.reservedTari.set(input.providerId, (this.reservedTari.get(input.providerId) ?? 0n) + tari);
     this.reservations.set(input.reservationId, reservation);
+    this.quoteReservations.set(input.quoteId, input.reservationId);
     return reservation;
   }
 
@@ -162,14 +173,36 @@ export class InMemoryReservationLedger implements ReservationLedger {
     if (r.state !== 'RELEASE_PENDING') throw new Error(`completeRelease requires RELEASE_PENDING, got ${r.state}`);
     const xtm = BigInt(r.xtmRawAmount);
     const tari = BigInt(r.tariRawAmount);
-    this.reservedXtm.set(r.providerId, (this.reservedXtm.get(r.providerId) ?? 0n) - xtm);
-    this.reservedTari.set(r.providerId, (this.reservedTari.get(r.providerId) ?? 0n) - tari);
-    if ((this.reservedXtm.get(r.providerId) ?? 0n) < 0n || (this.reservedTari.get(r.providerId) ?? 0n) < 0n) {
-      throw new Error('Reservation ledger would go negative — accounting bug');
+    // SECURITY: check the invariant BEFORE mutating. Decrementing first and throwing
+    // afterwards would leave permanently corrupted (negative) accounting and mask the
+    // double-release that caused it.
+    const nextXtm = (this.reservedXtm.get(r.providerId) ?? 0n) - xtm;
+    const nextTari = (this.reservedTari.get(r.providerId) ?? 0n) - tari;
+    if (nextXtm < 0n || nextTari < 0n) {
+      throw new Error('Reservation ledger would go negative — refusing to corrupt accounting (double release detected)');
     }
+    this.reservedXtm.set(r.providerId, nextXtm);
+    this.reservedTari.set(r.providerId, nextTari);
     const updated: Reservation = { ...r, state: 'RELEASED', releasedAtUnixMs: Date.now() };
     this.reservations.set(reservationId, updated);
     return updated;
+  }
+
+  /**
+   * Expiry sweep: releases ONLY unfunded reservations whose quote TTL has passed. A FUNDED
+   * reservation is never released here — funded sessions live by chain deadlines
+   * (cross-layer invariant 7). Without this, an accepted-but-never-funded quote would hold
+   * provider inventory forever (a permanent inventory strand / denial of service).
+   */
+  async expireUnfunded(nowUnixMs: number): Promise<Reservation[]> {
+    const expired: Reservation[] = [];
+    for (const r of [...this.reservations.values()]) {
+      if (r.state !== 'RESERVED') continue;
+      if (nowUnixMs < r.quoteExpiresAtUnixMs) continue;
+      const pending = await this.requestRelease(r.reservationId, `expire_${r.reservationId}`, 'QUOTE_EXPIRED');
+      expired.push(await this.completeRelease(pending.reservationId));
+    }
+    return expired;
   }
 
   private mustGet(reservationId: string): Reservation {

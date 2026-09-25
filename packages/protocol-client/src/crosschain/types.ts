@@ -63,3 +63,19 @@ export function requireOperationId(operationId: string): string {
   }
   return operationId;
 }
+
+/**
+ * External identifier (provider id, quote id): a non-empty, bounded, printable string
+ * with no control characters. Deliberately NOT `requireOperationId` — peer-chosen
+ * identifiers legitimately differ in length, but they still must not be blank, unbounded,
+ * or able to smuggle control characters into logs, filenames, or URLs.
+ */
+export function requireIdentifier(value: string, field: string): string {
+  if (typeof value !== 'string' || value.trim() === '') throw new Error(`${field} must be a non-empty identifier`);
+  if (value.length > 128) throw new Error(`${field} exceeds 128 characters`);
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    if (code < 0x20 || code === 0x7f) throw new Error(`${field} must not contain control characters`);
+  }
+  return value;
+}

@@ -25,7 +25,8 @@ import {
 import { ReservationLedger } from './reservation.js';
 import { CrossChainSecretStore, bytesToHex, hexToBytes, sha256, verifyPreimage } from './secret.js';
 import { assertDeadlineSafety } from './deadlines.js';
-import { assertTestnetNetwork, requireOperationId } from './types.js';
+import { assertTestnetNetwork, requireOperationId, requireRawAmount, requirePositiveAmount, requireIdentifier } from './types.js';
+import { IrreversiblePhase } from './deadlines.js';
 import { MinotariWalletProvider, OotleScriptPathLegPort, requireLegCapabilities, requireLegCapabilitiesSingle } from './provider.js';
 
 /**
@@ -51,6 +52,57 @@ export interface CoordinatorPorts {
   reservations: ReservationLedger;
   secrets: CrossChainSecretStore;
   sessions: SessionStore;
+  /**
+   * Authoritative deadline-margin source. Before every irreversible phase the coordinator
+   * asks THIS for the remaining margins instead of trusting numbers supplied by the caller.
+   *
+   * SECURITY (cross-layer invariants 10, 11): caller-supplied margins are an assertion
+   * about chain state. A caller that under-reports the remaining margin — or simply lies —
+   * would otherwise cause the preimage to be disclosed late, stranding or stealing funds.
+   * Any real deployment MUST provide this port; `unsafeAllowAssertedDeadlines` exists only
+   * for tests and is recorded on the session record as CALLER_ASSERTED evidence.
+   */
+  deadlineAuthority?: DeadlineAuthority;
+}
+
+/** Reads authoritative chain heights/epochs and converts them to remaining margins. */
+export interface DeadlineAuthority {
+  remainingMargins(input: { sessionId: string; phase: IrreversiblePhase }): Promise<{ l1RemainingMarginMs: string; l2RemainingMarginMs: string }>;
+}
+
+export type DeadlineSafetyInput = {
+  l1RemainingMarginMs: string;
+  l2RemainingMarginMs: string;
+  requiredL1MarginMs: string;
+  requiredL2MarginMs: string;
+};
+
+/**
+ * Resolve the margin evidence used at an irreversible phase.
+ * With a configured authority, its authoritative read WINS over anything the caller passed.
+ */
+async function resolveDeadlineSafety(input: {
+  ports: CoordinatorPorts;
+  sessionId: string;
+  phase: IrreversiblePhase;
+  asserted: DeadlineSafetyInput;
+  allowAsserted: boolean | undefined;
+}): Promise<{ safety: DeadlineSafetyInput; source: 'AUTHORITATIVE' | 'CALLER_ASSERTED' }> {
+  if (input.ports.deadlineAuthority !== undefined) {
+    const authoritative = await input.ports.deadlineAuthority.remainingMargins({ sessionId: input.sessionId, phase: input.phase });
+    requireRawAmount(authoritative.l1RemainingMarginMs, 'authoritative l1RemainingMarginMs');
+    requireRawAmount(authoritative.l2RemainingMarginMs, 'authoritative l2RemainingMarginMs');
+    return {
+      safety: { ...input.asserted, l1RemainingMarginMs: authoritative.l1RemainingMarginMs, l2RemainingMarginMs: authoritative.l2RemainingMarginMs },
+      source: 'AUTHORITATIVE',
+    };
+  }
+  if (input.allowAsserted !== true) {
+    throw new IllegalTransitionError(
+      `${input.phase} refused: no authoritative deadline authority configured — refusing to act on caller-asserted margins (pass deadlineAuthority, or explicitly opt in with unsafeAllowAssertedDeadlines)`,
+    );
+  }
+  return { safety: input.asserted, source: 'CALLER_ASSERTED' };
 }
 
 export interface CrossChainQuoteView {
@@ -84,8 +136,16 @@ export async function acceptQuote(input: { request: AcceptQuoteRequest; ports: C
   const q = input.request.quote;
   requireOperationId(input.request.sessionId);
   requireOperationId(input.request.reservationId);
+  // SECURITY: the quote object crosses a trust boundary (it originates from the peer
+  // provider). Validate EVERY field before any inventory is reserved, so a malformed or
+  // hostile quote can never become durable session state.
+  validateQuoteView(q, input.request.nowUnixMs);
   assertTestnetNetwork(q.l1Network);
   assertTestnetNetwork(q.l2Network);
+  // The two legs must belong to the SAME network — a mixed pairing is refused outright.
+  if (q.l1Network !== q.l2Network) {
+    throw new CoordinatorRefusal(`Mixed-network quote refused: l1=${q.l1Network} l2=${q.l2Network}`);
+  }
   // Capability negotiation: fail BEFORE inventory is reserved.
   requireLegCapabilities(q.direction, input.ports.l1.capabilities?.(), input.ports.l2.capabilities?.());
   await input.ports.reservations.reserve({
@@ -123,8 +183,45 @@ export async function acceptQuote(input: { request: AcceptQuoteRequest; ports: C
   return { session: advanced };
 }
 
-async function requireState(sessionId: string, ports: CoordinatorPorts, expected: string[]): Promise<CrossChainSessionRecord> {
-  const record = await ports.sessions.get(sessionId);
+/**
+ * Total validation of an untrusted provider quote before it becomes durable state.
+ * Everything here is fail-closed: a field we cannot prove is refused, not defaulted.
+ */
+export function validateQuoteView(q: CrossChainQuoteView, nowUnixMs: number): void {
+  requireIdentifier(q.quoteId, 'quote.quoteId');
+  requireIdentifier(q.providerId, 'quote.providerId');
+  if (q.direction !== 'XTM_TO_TARI' && q.direction !== 'TARI_TO_XTM') {
+    throw new CoordinatorRefusal(`Unknown swap direction ${String(q.direction)}`);
+  }
+  // Amounts: positive integer strings only (never zero, never negative, never a float).
+  if (requirePositiveAmount(q.xtmRawAmount, 'quote.xtmRawAmount') === 0n) throw new CoordinatorRefusal('quote XTM amount must be positive');
+  if (requirePositiveAmount(q.tariRawAmount, 'quote.tariRawAmount') === 0n) throw new CoordinatorRefusal('quote TARI amount must be positive');
+  // H is either a bound 32-byte hash, or EXPLICITLY deferred to authoritative chain
+  // readback (TARI_TO_XTM, where the counterparty's wallet generates S). Any other
+  // shape is a malformed quote, not a deferred hash.
+  if (q.hashH !== '' && !/^[0-9a-f]{64}$/.test(q.hashH)) {
+    throw new CoordinatorRefusal(`quote.hashH must be 64 lowercase hex chars or exactly '' when deferred to the chain`);
+  }
+  // Claim identities are exact addresses and must be present on both legs.
+  if (typeof q.l1ClaimRecipient !== 'string' || q.l1ClaimRecipient.trim() === '') throw new CoordinatorRefusal('quote.l1ClaimRecipient is required');
+  if (typeof q.l2ClaimRecipient !== 'string' || q.l2ClaimRecipient.trim() === '') throw new CoordinatorRefusal('quote.l2ClaimRecipient is required');
+  // Deadlines live in DIFFERENT domains and are validated only as integers — they are
+  // never compared to each other here.
+  requireRawAmount(q.l1RefundDeadlineHeight, 'quote.l1RefundDeadlineHeight');
+  requireRawAmount(q.l2RefundDeadlineEpoch, 'quote.l2RefundDeadlineEpoch');
+  if (requirePositiveAmount(q.requiredL1Confirmations, 'quote.requiredL1Confirmations') === 0n) {
+    throw new CoordinatorRefusal('quote.requiredL1Confirmations must be positive');
+  }
+  // An already-expired quote must never be accepted into a funded session.
+  if (typeof q.quoteExpiresAtUnixMs !== 'number' || !Number.isFinite(q.quoteExpiresAtUnixMs)) {
+    throw new CoordinatorRefusal('quote.quoteExpiresAtUnixMs must be a finite number');
+  }
+  if (nowUnixMs >= q.quoteExpiresAtUnixMs) {
+    throw new CoordinatorRefusal(`Quote ${q.quoteId} already expired at ${nowUnixMs} (expires ${q.quoteExpiresAtUnixMs}) — refusing acceptance`);
+  }
+}
+
+async function requireState(sessionId: string, ports: CoordinatorPorts, expected: string[]): Promise<CrossChainSessionRecord> {  const record = await ports.sessions.get(sessionId);
   if (!record) throw new CoordinatorRefusal(`Unknown session ${sessionId}`);
   if (!expected.includes(record.state)) {
     throw new IllegalTransitionError(`Session ${sessionId} is ${record.state}; expected one of ${expected.join('/')}`);
@@ -139,14 +236,15 @@ export interface LegFundOutcome {
 }
 
 /** BEGIN_L1_FUNDING: capabilities → gate → deadline safety → construct → authorize → submit. */
-export async function beginL1Funding(input: { sessionId: string; ports: CoordinatorPorts; env: Record<string, string | undefined>; deadlineSafety: { l1RemainingMarginMs: string; l2RemainingMarginMs: string; requiredL1MarginMs: string; requiredL2MarginMs: string } }): Promise<LegFundOutcome> {
+export async function beginL1Funding(input: { sessionId: string; ports: CoordinatorPorts; env: Record<string, string | undefined>; deadlineSafety: { l1RemainingMarginMs: string; l2RemainingMarginMs: string; requiredL1MarginMs: string; requiredL2MarginMs: string }; unsafeAllowAssertedDeadlines?: boolean }): Promise<LegFundOutcome> {
   const record = await requireState(input.sessionId, input.ports, ['RESERVED']);
   const gate = isRealSubmitEnabled(input.env, input.ports.l1.network());
   if (!gate.enabled) return { outcome: 'REFUSED', reason: gate.reason };
   // Fail closed on missing L1 wallet capabilities before ANY funding occurs.
   requireLegCapabilitiesSingle(record.direction, 'L1', input.ports.l1.capabilities?.());
-  assertDeadlineSafety({ phase: 'FIRST_LEG_FUNDING', ...input.deadlineSafety });
-  const advanced = applyEvent(record, { kind: 'BEGIN_L1_FUNDING', deadlineSafetyEvidence: 'deadline-recheck-passed' });
+  const { safety, source } = await resolveDeadlineSafety({ ports: input.ports, sessionId: input.sessionId, phase: 'FIRST_LEG_FUNDING', asserted: input.deadlineSafety, allowAsserted: input.unsafeAllowAssertedDeadlines });
+  assertDeadlineSafety({ phase: 'FIRST_LEG_FUNDING', ...safety });
+  const advanced = applyEvent(record, { kind: 'BEGIN_L1_FUNDING', deadlineSafetyEvidence: source });
   await input.ports.sessions.save(advanced);
   const intent = input.ports.l1.constructHtlcFunding({
     amountRaw: advanced.xtmRawAmount,
@@ -220,7 +318,11 @@ export async function verifyL1Funded(input: { sessionId: string; ports: Coordina
   // remembers the funding intent (e.g. the Minotari reference provider, whose base-node
   // readback yields a blinded commitment, not a revealed value) must set
   // `amountAuthoritative: false`, and settlement then refuses to treat the amount as proven.
-  const amountAuthoritative = obs.amountAuthoritative !== false;
+  const amountAuthoritative = obs.amountAuthoritative === true;
+  // DEADLINE FRESHNESS: matching the quoted deadline is not enough. The observed refund
+  // height must still be AHEAD of the current tip, otherwise the output is already
+  // refundable and the counterparty could take the first leg back at will.
+  const deadlineFresh = deadlineIsFresh(obs.refundHeight, obs.currentHeight, record.requiredL1Confirmations);
   const evidence = {
     l1TxId: record.l1TxId,
     confirmations: obs.confirmations,
@@ -228,15 +330,50 @@ export async function verifyL1Funded(input: { sessionId: string; ports: Coordina
     amountExact: obs.amountRaw === record.xtmRawAmount && amountAuthoritative,
     amountAuthoritative,
     deadlineSafe: obs.refundHeight === record.l1RefundDeadlineHeight,
-    hashFromScriptHex,
+    deadlineFresh,
+    confirmationsSufficient: isSufficientConfirmations(obs.confirmations, record.requiredL1Confirmations),
     source: obs.source,
-    confirmationsSufficient: BigInt(obs.confirmations) >= BigInt(record.requiredL1Confirmations),
+    observedHashHex: obs.hashHex,
+    observedAmountRaw: obs.amountRaw,
+    observedRefundHeight: obs.refundHeight,
+    observedCurrentHeight: obs.currentHeight,
+    observedClaimPubKeyHex: obs.claimRecipient,
+    observedRefundPubKeyHex: obs.refundRecipient,
+    hashFromScriptHex,
+    verifiedAtUnixMs: Date.now(),
   };
-  const verified = evidence.hashMatches && evidence.amountExact && evidence.deadlineSafe && evidence.confirmationsSufficient && obs.exists && obs.source !== 'PROVIDER_ASSERTION' && (hashUnbound ? hashFromScriptHex !== undefined : true);
+  const verified =
+    evidence.hashMatches &&
+    evidence.amountExact &&
+    evidence.deadlineSafe &&
+    evidence.deadlineFresh &&
+    evidence.confirmationsSufficient &&
+    obs.exists &&
+    obs.source !== 'PROVIDER_ASSERTION' &&
+    (hashUnbound ? hashFromScriptHex !== undefined : true);
   if (verified) {
     await input.ports.sessions.save(applyEvent(record, { kind: 'L1_VERIFIED_FUNDED', evidence }));
   }
   return { verified, evidence, reason: verified ? undefined : 'Authoritative L1 readback mismatch' };
+}
+
+/** Observed refund height must exceed the tip by at least the required confirmations. */
+function deadlineIsFresh(refundHeight: string | undefined, currentHeight: string, requiredConfirmations: string): boolean {
+  if (refundHeight === undefined || refundHeight === '') return false;
+  try {
+    return BigInt(refundHeight) > BigInt(currentHeight) + BigInt(requiredConfirmations);
+  } catch {
+    return false;
+  }
+}
+
+/** Confirmation comparison is exact and fail-closed on malformed values. */
+function isSufficientConfirmations(observed: string, required: string): boolean {
+  try {
+    return BigInt(observed) >= BigInt(required);
+  } catch {
+    return false;
+  }
 }
 
 export interface VerifyOutcome {
@@ -246,18 +383,26 @@ export interface VerifyOutcome {
 }
 
 /** BEGIN_L2_FUNDING: only after the first leg is authoritatively verified. */
-export async function beginL2Funding(input: { sessionId: string; ports: CoordinatorPorts; env: Record<string, string | undefined>; deadlineSafety: { l1RemainingMarginMs: string; l2RemainingMarginMs: string; requiredL1MarginMs: string; requiredL2MarginMs: string } }): Promise<LegFundOutcome> {
+export async function beginL2Funding(input: { sessionId: string; ports: CoordinatorPorts; env: Record<string, string | undefined>; deadlineSafety: { l1RemainingMarginMs: string; l2RemainingMarginMs: string; requiredL1MarginMs: string; requiredL2MarginMs: string }; unsafeAllowAssertedDeadlines?: boolean }): Promise<LegFundOutcome> {
   const record = await requireState(input.sessionId, input.ports, ['L1_FUNDED']);
   const gate = isRealSubmitEnabled(input.env, input.ports.l1.network());
   if (!gate.enabled) return { outcome: 'REFUSED', reason: gate.reason };
+  // SECURITY (cross-layer invariant 2): the second leg may NEVER be funded on an
+  // unverified first leg. `l1Verification` is written ONLY by verifyL1Funded on a fully
+  // proven authoritative observation, and the state machine refuses to record a partial
+  // one — so a submission acknowledgement alone cannot unlock this path.
+  if (!record.l1Verification) {
+    throw new IllegalTransitionError(`Second-leg funding refused: session ${record.sessionId} has no authoritative L1 verification evidence (run verifyL1Funded first)`);
+  }
   // H must be authoritatively bound before the second leg is constructed.
   requireHashHBound(record);
   // Fail closed on missing L2 wallet capabilities before ANY second-leg funding.
   requireLegCapabilitiesSingle(record.direction, 'L2', input.ports.l2.capabilities?.());
   // Never fund the second leg on the first party's word alone: the caller must pass
   // authoritative L1 verification; we re-check the session state enforces it.
-  assertDeadlineSafety({ phase: 'SECOND_LEG_FUNDING', ...input.deadlineSafety });
-  const advanced = applyEvent(record, { kind: 'BEGIN_L2_FUNDING', deadlineSafetyEvidence: 'deadline-recheck-passed' });
+  const { safety, source } = await resolveDeadlineSafety({ ports: input.ports, sessionId: input.sessionId, phase: 'SECOND_LEG_FUNDING', asserted: input.deadlineSafety, allowAsserted: input.unsafeAllowAssertedDeadlines });
+  assertDeadlineSafety({ phase: 'SECOND_LEG_FUNDING', ...safety });
+  const advanced = applyEvent(record, { kind: 'BEGIN_L2_FUNDING', deadlineSafetyEvidence: source });
   await input.ports.sessions.save(advanced);
   try {
     await input.ports.l2.constructFunding({
@@ -286,41 +431,82 @@ export async function verifyL2Funded(input: { sessionId: string; ports: Coordina
   const record = await requireState(input.sessionId, input.ports, ['BOTH_FUNDED', 'L2_FUNDING']);
   if (!record.l2TxId) return { verified: false, reason: 'No L2 transaction id recorded' };
   const obs = await input.ports.l2.observeHashlockOutput(record.l2TxId);
-  const evidence = { l2TxId: record.l2TxId, hashExact: obs.hashExact, amountExact: obs.amountRaw === record.tariRawAmount, deadlineSafe: obs.epochRefundExact, claimantExact: obs.claimantExact };
-  const ok = obs.exists && obs.source === 'AUTHORITATIVE' && evidence.hashExact && evidence.amountExact && evidence.deadlineSafe && evidence.claimantExact && obs.unspent;
+  const evidence = {
+    l2TxId: record.l2TxId,
+    hashExact: obs.hashExact === true,
+    amountExact: obs.amountRaw === record.tariRawAmount,
+    deadlineSafe: obs.epochRefundExact === true,
+    claimantExact: obs.claimantExact === true,
+    unspent: obs.unspent === true,
+    source: obs.source,
+    observedAmountRaw: obs.amountRaw,
+    verifiedAtUnixMs: Date.now(),
+  };
+  const ok = obs.exists && obs.source === 'AUTHORITATIVE' && evidence.hashExact && evidence.amountExact && evidence.deadlineSafe && evidence.claimantExact && evidence.unspent;
   if (ok) await input.ports.sessions.save(applyEvent(record, { kind: 'L2_VERIFIED_FUNDED', evidence }));
   return { verified: ok, evidence, reason: ok ? undefined : 'L2 hashlock output failed authoritative verification' };
 }
 
-/** CLAIM_ARMED: mandatory checks before ANY secret disclosure. */
-export async function armClaim(input: { sessionId: string; ports: CoordinatorPorts; deadlineSafety: { l1RemainingMarginMs: string; l2RemainingMarginMs: string; requiredL1MarginMs: string; requiredL2MarginMs: string }; claimConstructibleEvidence: string }): Promise<{ armed: boolean; reason?: string }> {
+/**
+ * CLAIM_ARMED — the last gate before the preimage may ever be disclosed.
+ *
+ * SECURITY (cross-layer invariants 2, 10, 11, 18): this does NOT trust the durable state,
+ * a caller-supplied evidence string, or any cached read. It RE-OBSERVES both chains
+ * authoritatively at arm time, so a reorg, a spent output, a changed account, a provider
+ * disconnect, or a capability change between funding and arming is caught here rather than
+ * after the secret is public.
+ */
+export async function armClaim(input: { sessionId: string; ports: CoordinatorPorts; deadlineSafety: { l1RemainingMarginMs: string; l2RemainingMarginMs: string; requiredL1MarginMs: string; requiredL2MarginMs: string }; unsafeAllowAssertedDeadlines?: boolean }): Promise<{ armed: boolean; reason?: string }> {
   const record = await requireState(input.sessionId, input.ports, ['BOTH_FUNDED']);
   requireHashHBound(record);
+  const toRecovery = async (reason: string) => {
+    await input.ports.sessions.save(applyEvent(record, { kind: 'ENTER_RECOVERY', reason }));
+    return { armed: false, reason };
+  };
+  // 1. Both legs must carry authoritative verification stamps from an earlier phase.
+  if (!record.l1Verification) return toRecovery('arm refused: no authoritative L1 verification evidence');
+  if (!record.l2Verification) return toRecovery('arm refused: no authoritative L2 verification evidence');
+  // 2. Capabilities must still hold — a provider that lost a primitive cannot be trusted
+  //    to construct the claim that discloses S.
   try {
-    assertDeadlineSafety({ phase: 'CLAIM_ARMED', ...input.deadlineSafety });
+    requireLegCapabilitiesSingle(record.direction, 'L1', input.ports.l1.capabilities?.());
+    requireLegCapabilitiesSingle(record.direction, 'L2', input.ports.l2.capabilities?.());
   } catch (error) {
-    const lost = applyEvent(record, { kind: 'ENTER_RECOVERY', reason: `deadline margin unsafe: ${(error as Error).message}` });
-    await input.ports.sessions.save(lost);
-    return { armed: false, reason: (error as Error).message };
+    return toRecovery(`arm refused: capability lost (${(error as Error).message})`);
   }
-  if (!input.claimConstructibleEvidence) {
-    const lost = applyEvent(record, { kind: 'ENTER_RECOVERY', reason: 'claim construction unavailable (fees/funding)' });
-    await input.ports.sessions.save(lost);
-    return { armed: false, reason: 'claim not constructible' };
+  // 3. Deadline margin must still hold immediately before arming.
+  let safety: DeadlineSafetyInput;
+  try {
+    const resolved = await resolveDeadlineSafety({ ports: input.ports, sessionId: input.sessionId, phase: 'CLAIM_ARMED', asserted: input.deadlineSafety, allowAsserted: input.unsafeAllowAssertedDeadlines });
+    safety = resolved.safety;
+    await input.ports.sessions.save({ ...record, deadlineEvidenceSource: resolved.source });
+    assertDeadlineSafety({ phase: 'CLAIM_ARMED', ...safety });
+  } catch (error) {
+    return toRecovery(`deadline margin unsafe: ${(error as Error).message}`);
   }
-  const armed = applyEvent(record, { kind: 'ARM_CLAIM', deadlineSafetyEvidence: 'recheck-passed', claimConstructibleEvidence: input.claimConstructibleEvidence });
+  // 4. FRESH authoritative re-observation of BOTH legs. Anything that drifted since the
+  //    verification phase (reorg, spend, wrong account, weaker confirmations) refuses.
+  const l1 = await verifyL1Funded({ sessionId: input.sessionId, ports: input.ports, deadlineSafety: safety });
+  if (!l1.verified) return toRecovery(`arm refused: L1 no longer authoritatively verified (${l1.reason ?? 'mismatch'})`);
+  const l2 = await verifyL2Funded({ sessionId: input.sessionId, ports: input.ports });
+  if (!l2.verified) return toRecovery('arm refused: L2 no longer authoritatively verified');
+  const current = (await input.ports.sessions.get(input.sessionId)) ?? record;
+  const armed = applyEvent(current, { kind: 'ARM_CLAIM', deadlineSafetyEvidence: 'recheck-passed', claimConstructibleEvidence: 'authoritative-reobservation-passed' });
   await input.ports.sessions.save(armed);
   return { armed: true };
 }
 
 /** SECRET REVEAL + claim submission — IRREVERSIBLE. UNKNOWN results force reconciliation. */
-export async function revealAndClaimL2(input: { sessionId: string; ports: CoordinatorPorts; env: Record<string, string | undefined>; deadlineSafety: { l1RemainingMarginMs: string; l2RemainingMarginMs: string; requiredL1MarginMs: string; requiredL2MarginMs: string } }): Promise<LegFundOutcome> {
+export async function revealAndClaimL2(input: { sessionId: string; ports: CoordinatorPorts; env: Record<string, string | undefined>; deadlineSafety: { l1RemainingMarginMs: string; l2RemainingMarginMs: string; requiredL1MarginMs: string; requiredL2MarginMs: string }; unsafeAllowAssertedDeadlines?: boolean }): Promise<LegFundOutcome> {
   const record = await requireState(input.sessionId, input.ports, ['CLAIM_ARMED']);
   const gate = isRealSubmitEnabled(input.env, input.ports.l1.network());
   if (!gate.enabled) return { outcome: 'REFUSED', reason: gate.reason };
   requireHashHBound(record);
   requireSecretRevealAllowed(record);
-  assertDeadlineSafety({ phase: 'SECRET_REVEAL', ...input.deadlineSafety });
+  // Invariant 10: the margin is recomputed IMMEDIATELY before disclosure, from the
+  // authoritative authority. Never from a number the caller asserted earlier.
+  const { safety } = await resolveDeadlineSafety({ ports: input.ports, sessionId: input.sessionId, phase: 'SECRET_REVEAL', asserted: input.deadlineSafety, allowAsserted: input.unsafeAllowAssertedDeadlines });
+  assertDeadlineSafety({ phase: 'SECRET_REVEAL', ...safety });
   const preimage = await input.ports.secrets.revealSecret(record.sessionId, record.state === 'CLAIM_ARMED');
   // The preimage must hash to the BOUND session hash — never trust storage blindly.
   if (!(await verifyPreimage(preimage, record.hashH))) {

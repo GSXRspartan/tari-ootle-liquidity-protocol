@@ -15,6 +15,8 @@ import {
   validateHashHex,
   requirePositiveAmount,
   requireRawAmount,
+  assertTestnetNetwork,
+  requireIdentifier,
 } from './types.js';
 
 export interface ProviderAdvertisement {
@@ -42,9 +44,12 @@ export function validateAdvertisement(ad: ProviderAdvertisement): void {
   requireRawAmount(ad.spreadBps, 'spreadBps');
   if (BigInt(ad.spreadBps) > 10_000n) throw new Error('spreadBps cannot exceed 10_000');
   requirePositiveAmount(ad.requiredL1Confirmations, 'requiredL1Confirmations');
-  if (ad.network === 'mainnet' || /mainnet/i.test(ad.network)) {
-    throw new Error('mainnet advertisements are refused (testnet-first)');
-  }
+  requirePositiveAmount(ad.quoteTtlMs, 'quoteTtlMs');
+  requireIdentifier(ad.providerId, 'providerId');
+  // SECURITY: use the SAME allowlist as the rest of the cross-layer stack. A substring
+  // mainnet check alone let an advertisement on an arbitrary network name pass here and
+  // only fail later at accept time; policy must be identical at every entry point.
+  assertTestnetNetwork(ad.network);
 }
 
 /** Deterministic quote side (BigInt only): out = in * rate * (10_000 - spread) / 10_000. */

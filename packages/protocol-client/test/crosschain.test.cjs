@@ -43,6 +43,12 @@ const AD = {
 const HASH = bytesToHex(new Uint8Array(32).fill(7));
 const applyEvt = (record, event) => sessionMod.applyEvent(record, event);
 
+/** Fully capable L1/L2 legs (XTM_TO_TARI requirements) for arming-path tests. */
+const CAPS = {
+  l1Balance: true, l1NormalSend: true, l1ShaInit: true, l1ShaInspect: true, l1ShaClaim: true, l1ShaRefund: true,
+  l2HtlcFund: true, l2HtlcClaim: true, l2HtlcRefund: true,
+};
+
 function sessionRecord(overrides = {}) {
   return {
     sessionId: 'sess_1',
@@ -151,16 +157,55 @@ test('double reservation with the same durable id is idempotent only for identic
 // State machine: legal path + failure injections
 // ---------------------------------------------------------------------------
 
+// A FULLY PROVEN authoritative evidence stamp. The state machine refuses to record a
+// partial one — every field must be affirmative and the read must not be an assertion.
+function provenL1Evidence(over = {}) {
+  return {
+    l1TxId: 'tx1',
+    confirmations: '5',
+    hashMatches: true,
+    amountExact: true,
+    amountAuthoritative: true,
+    deadlineSafe: true,
+    deadlineFresh: true,
+    confirmationsSufficient: true,
+    source: 'BASE_NODE',
+    observedHashHex: HASH,
+    observedAmountRaw: '10000',
+    observedRefundHeight: '500',
+    observedCurrentHeight: '400',
+    verifiedAtUnixMs: 1,
+    ...over,
+  };
+}
+
+function provenL2Evidence(over = {}) {
+  return {
+    l2TxId: 'tx2',
+    hashExact: true,
+    amountExact: true,
+    deadlineSafe: true,
+    claimantExact: true,
+    unspent: true,
+    source: 'AUTHORITATIVE',
+    observedAmountRaw: '5000000',
+    verifiedAtUnixMs: 1,
+    ...over,
+  };
+}
+
 test('happy path advances without illegal jumps and ends CLAIMED', () => {
   let r = sessionRecord({ state: 'QUOTED' });
   r = applyEvt(r, { kind: 'ACCEPT_QUOTE', nowUnixMs: 1 });
   assert.equal(r.state, 'RESERVED');
   r = applyEvt(r, { kind: 'BEGIN_L1_FUNDING', deadlineSafetyEvidence: 'x' });
   r = applyEvt(r, { kind: 'L1_FUND_ACKNOWLEDGED', l1TxId: 'tx1' });
-  r = applyEvt(r, { kind: 'L1_VERIFIED_FUNDED', evidence: { l1TxId: 'tx1', confirmations: '5', hashMatches: true, amountExact: true, deadlineSafe: true } });
+  r = applyEvt(r, { kind: 'L1_VERIFIED_FUNDED', evidence: provenL1Evidence() });
+  assert.ok(r.l1Verification, 'authoritative L1 evidence is stamped on the record');
   r = applyEvt(r, { kind: 'BEGIN_L2_FUNDING', deadlineSafetyEvidence: 'x' });
   r = applyEvt(r, { kind: 'L2_FUND_ACKNOWLEDGED', l2TxId: 'tx2' });
-  r = applyEvt(r, { kind: 'L2_VERIFIED_FUNDED', evidence: { l2TxId: 'tx2', hashExact: true, amountExact: true, deadlineSafe: true } });
+  r = applyEvt(r, { kind: 'L2_VERIFIED_FUNDED', evidence: provenL2Evidence() });
+  assert.ok(r.l2Verification, 'authoritative L2 evidence is stamped on the record');
   r = applyEvt(r, { kind: 'ARM_CLAIM', deadlineSafetyEvidence: 'x', claimConstructibleEvidence: 'y' });
   assert.equal(r.state, 'CLAIM_ARMED');
   r = applyEvt(r, { kind: 'REVEAL_SECRET' });
@@ -169,6 +214,33 @@ test('happy path advances without illegal jumps and ends CLAIMED', () => {
   r = applyEvt(r, { kind: 'CLAIM_CONFIRMED', leg: 'L2' });
   assert.equal(r.state, 'CLAIMED');
   assert.ok(isTerminal(r.state));
+});
+
+test('the state machine refuses to record a PARTIAL authoritative verification', () => {
+  const partials = [
+    { hashMatches: false },
+    { amountExact: false },
+    { amountAuthoritative: false },
+    { deadlineSafe: false },
+    { deadlineFresh: false },
+    { confirmationsSufficient: false },
+    { source: 'PROVIDER_ASSERTION' },
+    { observedHashHex: 'not-hex' },
+  ];
+  for (const over of partials) {
+    assert.throws(
+      () => applyEvt(sessionRecord({ state: 'L1_FUNDED', l1TxId: 'tx1' }), { kind: 'L1_VERIFIED_FUNDED', evidence: provenL1Evidence(over) }),
+      /L1_VERIFIED_FUNDED refused: unproven evidence/,
+      `partial evidence accepted: ${JSON.stringify(over)}`,
+    );
+  }
+  for (const over of [{ hashExact: false }, { amountExact: false }, { deadlineSafe: false }, { claimantExact: false }, { unspent: false }, { source: 'CACHED' }]) {
+    assert.throws(
+      () => applyEvt(sessionRecord({ state: 'BOTH_FUNDED', l2TxId: 'tx2' }), { kind: 'L2_VERIFIED_FUNDED', evidence: provenL2Evidence(over) }),
+      /L2_VERIFIED_FUNDED refused: unproven evidence/,
+      `partial L2 evidence accepted: ${JSON.stringify(over)}`,
+    );
+  }
 });
 
 test('CLAIM_ARMED bypass and premature secret reveal are refused', () => {
@@ -276,11 +348,26 @@ test('authoritative L1 verification refuses a merely-remembered amount', async (
   assert.equal(refused.evidence.amountExact, false);
   assert.equal(refused.evidence.amountAuthoritative, false);
   assert.equal(refused.evidence.hashMatches, true);
-  // An adapter that supplies a chain-validated opening verifies the same observation.
-  const proven = ports({ sessions, l1: { providerName: () => 'dev', primitivesStatus: () => 'VERIFIED', network: () => 'esmeralda', observeHtlc: async () => observed({ amountAuthoritative: true }), lookupTransaction: async () => 'COMMITTED', listInFlightSwaps: async () => [] } });
-  const verified = await verifyL1Funded({ sessionId: 'sess_1', ports: proven, deadlineSafety });
+  // A refund height that is NOT ahead of the tip is already-refundable: refuse even when
+  // every other field is perfect (this is the "stale/expired deadline" drain vector).
+  const proven = ports({ sessions, l1: { providerName: () => 'dev', primitivesStatus: () => 'VERIFIED', network: () => 'esmeralda', capabilities: () => CAPS, observeHtlc: async () => observed({ amountAuthoritative: true }), lookupTransaction: async () => 'COMMITTED', listInFlightSwaps: async () => [] } });
+  const stale = await verifyL1Funded({ sessionId: 'sess_1', ports: proven, deadlineSafety });
+  assert.equal(stale.verified, false, 'refund height 500 at tip 510 is NOT fresh — already refundable');
+  assert.equal(stale.evidence.deadlineFresh, false);
+  assert.equal(stale.evidence.amountExact, true);
+  // Fresh (refund height still ahead of the tip) + proven amount → verified and stamped.
+  const fresh = ports({ sessions, l1: { providerName: () => 'dev', primitivesStatus: () => 'VERIFIED', network: () => 'esmeralda', capabilities: () => CAPS, observeHtlc: async () => observed({ amountAuthoritative: true, currentHeight: '400' }), lookupTransaction: async () => 'COMMITTED', listInFlightSwaps: async () => [] } });
+  const verified = await verifyL1Funded({ sessionId: 'sess_1', ports: fresh, deadlineSafety });
   assert.equal(verified.verified, true);
   assert.equal(verified.evidence.amountExact, true);
+  assert.equal(verified.evidence.deadlineFresh, true);
+  assert.equal((await sessions.get('sess_1')).l1Verification.observedHashHex, HASH);
+  // A provider ASSERTION is never authoritative evidence, even with every field true.
+  const asserted = ports({ sessions: new InMemorySessionStore(), l1: { providerName: () => 'dev', primitivesStatus: () => 'VERIFIED', network: () => 'esmeralda', capabilities: () => CAPS, observeHtlc: async () => observed({ amountAuthoritative: true, currentHeight: '400', source: 'PROVIDER_ASSERTION' }), lookupTransaction: async () => 'COMMITTED', listInFlightSwaps: async () => [] } });
+  await asserted.sessions.save(sessionRecord({ state: 'L1_FUNDED', l1TxId: 'tx_l1' }));
+  const assertedResult = await verifyL1Funded({ sessionId: 'sess_1', ports: asserted, deadlineSafety });
+  assert.equal(assertedResult.verified, false, 'PROVIDER_ASSERTION must never verify');
+  assert.equal((await asserted.sessions.get('sess_1')).l1Verification, undefined);
 });
 
 test('claim committed → FINALIZE', async () => {
