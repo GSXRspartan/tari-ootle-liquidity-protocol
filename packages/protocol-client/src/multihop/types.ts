@@ -149,6 +149,8 @@ export type RoutePauseReason =
   | 'AMM_PRICE_OUT_OF_ACCEPTED_BOUNDS'
   | 'INTERMEDIATE_AMOUNT_MISMATCH'
   | 'AMM_DUST_INPUT'
+  /** The AMM execution itself failed; the settled intermediate is safe and unspent. */
+  | 'AMM_EXECUTION_FAILED'
   | 'WALLET_PROVIDER_UNAVAILABLE';
 
 export interface RoutePauseRecord {

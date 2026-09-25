@@ -12,7 +12,7 @@
  *  - partial completion (hop 2 skipped) is a first-class outcome, not a failure.
  */
 import { IllegalTransitionError } from '../crosschain/session.js';
-import { requireIdentifier } from '../crosschain/types.js';
+import { requireIdentifier, requireOperationId } from '../crosschain/types.js';
 import { RouteEvent, RouteRecord, RouteState, TERMINAL_ROUTE_STATES } from './types.js';
 
 /** Legal route transitions. Everything else is an IllegalTransitionError. */
@@ -23,7 +23,7 @@ const TRANSITIONS: Record<RouteState, Partial<Record<RouteEvent['kind'], RouteSt
   HOP1_SETTLED: { BEGIN_HOP2_REQUOTE: 'HOP2_REQUOTE', SKIP_HOP2: 'HOP2_SKIPPED', PAUSE: 'ROUTE_PAUSED' },
   HOP2_REQUOTE: { HOP2_READY: 'HOP2_READY', REQUIRE_REQUOTE: 'ROUTE_PAUSED', HOP2_UNAVAILABLE: 'ROUTE_PAUSED', PAUSE: 'ROUTE_PAUSED' },
   HOP2_READY: { BEGIN_HOP2: 'HOP2_EXECUTING', PAUSE: 'ROUTE_PAUSED', FAIL_TERMINAL: 'ROUTE_FAILED_TERMINAL' },
-  HOP2_EXECUTING: { HOP2_SETTLED: 'ROUTE_SETTLED', HOP2_UNKNOWN: 'ROUTE_RECOVERY_REQUIRED', HOP2_FAILED: 'ROUTE_FAILED_TERMINAL' },
+  HOP2_EXECUTING: { HOP2_SETTLED: 'ROUTE_SETTLED', HOP2_UNKNOWN: 'ROUTE_RECOVERY_REQUIRED', HOP2_FAILED: 'ROUTE_PAUSED' },
   HOP2_SKIPPED: { SETTLE_PARTIAL: 'ROUTE_SETTLED', BEGIN_HOP2_REQUOTE: 'HOP2_REQUOTE' },
   ROUTE_SETTLED: {},
   ROUTE_PAUSED: { RESUME_REQUOTE: 'HOP2_REQUOTE', SKIP_HOP2: 'HOP2_SKIPPED', ENTER_RECOVERY: 'ROUTE_RECOVERY_REQUIRED', FAIL_TERMINAL: 'ROUTE_FAILED_TERMINAL' },
@@ -61,8 +61,16 @@ export function applyRouteEvent(record: RouteRecord, event: RouteEvent): RouteRe
     }
     case 'HOP1_SETTLED': {
       const [hop1] = next.hops;
-      // A hop settles with the amount from the PROOF, never the quote.
+      // Settling hop 1 REQUIRES the proven amount, and that amount must be a POSITIVE
+      // integer. Accepting "0" (or a malformed value) would mark the cross-layer trade
+      // settled while the intermediate TARI does not exist — silently losing the user's
+      // money. Found by the route fuzzer; enforced here so no caller can skip it.
       if (event.settledAmountRaw === undefined) throw new IllegalTransitionError('hop 1 settlement must carry the PROVEN settled amount');
+      if (!/^\d+$/.test(event.settledAmountRaw)) throw new IllegalTransitionError(`hop 1 settled amount ${event.settledAmountRaw} must be a raw non-negative integer string`);
+      if (BigInt(event.settledAmountRaw) === 0n) throw new IllegalTransitionError('hop 1 settled amount is zero — the intermediate TARI would be lost');
+      if (event.proofRef === undefined || event.proofRef.routeId !== next.routeId) {
+        throw new IllegalTransitionError('hop 1 settlement must carry a proof reference bound to this route');
+      }
       hop1.settlement = 'SETTLED';
       hop1.execution = 'CONFIRMED';
       hop1.settledAmountRaw = event.settledAmountRaw;
@@ -107,6 +115,9 @@ export function applyRouteEvent(record: RouteRecord, event: RouteEvent): RouteRe
       const hop2 = next.hops[1];
       if (next.settlementProof === undefined) throw new IllegalTransitionError('hop 2 may not execute without a settlement proof');
       if (next.proofConsumedByHop2 === true) throw new IllegalTransitionError('hop 2 already consumed the settlement proof — double execution refused');
+      // The durable operation id is what makes a retry idempotent and what reconciliation
+      // keys on, so it is validated here rather than trusted from the caller.
+      requireOperationId(event.operationId);
       hop2.execution = 'EXECUTING';
       hop2.operationId = event.operationId;
       next.proofConsumedByHop2 = true;
@@ -114,6 +125,13 @@ export function applyRouteEvent(record: RouteRecord, event: RouteEvent): RouteRe
     }
     case 'HOP2_SETTLED': {
       const hop2 = next.hops[1];
+      // The FINAL output may never violate the user's accepted minimum, even if a buggy or
+      // hostile caller reports a smaller settlement. The AMM hop enforces this at build
+      // time; the route machine enforces it again so the invariant cannot be bypassed.
+      if (!/^\d+$/.test(event.settledAmountRaw)) throw new IllegalTransitionError(`hop 2 settled amount ${event.settledAmountRaw} must be a raw non-negative integer string`);
+      if (BigInt(event.settledAmountRaw) < BigInt(next.acceptance.minimumFinalOutputRaw)) {
+        throw new IllegalTransitionError(`hop 2 settled amount ${event.settledAmountRaw} violates the accepted minimum final output ${next.acceptance.minimumFinalOutputRaw}`);
+      }
       hop2.execution = 'CONFIRMED';
       hop2.settlement = 'SETTLED';
       hop2.chainTxId = event.chainTxId;
@@ -131,9 +149,11 @@ export function applyRouteEvent(record: RouteRecord, event: RouteEvent): RouteRe
       const hop2 = next.hops[1];
       hop2.execution = 'FAILED';
       hop2.failureReason = event.reason;
-      // A failed hop 2 does NOT lose the intermediate TARI — the route pauses, it does not
-      // roll back a completed cross-layer trade.
-      next.pause = { reason: 'AMM_LIQUIDITY_GONE', detail: event.reason, atUnixMs: Date.now() };
+      // A failed hop 2 does NOT lose the intermediate TARI and does NOT fail the whole
+      // route: hop 1 already settled for the user. The route PAUSES so the user can
+      // requote, retry deliberately, or simply keep the TARI. A terminal failure here
+      // would misreport a completed cross-layer trade as a total loss.
+      next.pause = { reason: 'AMM_EXECUTION_FAILED', detail: event.reason, atUnixMs: Date.now() };
       return next;
     }
     case 'SKIP_HOP2':
@@ -160,6 +180,26 @@ export function applyRouteEvent(record: RouteRecord, event: RouteEvent): RouteRe
       return next;
     case 'RESOLVE_SETTLED': {
       const hop2 = next.hops[1];
+      // Recovery may only MARK a hop settled when durable evidence already proves what
+      // committed. Without a hop-1 settlement proof and a known hop-2 transaction id, this
+      // event would be a bypass: it could settle hop 2 (and the whole route) while hop 1
+      // never settled at all. Found by the route fuzzer; the same preconditions as
+      // HOP2_SETTLED are enforced here.
+      if (next.settlementProof === undefined) {
+        throw new IllegalTransitionError('recovery cannot settle hop 2 without a hop-1 terminal settlement proof');
+      }
+      if (next.hops[0].settlement !== 'SETTLED') {
+        throw new IllegalTransitionError('recovery cannot settle hop 2 while hop 1 is unsettled');
+      }
+      if (hop2.chainTxId === undefined || hop2.chainTxId === '') {
+        throw new IllegalTransitionError('recovery cannot settle hop 2 without the committed chain transaction id');
+      }
+      if (hop2.settledAmountRaw === undefined || !/^\d+$/.test(hop2.settledAmountRaw)) {
+        throw new IllegalTransitionError('recovery cannot settle hop 2 without the proven output amount');
+      }
+      if (BigInt(hop2.settledAmountRaw) < BigInt(next.acceptance.minimumFinalOutputRaw)) {
+        throw new IllegalTransitionError(`recovery output ${hop2.settledAmountRaw} violates the accepted minimum ${next.acceptance.minimumFinalOutputRaw}`);
+      }
       hop2.settlement = 'SETTLED';
       hop2.execution = 'CONFIRMED';
       return next;

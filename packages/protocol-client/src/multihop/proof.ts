@@ -81,10 +81,13 @@ function fail(why: string): never {
   throw new SettlementProofRefusal(`Settlement proof refused: ${why}`);
 }
 
+/** Largest value we model: 2^128-1, computed so the bound cannot be mistyped. */
+const MAX_UINT_128 = (1n << 128n) - 1n;
+
 function requireRaw(value: string, field: string): bigint {
   if (typeof value !== 'string' || !/^\d+$/.test(value)) fail(`${field} must be a raw non-negative integer string`);
   const v = BigInt(value);
-  if (v > 0xffffffffffffffffffffffffn) fail(`${field} exceeds 128 bits`);
+  if (v > MAX_UINT_128) fail(`${field} exceeds 128 bits`);
   return v;
 }
 
