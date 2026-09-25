@@ -114,13 +114,12 @@ authoritative type.
 
 ## Real Ootle engine
 
-Tests executed (pool-relevant): **34** = pool_engine 7 + pool_economics 4 + opus08 9 +
-pool_adversarial 11 + faucet/hostile support + 3 marketplace-side suites. Environment:
-Linux CI (`security-engine-tests.yml`, wasmer/cranelift; cannot compile on Windows —
-documented, not a contract property). Passed/failed/ignored at this HEAD: to be recorded by
-the CI run of this commit; local Windows execution is impossible for the engine suites
-(Cranelift `compile_error!`), all off-chain suites pass locally (32 pool_math + 22 ref model +
-2 protocol_types).
+Tests executed (pool-relevant): **43** total engine tests = pool_engine 7 + pool_economics 4 +
+opus08 9 + pool_adversarial 11 (w01–w11) + NFT suites 12. **Executed result (CI run
+36097235958, commit 3445c46, Linux/wasmer): pool-relevant 31 passed · 0 failed · 0 ignored;
+pool_adversarial specifically 11 passed · 0 failed · 0 ignored — the adversarial suite
+EXECUTED, not merely compiled.** Off-chain: 32 pool_math + 22 ref model + 10 protocol_types
+all green locally and in CI.
 
 ## Client / router
 
