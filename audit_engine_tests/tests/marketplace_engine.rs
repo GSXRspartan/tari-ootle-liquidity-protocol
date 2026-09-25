@@ -103,7 +103,7 @@ fn fund_nft(t: &mut TemplateTest, faucet: ComponentAddress, recipient: Component
 }
 
 macro_rules! create_listing {
-    ($t:expr, $seller:expr, $seller_proof:expr, $seller_secret:expr, $nft_resource:expr, $nft_id:expr, $quote:expr, $price:expr, $expiry:expr) => {{
+    ($t:expr, $seller:expr, $seller_proof:expr, $seller_secret:expr, $nft_resource:expr, $nft_id:expr, $quote:expr, $price:expr, $expiry:expr $(,)?) => {{
         let template = $t.get_template_address("FixedPriceListing");
         let result = $t.execute_expect_success(
             $t.transaction()
