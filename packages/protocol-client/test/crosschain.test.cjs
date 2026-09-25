@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const sessionMod = require('../dist/crosschain/session.js');
+const { IllegalTransitionError } = sessionMod;
 const {
   buildQuote,
   isQuoteExpired,
@@ -196,10 +197,6 @@ test('secret never leaks into serializable state', async () => {
   assertNoSecretInJson(historyJson, preimage);
   assert.throws(() => assertNoSecretInJson(JSON.stringify({ leaked: preimage }), preimage), /SECRET LEAKED/);
 });
-
-function assertNoSecretInJson(json, secret) {
-  require('../dist/crosschain/secret.js').assertNoSecretInJson(json, secret);
-}
 
 test('stale/expired unfunded quote terminates and cannot be revived', () => {
   const r = applyEvt(sessionRecord({ state: 'QUOTED' }), { kind: 'FAIL_TERMINAL', reason: 'quote expired unfunded' });
