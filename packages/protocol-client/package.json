@@ -9,7 +9,7 @@
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "lint": "echo 'No lint'",
-    "test": "npm run build && node --test test/marketplace.test.cjs test/amm.test.cjs test/history.test.cjs test/crosschain.test.cjs test/minotari.test.cjs"
+    "test": "npm run build && node --test test/marketplace.test.cjs test/amm.test.cjs test/history.test.cjs test/crosschain.test.cjs test/minotari.test.cjs test/hostile_crosschain.test.cjs test/hostile_fuzz.test.cjs"
   },
   "dependencies": {},
   "devDependencies": {

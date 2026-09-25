@@ -307,7 +307,9 @@ async function ingestWalletGeneratedSecret(ports: CoordinatorPorts, sessionId: s
 
 /** AUTHORITATIVE first-leg verification — required before funding the second leg. */
 export async function verifyL1Funded(input: { sessionId: string; ports: CoordinatorPorts; deadlineSafety: { l1RemainingMarginMs: string; l2RemainingMarginMs: string; requiredL1MarginMs: string; requiredL2MarginMs: string } }): Promise<VerifyOutcome> {
-  const record = await requireState(input.sessionId, input.ports, ['L1_FUNDED', 'L1_FUNDING']);
+  // BOTH_FUNDED/CLAIM_ARMED are legal here: arming and disclosure RE-VERIFY the first leg
+  // authoritatively at that later point rather than trusting the original read.
+  const record = await requireState(input.sessionId, input.ports, ['L1_FUNDED', 'L1_FUNDING', 'BOTH_FUNDED', 'CLAIM_ARMED']);
   if (!record.l1TxId) return { verified: false, reason: 'No L1 transaction id recorded' };
   const obs = await input.ports.l1.observeHtlc(record.l1TxId);
   // When the quote did not fix H (real wallet generates S at funding time), the FIRST
@@ -428,7 +430,7 @@ export async function beginL2Funding(input: { sessionId: string; ports: Coordina
 
 /** AUTHORITATIVE L2 verification of the hashlock output. */
 export async function verifyL2Funded(input: { sessionId: string; ports: CoordinatorPorts }): Promise<VerifyOutcome> {
-  const record = await requireState(input.sessionId, input.ports, ['BOTH_FUNDED', 'L2_FUNDING']);
+  const record = await requireState(input.sessionId, input.ports, ['BOTH_FUNDED', 'L2_FUNDING', 'CLAIM_ARMED']);
   if (!record.l2TxId) return { verified: false, reason: 'No L2 transaction id recorded' };
   const obs = await input.ports.l2.observeHashlockOutput(record.l2TxId);
   const evidence = {
@@ -523,8 +525,11 @@ export async function revealAndClaimL2(input: { sessionId: string; ports: Coordi
     await input.ports.sessions.save(applyEvent(claiming, { kind: 'CLAIM_ACKNOWLEDGED', leg: 'L2', txId: submitted.l2TxId }));
     return { outcome: 'SUBMITTED', txId: submitted.l2TxId };
   } catch (error) {
-    // The secret MAY be public; reconcile, never retry blindly.
-    const recovery = applyEvent(record, { kind: 'ENTER_RECOVERY', reason: `claim submit unknown: ${(error as Error).message}` });
+    // The secret MAY already be public (the claim may have reached the network even though
+    // the response was lost). Persist the recovery transition from the REVEALED record so
+    // the durable evidence that S went out is never lost — an operator must be able to see
+    // this session can no longer be treated as secret.
+    const recovery = applyEvent(revealed, { kind: 'ENTER_RECOVERY', reason: `claim submit unknown: ${(error as Error).message}` });
     await input.ports.sessions.save(recovery);
     return { outcome: 'UNKNOWN', reason: (error as Error).message };
   }
