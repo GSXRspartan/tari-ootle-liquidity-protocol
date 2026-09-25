@@ -2,6 +2,12 @@ name: Node Tests
 
 # Runs the TypeScript package builds and test suites (protocol-client, wallet-adapter).
 # This is the validation channel for packages whose local environment may be offline.
+#
+# This workspace uses PNPM (pnpm-workspace.yaml, engines.pnpm >= 9, workspace:* deps).
+# The install step mirrors the established convention in pages.yml: pnpm/action-setup v4
+# pinned to 9 (per engines.pnpm >= 9.0.0), then `pnpm install --no-frozen-lockfile`
+# because the repo ships no pnpm-lock.yaml yet. Once a lockfile is committed, re-add
+# setup-node `cache: 'pnpm'` and switch to `--frozen-lockfile` (same as pages.yml notes).
 
 on:
   pull_request:
@@ -23,22 +29,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node 20
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 20
 
       - name: Install workspace dependencies
-        run: npm install
+        run: pnpm install --no-frozen-lockfile
 
-      - name: protocol-client build + tests
-        run: |
-          cd packages/protocol-client
-          npm run typecheck
-          npm test
+      - name: protocol-client typecheck + tests
+        run: pnpm --filter @tari-ootle/protocol-client run typecheck && pnpm --filter @tari-ootle/protocol-client run test
 
-      - name: wallet-adapter build + tests
-        run: |
-          cd ../wallet-adapter
-          npm run typecheck
-          npm test
+      - name: wallet-adapter typecheck + tests
+        run: pnpm --filter @tari-ootle/wallet-adapter run typecheck && pnpm --filter @tari-ootle/wallet-adapter run test
