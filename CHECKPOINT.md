@@ -1,3 +1,62 @@
+# END-OF-RUN CHECKPOINT (2026-09-25) — hostile cross-layer audit
+
+> Supersedes only the facts it contradicts below; the AMM/template history in the
+> 2026-09-23 checkpoint and the Minotari phase section below are retained for reference.
+
+## A1. Outcome
+**NO KNOWN CROSS-LAYER CONTRACT/COORDINATOR DRAIN FOUND UNDER TESTED MODEL.**
+3 CRITICAL + 6 HIGH + 7 MEDIUM root causes found, all fixed, all covered by retained
+regressions. Open CRITICAL: 0. Open HIGH: 0.
+
+CRITICAL fixes (previously the "authoritative verification" steps were advisory):
+- second-leg funding was reachable from a bare submission ack → now requires an
+  authoritative `l1Verification` stamp the state machine refuses to write unless fully proven;
+- `CLAIM_ARMED` trusted durable state plus a truthy `claimConstructileEvidence` string and
+  re-observed nothing → now re-observes BOTH legs authoritatively at arm time; the string is gone;
+- the L1 `amountExact` check compared the funding intent against itself → an explicitly proven
+  amount is now required, and `amountAuthoritative` defaults to false.
+
+## A2. Evidence
+| Suite | Result |
+|---|---|
+| `test/hostile_crosschain.test.cjs` | 34/34 (attack matrix rows A–U) |
+| `test/hostile_fuzz.test.cjs` | 5/5 (~150k ops: 100k transitions, 70k script mutations, 12 crash points) |
+| protocol-client total | **106/106** (was 67) |
+| wallet-adapter | **12/12** |
+| workspace typecheck | clean |
+| persisted failing fuzz seeds | **0** (`test/fuzz-failing-seeds.jsonl` not created) |
+| attack-matrix rows | 146 (PASS 81, FIXED 48, N/A 3, EXTERNAL_RISK 2, BLOCKED_EXTERNAL 10, BLOCKED_TOOLING 2, UNKNOWN 0) |
+
+## A3. Deliverables
+- `security/CROSS_LAYER_INVARIANTS.md` — 14 required + 6 additional invariants, each naming
+  its enforcing code and its test
+- `security/CROSS_LAYER_ATTACK_MATRIX.md` — 146 classified rows, no UNKNOWN
+- `security/CROSS_LAYER_HOSTILE_AUDIT_REPORT.md`
+- `security/CROSS_LAYER_RESIDUAL_RISKS.md` — 17 residual risks
+- `security/MINOTARI_AUTHORITY_MODEL.md` — field-by-field authority classification
+
+## A4. The L1 amount answer
+The amount **is** establishable, but never by the base node (blinded commitment). The
+claimant can prove it from chain data + its own view key via `EncryptedData::decrypt_data`
++ `output.verify_mask` (the APIs the real claim path already uses) — yet no traced wallet
+gRPC or WASM operation exposes that, so the reference provider reports
+`amountAuthoritative: false` and the coordinator refuses. Availability limit, not a fund risk.
+`TARI_TO_XTM` cannot complete until that upstream operation exists.
+
+## A5. Still not established
+No live Esmeralda execution (no funded wallet/gRPC/readback), no real Ootle L2 execution
+(no concrete `OotleScriptPathLegPort` provider), no reorg simulation, no browser L1 leg
+(upstream-blocked), no production restart-safe secret storage. Route remains
+EXPERIMENTAL/TESTNET; real submit OFF by default; mainnet refused.
+
+## A6. Next exact phase
+Unified route composition **XTM → TARI → AMM** plus hostile multi-hop failure testing.
+The seam is prepared but inert by construction: `RouteResult.composable` is typed `false`
+and `settlementStatus` starts `UNSETTLED`, so a downstream hop cannot start on a
+coordinator's optimism.
+
+---
+
 # END-OF-RUN CHECKPOINT (2026-09-25) — FAST_XTM_TARI Minotari phase
 
 > Supersedes only the facts it contradicts below; the AMM/template history in the
