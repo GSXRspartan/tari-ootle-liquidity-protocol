@@ -36,8 +36,7 @@ mod test_nft_faucet {
                     nft_ids
                         .iter()
                         .cloned()
-                        .map(|id| (id, (&immutable_data, &mutable_data)))
-                        .collect(),
+                        .map(|id| (id, (&immutable_data, &mutable_data))),
                 );
 
             Component::new(Self {
