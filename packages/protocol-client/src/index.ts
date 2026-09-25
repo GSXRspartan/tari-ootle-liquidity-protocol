@@ -3,6 +3,8 @@ export interface IndexerProvider {
   networkName: string;
 }
 
+export * from './marketplace';
+
 export interface IndexerResponse<T> {
   data: T;
   meta?: { height?: number; timestamp?: number };
