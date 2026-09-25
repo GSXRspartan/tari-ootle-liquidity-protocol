@@ -95,16 +95,13 @@ fn new_ctx(fee: u16) -> Ctx {
 
 fn fund_once(ctx: &mut Ctx, faucet_component: ComponentAddress) {
     let account = ctx.account;
-    ctx.t
-        .build_and_execute(
-            ctx.t
-                .transaction()
-                .call_method(faucet_component, "take_free_coins", args![])
-                .put_last_instruction_output_on_workspace("coins")
-                .call_method(account, "deposit", args![Workspace("coins")]),
-            vec![],
-        )
-        .expect_success();
+    let tx = ctx
+        .t
+        .transaction()
+        .call_method(faucet_component, "take_free_coins", args![])
+        .put_last_instruction_output_on_workspace("coins")
+        .call_method(account, "deposit", args![Workspace("coins")]);
+    ctx.t.build_and_execute(tx, vec![]).expect_success();
 }
 
 /// Instantiate the Hostile factory (returns `(Component<Self>, ResourceAddress)`); returns
@@ -113,7 +110,7 @@ fn hostile_component(t: &mut TemplateTest) -> ComponentAddress {
     let tpl = t.get_template_address("Hostile");
     let res = t.execute_expect_success(
         t.transaction()
-            .call_function(tpl, "safe_fungible", args![], vec![])
+            .call_function(tpl, "safe_fungible", args![])
             .build_and_seal(t.secret_key()),
         vec![],
     );
@@ -151,8 +148,15 @@ fn account_balance(ctx: &mut Ctx, res: ResourceAddress) -> u128 {
 
 /// Add liquidity from the main account; returns the LP minted to it.
 fn add_liquidity(ctx: &mut Ctx, a_amt: u64, b_amt: u64) -> u128 {
-    let (a, b, account, pool, proof) = (ctx.a, ctx.b, ctx.account, ctx.pool, ctx.proof.clone());
-    let lp_before = account_balance(ctx, ctx.lp);
+    let (a, b, lp, account, pool, proof) = (
+        ctx.a,
+        ctx.b,
+        ctx.lp,
+        ctx.account,
+        ctx.pool,
+        ctx.proof.clone(),
+    );
+    let lp_before = account_balance(ctx, lp);
     let tx = ctx
         .t
         .transaction()
@@ -164,14 +168,21 @@ fn add_liquidity(ctx: &mut Ctx, a_amt: u64, b_amt: u64) -> u128 {
         .put_last_instruction_output_on_workspace("lp")
         .call_method(account, "deposit", args![Workspace("lp")]);
     ctx.t.build_and_execute(tx, vec![proof]).expect_success();
-    account_balance(ctx, ctx.lp) - lp_before
+    account_balance(ctx, lp) - lp_before
 }
 
 /// Redeem `lp_amt` LP from the main account; returns (A out, B out).
 fn redeem(ctx: &mut Ctx, lp_amt: u64) -> (u128, u128) {
-    let (lp, account, pool, proof) = (ctx.lp, ctx.account, ctx.pool, ctx.proof.clone());
-    let a_before = account_balance(ctx, ctx.a);
-    let b_before = account_balance(ctx, ctx.b);
+    let (a, b, lp, account, pool, proof) = (
+        ctx.a,
+        ctx.b,
+        ctx.lp,
+        ctx.account,
+        ctx.pool,
+        ctx.proof.clone(),
+    );
+    let a_before = account_balance(ctx, a);
+    let b_before = account_balance(ctx, b);
     let tx = ctx
         .t
         .transaction()
@@ -182,10 +193,9 @@ fn redeem(ctx: &mut Ctx, lp_amt: u64) -> (u128, u128) {
         .call_method(account, "deposit", args![Workspace("out.0")])
         .call_method(account, "deposit", args![Workspace("out.1")]);
     ctx.t.build_and_execute(tx, vec![proof]).expect_success();
-    (
-        account_balance(ctx, ctx.a) - a_before,
-        account_balance(ctx, ctx.b) - b_before,
-    )
+    let a_after = account_balance(ctx, a);
+    let b_after = account_balance(ctx, b);
+    (a_after - a_before, b_after - b_before)
 }
 
 /// Swap from the main account; returns the output received.
@@ -222,16 +232,18 @@ fn w01_uranium_denominator_tiny_input_cannot_extract() {
     let mut ctx = new_ctx(30);
     add_liquidity(&mut ctx, 1_000_000_000, 1_000_000_000);
 
-    let ra0 = pool_balance(&mut ctx, ctx.a);
-    let rb0 = pool_balance(&mut ctx, ctx.b);
+    let a = ctx.a;
+    let b = ctx.b;
+    let ra0 = pool_balance(&mut ctx, a);
+    let rb0 = pool_balance(&mut ctx, b);
     let supply0 = pool_lp_supply(&mut ctx);
 
     // Attack: tiny input, disproportionate output demanded (Uranium shape)
-    let (b, account, pool, proof) = (ctx.b, ctx.account, ctx.pool, ctx.proof.clone());
+    let (account, pool, proof) = (ctx.account, ctx.pool, ctx.proof.clone());
     let tx = ctx
         .t
         .transaction()
-        .call_method(account, "withdraw", args![ctx.a, Amount::from(2u64)])
+        .call_method(account, "withdraw", args![a, Amount::from(2u64)])
         .put_last_instruction_output_on_workspace("in")
         .call_method(
             pool,
@@ -243,30 +255,21 @@ fn w01_uranium_denominator_tiny_input_cannot_extract() {
     println!("w01 disproportionate-output swap rejected: {:?}", reason);
 
     // atomicity: nothing changed
-    assert_eq!(
-        pool_balance(&mut ctx, ctx.a),
-        ra0,
-        "reserve A changed after abort"
-    );
-    assert_eq!(
-        pool_balance(&mut ctx, ctx.b),
-        rb0,
-        "reserve B changed after abort"
-    );
-    assert_eq!(
-        pool_lp_supply(&mut ctx),
-        supply0,
-        "supply changed after abort"
-    );
+    let ra1 = pool_balance(&mut ctx, a);
+    let rb1 = pool_balance(&mut ctx, b);
+    let supply1 = pool_lp_supply(&mut ctx);
+    assert_eq!(ra1, ra0, "reserve A changed after abort");
+    assert_eq!(rb1, rb0, "reserve B changed after abort");
+    assert_eq!(supply1, supply0, "supply changed after abort");
 
     // The same 2-unit input yields exactly 1 unit: eff = 2*9970/10000 = 1;
     // out = 1e9*1/(1e9+1) floor = 0... with these reserves it floors to 0, so a
     // min_output of 1 aborts. Prove the boundary: demanding 1 is rejected here.
-    let (b, account, pool, proof) = (ctx.b, ctx.account, ctx.pool, ctx.proof.clone());
+    let (account, pool, proof) = (ctx.account, ctx.pool, ctx.proof.clone());
     let tx = ctx
         .t
         .transaction()
-        .call_method(account, "withdraw", args![ctx.a, Amount::from(2u64)])
+        .call_method(account, "withdraw", args![a, Amount::from(2u64)])
         .put_last_instruction_output_on_workspace("in")
         .call_method(pool, "swap", args![Workspace("in"), b, Amount::from(1u64)])
         .build_and_seal(ctx.t.secret_key());
@@ -275,22 +278,18 @@ fn w01_uranium_denominator_tiny_input_cannot_extract() {
         "w01 2-unit swap with min_output=1 rejected (floors to 0): {:?}",
         reason
     );
-    assert_eq!(
-        pool_balance(&mut ctx, ctx.b),
-        rb0,
-        "state mutated by aborted swap"
-    );
+    let rb2 = pool_balance(&mut ctx, b);
+    assert_eq!(rb2, rb0, "state mutated by aborted swap");
 
     // A 3-unit input floors to exactly 1 output — the maximum any tiny input may take.
     let out = swap(&mut ctx, true, 3, 1);
     assert_eq!(out, 1, "3-unit swap must yield exactly 1 unit");
-    assert!(
-        pool_balance(&mut ctx, ctx.b) < rb0,
-        "output reserve must decrease"
-    );
+    let rb3 = pool_balance(&mut ctx, b);
+    assert!(rb3 < rb0, "output reserve must decrease");
     // and k must grow (fee retained for LPs)
+    let ra3 = pool_balance(&mut ctx, a);
     let k0 = ra0 * rb0;
-    let k1 = pool_balance(&mut ctx, ctx.a) * pool_balance(&mut ctx, ctx.b);
+    let k1 = ra3 * rb3;
     assert!(k1 > k0, "k did not grow");
 }
 
@@ -299,20 +298,24 @@ fn w01_uranium_denominator_tiny_input_cannot_extract() {
 fn w02_one_unit_swap_aborts_free_trade() {
     let mut ctx = new_ctx(30);
     add_liquidity(&mut ctx, 1_000_000_000, 1_000_000_000);
-    let ra0 = pool_balance(&mut ctx, ctx.a);
-    let rb0 = pool_balance(&mut ctx, ctx.b);
-    let (b, account, pool, proof) = (ctx.b, ctx.account, ctx.pool, ctx.proof.clone());
+    let a = ctx.a;
+    let b = ctx.b;
+    let ra0 = pool_balance(&mut ctx, a);
+    let rb0 = pool_balance(&mut ctx, b);
+    let (account, pool, proof) = (ctx.account, ctx.pool, ctx.proof.clone());
     let tx = ctx
         .t
         .transaction()
-        .call_method(account, "withdraw", args![ctx.a, Amount::from(1u64)])
+        .call_method(account, "withdraw", args![a, Amount::from(1u64)])
         .put_last_instruction_output_on_workspace("in")
         .call_method(pool, "swap", args![Workspace("in"), b, Amount::from(0u64)])
         .build_and_seal(ctx.t.secret_key());
     let reason = ctx.t.execute_expect_failure(tx, vec![proof]);
     println!("w02 1-unit swap rejected: {:?}", reason);
-    assert_eq!(pool_balance(&mut ctx, ctx.a), ra0);
-    assert_eq!(pool_balance(&mut ctx, ctx.b), rb0);
+    let ra1 = pool_balance(&mut ctx, a);
+    let rb1 = pool_balance(&mut ctx, b);
+    assert_eq!(ra1, ra0);
+    assert_eq!(rb1, rb0);
 }
 
 /// Repeated micro round-trips — repeated precision extraction class. Each full A→B→A
@@ -363,10 +366,12 @@ fn w04_first_depositor_cannot_capture_victim_value() {
     );
     assert_eq!(pool_locked(&mut ctx), 1_000);
 
+    let (a, b, lp) = (ctx.a, ctx.b, ctx.lp);
+
     // victim account (separate identity) receives 1e9 of each from the main account
     let (victim, victim_proof, _) = ctx.t.create_funded_account();
     {
-        let (a, b, account, proof) = (ctx.a, ctx.b, ctx.account, ctx.proof.clone());
+        let (account, proof) = (ctx.account, ctx.proof.clone());
         let tx = ctx
             .t
             .transaction()
@@ -386,7 +391,7 @@ fn w04_first_depositor_cannot_capture_victim_value() {
             .call_method(victim, "deposit", args![Workspace("b")]);
         ctx.t.build_and_execute(tx, vec![proof]).expect_success();
     }
-    let (a, b, pool) = (ctx.a, ctx.b, ctx.pool);
+    let pool = ctx.pool;
     let tx = ctx
         .t
         .transaction()
@@ -402,7 +407,7 @@ fn w04_first_depositor_cannot_capture_victim_value() {
         .expect_success();
 
     // victim LP must be exactly proportional: 1e9 * 1e6 / 1e6 = 1e9 (never zero/under)
-    let victim_lp: Amount = ctx.t.call_method(victim, "balance", args![ctx.lp], vec![]);
+    let victim_lp: Amount = ctx.t.call_method(victim, "balance", args![lp], vec![]);
     assert_eq!(
         victim_lp.to_u128(),
         1_000_000_000,
@@ -421,7 +426,6 @@ fn w04_first_depositor_cannot_capture_victim_value() {
     );
 
     // victim redeems everything user-held: must recover exactly the deposit
-    let (lp, pool) = (ctx.lp, ctx.pool);
     let tx = ctx
         .t
         .transaction()
@@ -434,8 +438,8 @@ fn w04_first_depositor_cannot_capture_victim_value() {
     ctx.t
         .build_and_execute(tx, vec![victim_proof])
         .expect_success();
-    let va: Amount = ctx.t.call_method(victim, "balance", args![ctx.a], vec![]);
-    let vb: Amount = ctx.t.call_method(victim, "balance", args![ctx.b], vec![]);
+    let va: Amount = ctx.t.call_method(victim, "balance", args![a], vec![]);
+    let vb: Amount = ctx.t.call_method(victim, "balance", args![b], vec![]);
     assert_eq!(va.to_u128(), 1_000_000_000, "victim under-recovered A");
     assert_eq!(vb.to_u128(), 1_000_000_000, "victim under-recovered B");
     assert_eq!(pool_lp_supply(&mut ctx), 1_000, "only locked LP remains");
@@ -452,12 +456,14 @@ fn w04_first_depositor_cannot_capture_victim_value() {
 #[test]
 fn w05_zero_user_lp_reinit_is_proportional_never_rebootstraps() {
     let mut ctx = new_ctx(30);
+    let a = ctx.a;
+    let b = ctx.b;
     let lp = add_liquidity(&mut ctx, 10_000_000, 10_000_000);
     assert_eq!(lp, 9_999_000);
     let _ = redeem(&mut ctx, lp as u64);
     // reserves reduce proportionally to the locked share: 1e7 * 1000/1e7 = 1000
-    assert_eq!(pool_balance(&mut ctx, ctx.a), 1_000);
-    assert_eq!(pool_balance(&mut ctx, ctx.b), 1_000);
+    assert_eq!(pool_balance(&mut ctx, a), 1_000);
+    assert_eq!(pool_balance(&mut ctx, b), 1_000);
     assert_eq!(pool_lp_supply(&mut ctx), 1_000);
     assert_eq!(pool_locked(&mut ctx), 1_000);
 
@@ -470,8 +476,8 @@ fn w05_zero_user_lp_reinit_is_proportional_never_rebootstraps() {
     let (ra, rb) = redeem(&mut ctx, lp2 as u64);
     assert_eq!(ra, 1_000_000, "reinit over-redemption: {ra}");
     assert_eq!(rb, 1_000_000, "reinit over-redemption: {rb}");
-    assert_eq!(pool_balance(&mut ctx, ctx.a), 1_000);
-    assert_eq!(pool_balance(&mut ctx, ctx.b), 1_000);
+    assert_eq!(pool_balance(&mut ctx, a), 1_000);
+    assert_eq!(pool_balance(&mut ctx, b), 1_000);
     assert_eq!(pool_lp_supply(&mut ctx), 1_000);
 }
 
@@ -486,7 +492,7 @@ fn w06_unauthorized_lp_mint_rejected() {
     add_liquidity(&mut ctx, 1_000_000, 1_000_000);
     let supply0 = pool_lp_supply(&mut ctx);
 
-    let hostile_tpl = ctx.t.get_template_address("Hostile");
+    let lp = ctx.lp;
     let hostile_c = hostile_component(&mut ctx.t);
     let sealed = ctx
         .t
@@ -494,7 +500,7 @@ fn w06_unauthorized_lp_mint_rejected() {
         .call_method(
             hostile_c,
             "try_mint_foreign",
-            args![ctx.lp, Amount::from(1_000_000_000u64)],
+            args![lp, Amount::from(1_000_000_000u64)],
         )
         .build_and_seal(ctx.t.secret_key());
     let reason = ctx
@@ -516,7 +522,6 @@ fn w07_unauthorized_lp_burn_rejected() {
     let lp_held = add_liquidity(&mut ctx, 1_000_000, 1_000_000);
     let supply0 = pool_lp_supply(&mut ctx);
 
-    let hostile_tpl = ctx.t.get_template_address("Hostile");
     let hostile_c = hostile_component(&mut ctx.t);
     let (account, lp) = (ctx.account, ctx.lp);
     let sealed = ctx
@@ -546,23 +551,22 @@ fn w07_unauthorized_lp_burn_rejected() {
 fn w08_wrong_resource_swap_rejected_at_boundary() {
     let mut ctx = new_ctx(30);
     add_liquidity(&mut ctx, 1_000_000, 1_000_000);
+    let a = ctx.a;
+    let b = ctx.b;
     let (c_faucet, c) = faucet(&mut ctx.t, "CCC");
     {
         let account = ctx.account;
-        ctx.t
-            .build_and_execute(
-                ctx.t
-                    .transaction()
-                    .call_method(c_faucet, "take_free_coins", args![])
-                    .put_last_instruction_output_on_workspace("coins")
-                    .call_method(account, "deposit", args![Workspace("coins")]),
-                vec![],
-            )
-            .expect_success();
+        let tx = ctx
+            .t
+            .transaction()
+            .call_method(c_faucet, "take_free_coins", args![])
+            .put_last_instruction_output_on_workspace("coins")
+            .call_method(account, "deposit", args![Workspace("coins")]);
+        ctx.t.build_and_execute(tx, vec![]).expect_success();
     }
     let (account, b, pool, proof) = (ctx.account, ctx.b, ctx.pool, ctx.proof.clone());
-    let ra0 = pool_balance(&mut ctx, ctx.a);
-    let rb0 = pool_balance(&mut ctx, ctx.b);
+    let ra0 = pool_balance(&mut ctx, a);
+    let rb0 = pool_balance(&mut ctx, b);
     let sealed = ctx
         .t
         .transaction()
@@ -573,8 +577,10 @@ fn w08_wrong_resource_swap_rejected_at_boundary() {
     let reason = ctx.t.execute_expect_failure(sealed, vec![proof]);
     println!("w08 wrong-resource swap rejected: {:?}", reason);
     // state untouched
-    assert_eq!(pool_balance(&mut ctx, ctx.a), ra0);
-    assert_eq!(pool_balance(&mut ctx, ctx.b), rb0);
+    let ra1 = pool_balance(&mut ctx, a);
+    let rb1 = pool_balance(&mut ctx, b);
+    assert_eq!(ra1, ra0);
+    assert_eq!(rb1, rb0);
 }
 
 // ---------------------------------------------------------------------------
@@ -587,22 +593,20 @@ fn w08_wrong_resource_swap_rejected_at_boundary() {
 fn w09_failed_swap_atomicity() {
     let mut ctx = new_ctx(30);
     add_liquidity(&mut ctx, 1_000_000_000, 1_000_000_000);
-    let ra0 = pool_balance(&mut ctx, ctx.a);
-    let rb0 = pool_balance(&mut ctx, ctx.b);
+    let a = ctx.a;
+    let b = ctx.b;
+    let ra0 = pool_balance(&mut ctx, a);
+    let rb0 = pool_balance(&mut ctx, b);
     let s0 = pool_lp_supply(&mut ctx);
     let l0 = pool_locked(&mut ctx);
-    let held0 = account_balance(&mut ctx, ctx.a);
+    let held0 = account_balance(&mut ctx, a);
 
     // min_output above achievable output
-    let (b, account, pool, proof) = (ctx.b, ctx.account, ctx.pool, ctx.proof.clone());
+    let (account, pool, proof) = (ctx.account, ctx.pool, ctx.proof.clone());
     let sealed = ctx
         .t
         .transaction()
-        .call_method(
-            account,
-            "withdraw",
-            args![ctx.a, Amount::from(1_000_000u64)],
-        )
+        .call_method(account, "withdraw", args![a, Amount::from(1_000_000u64)])
         .put_last_instruction_output_on_workspace("in")
         .call_method(
             pool,
@@ -613,12 +617,14 @@ fn w09_failed_swap_atomicity() {
     let reason = ctx.t.execute_expect_failure(sealed, vec![proof]);
     println!("w09 min_output swap rejected: {:?}", reason);
 
-    assert_eq!(pool_balance(&mut ctx, ctx.a), ra0, "reserve A mutated");
-    assert_eq!(pool_balance(&mut ctx, ctx.b), rb0, "reserve B mutated");
+    let ra1 = pool_balance(&mut ctx, a);
+    let rb1 = pool_balance(&mut ctx, b);
+    assert_eq!(ra1, ra0, "reserve A mutated");
+    assert_eq!(rb1, rb0, "reserve B mutated");
     assert_eq!(pool_lp_supply(&mut ctx), s0, "supply mutated");
     assert_eq!(pool_locked(&mut ctx), l0, "locked mutated");
     assert_eq!(
-        account_balance(&mut ctx, ctx.a),
+        account_balance(&mut ctx, a),
         held0,
         "attacker balance not rolled back atomically"
     );
@@ -667,7 +673,8 @@ fn w10_no_admin_or_fee_withdrawal_entry_points() {
 fn w11_sequential_conflicting_swaps_cannot_over_withdraw() {
     let mut ctx = new_ctx(30);
     add_liquidity(&mut ctx, 1_000_000_000, 1_000_000_000);
-    let rb0 = pool_balance(&mut ctx, ctx.b);
+    let b = ctx.b;
+    let rb0 = pool_balance(&mut ctx, b);
     // near-full swap A->B
     let out1 = swap(&mut ctx, true, 999_000_000, 0);
     assert!(out1 > 0 && out1 < rb0);
@@ -678,9 +685,9 @@ fn w11_sequential_conflicting_swaps_cannot_over_withdraw() {
         "second near-full swap must yield strictly less against post-trade reserves"
     );
     // reserves never went negative / wrapped
-    let rb = pool_balance(&mut ctx, ctx.b);
+    let rb1 = pool_balance(&mut ctx, b);
     assert!(
-        rb < rb0 && rb > 0,
+        rb1 < rb0 && rb1 > 0,
         "output reserve invalid after conflicting swaps"
     );
 }
