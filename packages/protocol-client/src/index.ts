@@ -11,6 +11,12 @@ export * from './history';
 export * from './execution_flow';
 export * from './chains/minotari';
 export * from './chains/minotari_grpc';
+export * from './multihop/types';
+export * from './multihop/proof';
+export * from './multihop/route';
+export * from './multihop/hops';
+export * from './multihop/compose';
+export * from './multihop/frontend';
 
 export interface IndexerResponse<T> {
   data: T;
