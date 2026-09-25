@@ -10,7 +10,7 @@
 import { resolveSwap, SlippagePolicy, SwapOutcome } from '../amm.js';
 import { PoolReadbackProvider } from '../ootle.js';
 import { TransactionLookup } from '../execution.js';
-import { TerminalSettlementProof, verifyTerminalSettlementProof } from './proof.js';
+import { SettlementRevalidation, SettlementRevalidator, TerminalSettlementProof, revalidateTerminalSettlementProof, verifyTerminalSettlementProof } from './proof.js';
 import { RouteAsset } from './types.js';
 
 // ---------------------------------------------------------------------------
@@ -55,10 +55,12 @@ export interface AmmSwapHopInput {
   maxEpoch: string;
   currentEpoch?: string;
   slippage: SlippagePolicy;
+  /** Confirmations the settlement must still satisfy at consumption time. */
+  requiredSettlementConfirmations: string;
 }
 
 export interface AmmSwapBuildResult {
-  status: 'BUILT' | 'REFUSED' | 'REQUOTE_REQUIRED' | 'UNAVAILABLE';
+  status: 'BUILT' | 'REFUSED' | 'REQUOTE_REQUIRED' | 'UNAVAILABLE' | 'AUTHORITATIVE_REVALIDATION_UNAVAILABLE';
   reason?: string;
   /** Raw input actually used — always the PROVEN settled amount. */
   inputAmountRaw: string;
@@ -70,6 +72,8 @@ export interface AmmSwapBuildResult {
   reserveOutBefore?: string;
   feeBps?: string;
   builderIntent?: unknown;
+  /** Settlement revalidation outcome, recorded for the route/frontend. */
+  revalidation?: SettlementRevalidation;
 }
 
 /** Policy for what to do when the settled amount differs from the route expectation. */
@@ -94,7 +98,17 @@ export interface AmmSwapPolicy {
  */
 export async function buildAmmSwapHop(
   input: AmmSwapHopInput,
-  deps: { readback: PoolReadbackProvider; builder: { swap(i: { poolComponent: string; quote: unknown; minOutput: string; maxEpoch: string }): unknown }; policy: AmmSwapPolicy },
+  deps: {
+    readback: PoolReadbackProvider;
+    builder: { swap(i: { poolComponent: string; quote: unknown; minOutput: string; maxEpoch: string }): unknown };
+    policy: AmmSwapPolicy;
+    /**
+     * MANDATORY authoritative settlement revalidation. Its absence is a structured refusal,
+     * not a silent pass: the proof's max-age window is a liveness bound, not a security one,
+     * so a reorg inside that window must not escape notice.
+     */
+    settlementRevalidator?: SettlementRevalidator;
+  },
 ): Promise<AmmSwapBuildResult> {
   // 1. HARD DEPENDENCY. A forged, stale, wrong-session, wrong-recipient, wrong-resource or
   //    wrong-route proof stops here, before any AMM read or construction.
@@ -107,6 +121,19 @@ export async function buildAmmSwapHop(
     });
   } catch (error) {
     return { status: 'REFUSED', reason: (error as Error).message, inputAmountRaw: '0' };
+  }
+
+  // 2. AUTHORITATIVE REVALIDATION of the settlement itself. A proof is an in-process
+  //    capability; the chain is the authority. Every identity field is compared, the settled
+  //    state must still hold, and confirmations must still satisfy policy.
+  const revalidation = await revalidateTerminalSettlementProof(input.settlementProof, deps.settlementRevalidator, {
+    requiredConfirmations: input.requiredSettlementConfirmations,
+  });
+  if (revalidation.status === 'AUTHORITATIVE_REVALIDATION_UNAVAILABLE') {
+    return { status: 'AUTHORITATIVE_REVALIDATION_UNAVAILABLE', reason: revalidation.reason, inputAmountRaw: input.settlementProof.resultingAmountRaw, revalidation };
+  }
+  if (revalidation.status !== 'CONFIRMED') {
+    return { status: 'REFUSED', reason: revalidation.reason, inputAmountRaw: input.settlementProof.resultingAmountRaw, revalidation };
   }
 
   // 2. The AMM input is the ACTUAL settled amount from the proof. Never the quote, never a
@@ -186,6 +213,7 @@ export async function buildAmmSwapHop(
     reserveOutBefore: input.inputResource.resourceAddress === pool.resourceA ? pool.reserveB : pool.reserveA,
     feeBps: pool.feeBps,
     builderIntent: outcome.resolved.builderIntent,
+    revalidation,
     // proofRef is intentionally not returned to the caller as authority; the route record
     // holds the single-use binding.
     ...(proofRef ? {} : {}),

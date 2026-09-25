@@ -123,11 +123,41 @@ function ammInput(over = {}) {
     maxEpoch: over.maxEpoch ?? '9999',
     currentEpoch: over.currentEpoch,
     slippage: over.slippage ?? { slippageBps: '100' },
+    requiredSettlementConfirmations: over.requiredSettlementConfirmations ?? '1',
   };
 }
 
-async function buildHop2(over = {}, readbackCfg = {}, policyOver = {}) {
-  return hops.buildAmmSwapHop(ammInput(over), { readback: makeReadback(readbackCfg), builder: AMM_BUILDER, policy: ammPolicy(policyOver) });
+/** An authoritative revalidator that CONFIRMS the proof's own facts. */
+function confirmingRevalidator(proof, over = {}) {
+  return {
+    revalidate: async () => ({
+      status: over.status ?? 'CONFIRMED',
+      reason: over.reason,
+      source: over.source ?? 'CHAIN_NODE',
+      observed: {
+        account: over.account ?? proof.recipientAccount,
+        resourceAddress: over.resourceAddress ?? proof.resultingResourceAddress,
+        amountRaw: over.amountRaw ?? proof.resultingAmountRaw,
+        settled: over.settled ?? true,
+        confirmations: over.confirmations ?? '5',
+        chainTxId: over.chainTxId ?? proof.chainTxId,
+        substateIdentity: over.substateIdentity ?? proof.substateIdentity,
+      },
+    }),
+  };
+}
+
+async function buildHop2(over = {}, readbackCfg = {}, policyOver = {}, depsOver = {}) {
+  const input = ammInput(over);
+  const proof = input.settlementProof;
+  return hops.buildAmmSwapHop(input, {
+    readback: makeReadback(readbackCfg),
+    builder: AMM_BUILDER,
+    policy: ammPolicy(policyOver),
+    // Unless a test explicitly omits it, the authoritative revalidation is present and
+    // confirms the proof. Tests that attack revalidation pass their own.
+    settlementRevalidator: 'settlementRevalidator' in depsOver ? depsOver.settlementRevalidator : confirmingRevalidator(proof),
+  });
 }
 
 function makeRoute(over = {}) {
@@ -199,6 +229,82 @@ test('1.3 HOP1_SETTLED requires the proven amount, and hop 2 input becomes the s
   assert.equal(r.hops[0].settledAmountRaw, '5000000');
   // the hop-2 input is still empty until the caller fills it from the proof
   assert.equal(r.hops[1].inputAmountRaw, '', 'hop 2 input must never be pre-filled from the quote');
+});
+
+// ===========================================================================
+// 0. AUTHORITATIVE SETTLEMENT REVALIDATION (the recorded freshness gap)
+// ===========================================================================
+
+test('0.1 with NO authoritative revalidation provider, hop 2 refuses structurally', async () => {
+  // The proof is genuine and fresh, but the chain was never re-read. The age window is a
+  // LIVENESS bound, not a security one, so this must not silently pass.
+  const r = await buildHop2({}, {}, {}, { settlementRevalidator: undefined });
+  assert.equal(r.status, 'AUTHORITATIVE_REVALIDATION_UNAVAILABLE');
+  assert.match(r.reason, /authoritative settlement revalidation provider is configured|not a substitute for a chain read/);
+  assert.equal(r.builderIntent, undefined, 'no AMM intent may be built without authoritative revalidation');
+  assert.equal(r.revalidation.status, 'AUTHORITATIVE_REVALIDATION_UNAVAILABLE');
+});
+
+test('0.2 a reorg / rollback of the settling transaction refuses hop 2', async () => {
+  const proof = makeProof();
+  const r = await buildHop2({ proof }, {}, {}, { settlementRevalidator: confirmingRevalidator(proof, { settled: false }) });
+  assert.equal(r.status, 'REFUSED');
+  assert.equal(r.revalidation.status, 'REORGED_OR_ROLLED_BACK');
+  assert.match(r.reason, /no longer settled/);
+});
+
+test('0.3 every identity divergence between proof and chain refuses hop 2', async () => {
+  const cases = [
+    ['amount', { amountRaw: '4999999' }, /settled amount mismatch/],
+    ['account', { account: 'acct_other' }, /settlement account mismatch/],
+    ['resource', { resourceAddress: 'tari_lookalike' }, /settled resource mismatch/],
+    ['txid', { chainTxId: 'other_tx' }, /settlement tx mismatch/],
+    ['substate', { substateIdentity: 'pool@DIFFERENT' }, /substate identity mismatch/],
+    ['confirmations', { confirmations: '0' }, /confirmations 0 < required/],
+  ];
+  for (const [name, over, re] of cases) {
+    const proof = makeProof();
+    const r = await buildHop2({ proof }, {}, {}, { settlementRevalidator: confirmingRevalidator(proof, over) });
+    assert.equal(r.status, 'REFUSED', `${name} divergence was accepted`);
+    assert.match(r.reason, re, `${name} divergence produced the wrong reason`);
+  }
+});
+
+test('0.4 a revalidation reader that is itself non-authoritative or broken is refused', async () => {
+  const proof = makeProof();
+  // an indexer/cache source
+  const indexed = await buildHop2({ proof }, {}, {}, { settlementRevalidator: confirmingRevalidator(proof, { source: 'INDEXER_SUBSTATE' }) });
+  assert.equal(indexed.status, 'AUTHORITATIVE_REVALIDATION_UNAVAILABLE');
+  assert.match(indexed.reason, /not authoritative/);
+  // a reader that throws
+  const throwing = await buildHop2({ proof }, {}, {}, { settlementRevalidator: { revalidate: async () => { throw new Error('rpc down'); } } });
+  assert.equal(throwing.status, 'AUTHORITATIVE_REVALIDATION_UNAVAILABLE');
+  assert.match(throwing.reason, /rpc down/);
+  // a malformed reader
+  const malformed = await buildHop2({ proof }, {}, {}, { settlementRevalidator: { revalidate: async () => ({ status: 'CONFIRMED' }) } });
+  assert.equal(malformed.status, 'AUTHORITATIVE_REVALIDATION_UNAVAILABLE');
+  assert.match(malformed.reason, /no observed facts/);
+  const noMethod = await buildHop2({ proof }, {}, {}, { settlementRevalidator: {} });
+  assert.equal(noMethod.status, 'AUTHORITATIVE_REVALIDATION_UNAVAILABLE');
+  // a reader that reports a non-CONFIRMED status without a reason
+  const unconfirmed = await buildHop2({ proof }, {}, {}, { settlementRevalidator: confirmingRevalidator(proof, { status: 'MISMATCH' }) });
+  assert.equal(unconfirmed.status, 'REFUSED');
+});
+
+test('0.5 a reorg between the mint and the consumption is caught (the recorded gap)', async () => {
+  // The exact scenario the residual risk described: the proof was valid at mint time, and
+  // the chain state changed inside the proof's max-age window.
+  const proof = makeProof();
+  assert.equal(proof.terminalStatus, 'CLAIMED');
+  const stillSettled = await buildHop2({ proof }, {}, {}, { settlementRevalidator: confirmingRevalidator(proof) });
+  assert.equal(stillSettled.status, 'BUILT', 'a genuinely settled proof still builds');
+  // now the chain reports the same output is gone (reorg / state reverted)
+  const reorged = await buildHop2({ proof }, {}, {}, { settlementRevalidator: confirmingRevalidator(proof, { settled: false }) });
+  assert.equal(reorged.status, 'REFUSED');
+  // and the amount the chain now reports differs
+  const reduced = await buildHop2({ proof }, {}, {}, { settlementRevalidator: confirmingRevalidator(proof, { amountRaw: '1' }) });
+  assert.equal(reduced.status, 'REFUSED');
+  assert.match(reduced.reason, /settled amount mismatch/);
 });
 
 // ===========================================================================

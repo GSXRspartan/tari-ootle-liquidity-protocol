@@ -241,6 +241,107 @@ function fingerprint(proof: Omit<TerminalSettlementProof, 'proofFingerprint'>): 
   return `${h1.toString(16).padStart(8, '0')}${h2.toString(16).padStart(8, '0')}`;
 }
 
+// ---------------------------------------------------------------------------
+// AUTHORITATIVE REVALIDATION (closes the recorded stale/reorg gap)
+// ---------------------------------------------------------------------------
+
+/**
+ * The facts an authoritative reader must re-derive before a settlement proof is allowed to
+ * authorise hop 2. A proof alone is an in-process capability validated at mint time; a
+ * reorg, a rollback, or an account/state change inside `maxAgeMs` would otherwise escape
+ * notice. These fields are what the revalidation is checked against.
+ */
+export interface SettlementRevalidation {
+  status: 'CONFIRMED' | 'MISMATCH' | 'REORGED_OR_ROLLED_BACK' | 'AUTHORITATIVE_REVALIDATION_UNAVAILABLE';
+  reason?: string;
+  observed?: {
+    account: string;
+    resourceAddress: string;
+    /** Amount currently attributable to the settlement for this account/resource. */
+    amountRaw: string;
+    /** Whether the settling transaction/output is still settled (not reverted, not re-spent). */
+    settled: boolean;
+    confirmations: string;
+    chainTxId: string;
+    substateIdentity?: string;
+  };
+  source?: ReadSource;
+}
+
+export interface SettlementRevalidator {
+  /**
+   * MUST come from an authoritative source (chain node or wallet provider). Indexers,
+   * caches, and provider assertions are not acceptable and are refused on inspection.
+   */
+  revalidate(input: { proof: TerminalSettlementProof; requiredConfirmations: string }): Promise<SettlementRevalidation>;
+}
+
+/**
+ * Re-verify a proof against authoritative chain state.
+ *
+ * Fails closed in every direction: an unavailable authoritative reader is NOT treated as
+ * equivalent to a recent read (the `maxAgeMs` window is a liveness bound, not a security
+ * one), and any divergence in identity, resource, amount, account, transaction, settled
+ * state, or confirmations refuses.
+ */
+export async function revalidateTerminalSettlementProof(
+  proof: TerminalSettlementProof,
+  revalidator: SettlementRevalidator | undefined,
+  options: { requiredConfirmations: string },
+): Promise<SettlementRevalidation> {
+  if (revalidator === undefined) {
+    return {
+      status: 'AUTHORITATIVE_REVALIDATION_UNAVAILABLE',
+      reason: 'no authoritative settlement revalidation provider is configured — the proof age window is not a substitute for a chain read; hop 2 must not be constructed',
+    };
+  }
+  if (typeof revalidator.revalidate !== 'function') {
+    return { status: 'AUTHORITATIVE_REVALIDATION_UNAVAILABLE', reason: 'settlement revalidator does not implement revalidate()' };
+  }
+  let result: SettlementRevalidation;
+  try {
+    result = await revalidator.revalidate({ proof, requiredConfirmations: options.requiredConfirmations });
+  } catch (error) {
+    return { status: 'AUTHORITATIVE_REVALIDATION_UNAVAILABLE', reason: `authoritative revalidation failed: ${(error as Error).message}` };
+  }
+  if (result.status !== 'CONFIRMED') {
+    return { ...result, reason: result.reason ?? `authoritative revalidation returned ${result.status}` };
+  }
+  // The reader must itself be authoritative.
+  if (result.source !== undefined && !isAuthoritativeSource(result.source)) {
+    return { status: 'AUTHORITATIVE_REVALIDATION_UNAVAILABLE', reason: `revalidation source ${result.source} is not authoritative` };
+  }
+  const observed = result.observed;
+  if (observed === undefined) {
+    return { status: 'AUTHORITATIVE_REVALIDATION_UNAVAILABLE', reason: 'revalidation returned no observed facts' };
+  }
+  if (observed.settled !== true) {
+    return { status: 'REORGED_OR_ROLLED_BACK', reason: 'the settling transaction/output is no longer settled authoritatively' };
+  }
+  if (observed.chainTxId !== proof.chainTxId) {
+    return { status: 'MISMATCH', reason: `settlement tx mismatch: proof ${proof.chainTxId} vs authoritative ${observed.chainTxId}` };
+  }
+  if (observed.account !== proof.recipientAccount) {
+    return { status: 'MISMATCH', reason: `settlement account mismatch: proof ${proof.recipientAccount} vs authoritative ${observed.account}` };
+  }
+  if (observed.resourceAddress !== proof.resultingResourceAddress) {
+    return { status: 'MISMATCH', reason: `settled resource mismatch: proof ${proof.resultingResourceAddress} vs authoritative ${observed.resourceAddress}` };
+  }
+  if (observed.amountRaw !== proof.resultingAmountRaw) {
+    return { status: 'MISMATCH', reason: `settled amount mismatch: proof ${proof.resultingAmountRaw} vs authoritative ${observed.amountRaw}` };
+  }
+  if (proof.substateIdentity !== undefined && observed.substateIdentity !== undefined && observed.substateIdentity !== proof.substateIdentity) {
+    return { status: 'MISMATCH', reason: `substate identity mismatch: proof ${proof.substateIdentity} vs authoritative ${observed.substateIdentity}` };
+  }
+  // Confirmations must still satisfy policy at consumption time.
+  const observedConf = BigInt(observed.confirmations);
+  const requiredConf = BigInt(options.requiredConfirmations);
+  if (observedConf < requiredConf) {
+    return { status: 'MISMATCH', reason: `confirmations ${observed.confirmations} < required ${options.requiredConfirmations} at consumption time` };
+  }
+  return { status: 'CONFIRMED', observed, source: result.source };
+}
+
 export function isTerminalSettlementProof(value: unknown): value is TerminalSettlementProof {
   return typeof value === 'object' && value !== null && (value as Record<symbol, unknown>)[PROOF_BRAND] === true;
 }
