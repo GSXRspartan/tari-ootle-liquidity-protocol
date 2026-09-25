@@ -6,7 +6,9 @@ use tari_crypto::ristretto::RistrettoSecretKey;
 use tari_engine_types::virtual_substate::{VirtualSubstate, VirtualSubstateId};
 use tari_ootle_common_types::substate_type::SubstateType;
 use tari_ootle_transaction::args;
-use tari_template_lib::types::{Amount, ComponentAddress, NonFungibleId, ResourceAddress};
+use tari_template_lib::types::{
+    Amount, ComponentAddress, NonFungibleAddress, NonFungibleId, ResourceAddress,
+};
 use tari_template_test_tooling::TemplateTest;
 
 const CRATE_PATH: &str = env!("CARGO_MANIFEST_DIR");
