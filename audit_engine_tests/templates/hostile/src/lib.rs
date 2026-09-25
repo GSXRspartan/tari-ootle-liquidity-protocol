@@ -102,5 +102,20 @@ mod hostile {
         pub fn recall_from_vault(&mut self, vault_id: VaultId, amount: Amount) -> Bucket {
             ResourceManager::get(self.vault.resource_address()).recall_fungible_amount(vault_id, amount)
         }
+
+        /// Attack (LP-AUTH): attempt to MINT an arbitrary foreign resource (e.g. the pool's LP
+        /// token) from an untrusted component frame. Must fail unless the resource's mint rule
+        /// authorizes THIS component — the pool's LP mint rule is scoped to the pool component
+        /// only, so this must abort.
+        pub fn try_mint_foreign(&mut self, resource: ResourceAddress, amount: Amount) -> Bucket {
+            ResourceManager::get(resource).mint_fungible(amount)
+        }
+
+        /// Attack (LP-AUTH): attempt to BURN an arbitrary bucket (e.g. another user's LP) from an
+        /// untrusted component frame. The pool's LP burn rule is scoped to the pool component
+        /// only, so this must abort.
+        pub fn try_burn_foreign(&mut self, bucket: Bucket) {
+            bucket.burn();
+        }
     }
 }

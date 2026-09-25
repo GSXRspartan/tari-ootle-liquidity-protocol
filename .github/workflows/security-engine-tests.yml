@@ -50,6 +50,8 @@ jobs:
       # ---- Formatting (all Rust crates) ----
       - name: rustfmt (pool_math)
         run: cargo fmt --manifest-path crates/pool_math/Cargo.toml -- --check
+      - name: rustfmt (pool_ref_model)
+        run: cargo fmt --manifest-path crates/pool_ref_model/Cargo.toml -- --check
       - name: rustfmt (protocol_types)
         run: cargo fmt --manifest-path crates/protocol_types/Cargo.toml -- --check
       - name: rustfmt (fungible_pool template)
@@ -66,6 +68,8 @@ jobs:
       # ---- cargo check + clippy (warnings denied via RUSTFLAGS) ----
       - name: clippy (pool_math)
         run: cargo clippy --manifest-path crates/pool_math/Cargo.toml --all-targets --all-features
+      - name: clippy (pool_ref_model)
+        run: cargo clippy --manifest-path crates/pool_ref_model/Cargo.toml --all-targets --all-features
       - name: clippy (protocol_types)
         run: cargo clippy --manifest-path crates/protocol_types/Cargo.toml --all-targets --all-features
       - name: clippy (fungible_pool template, wasm)
@@ -74,6 +78,8 @@ jobs:
       # ---- Off-chain unit/property tests ----
       - name: test (pool_math)
         run: cargo test --manifest-path crates/pool_math/Cargo.toml
+      - name: test (pool_ref_model — differential, gauntlet, fuzzer)
+        run: cargo test --manifest-path crates/pool_ref_model/Cargo.toml --release
       - name: test (protocol_types)
         run: cargo test --manifest-path crates/protocol_types/Cargo.toml
 
