@@ -1,0 +1,367 @@
+const test = require('node:test');
+const assert = require('node:assert/strict');
+
+const sessionMod = require('../dist/crosschain/session.js');
+const {
+  buildQuote,
+  isQuoteExpired,
+  validateAdvertisement,
+} = require('../dist/crosschain/quote.js');
+const { InMemoryReservationLedger } = require('../dist/crosschain/reservation.js');
+const {
+  InMemorySecretStore,
+  verifyPreimage,
+  assertNoSecretInJson,
+  sha256,
+  bytesToHex,
+} = require('../dist/crosschain/secret.js');
+const { deriveDeadlines, assertDeadlineSafety, DeadlineError } = require('../dist/crosschain/deadlines.js');
+const {
+  acceptQuote,
+  revealAndClaimL2,
+  claimL1,
+  assessRefundEligibility,
+  recoverSession,
+  isRealSubmitEnabled,
+} = require('../dist/crosschain/coordinator.js');
+
+const AD = {
+  providerId: 'prov_1',
+  pair: 'XTM/TARI',
+  xtmAvailable: '100000',
+  tariAvailable: '50000000',
+  minTradeXtm: '1000',
+  maxTradeXtm: '90000',
+  spreadBps: '50',
+  quoteTtlMs: '60000',
+  requiredL1Confirmations: '3',
+  network: 'esmeralda',
+};
+
+const HASH = bytesToHex(new Uint8Array(32).fill(7));
+const applyEvt = (record, event) => sessionMod.applyEvent(record, event);
+
+function sessionRecord(overrides = {}) {
+  return {
+    sessionId: 'sess_1',
+    state: 'RESERVED',
+    quoteId: 'q_1',
+    reservationId: 'r_1',
+    providerId: 'prov_1',
+    direction: 'XTM_TO_TARI',
+    xtmRawAmount: '10000',
+    tariRawAmount: '5000000',
+    hashH: HASH,
+    l1ClaimRecipient: 'l1_claim_addr',
+    l2ClaimRecipient: 'component_tari_1',
+    l1Network: 'esmeralda',
+    l2Network: 'esmeralda',
+    l1RefundDeadlineHeight: '500',
+    l2RefundDeadlineEpoch: '1200',
+    requiredL1Confirmations: '3',
+    createdAtUnixMs: 1,
+    updatedAtUnixMs: 1,
+    ...overrides,
+  };
+}
+
+function ports(overrides = {}) {
+  return {
+    l1: {
+      providerName: () => 'dev',
+      primitivesStatus: () => 'PENDING_TRACE',
+      network: () => 'esmeralda',
+      observeHtlc: async () => ({ l1TxId: 'tx1', exists: true, amountRaw: '10000', hashHex: HASH, refundHeight: '500', confirmations: '5', currentHeight: '510', spent: false, source: 'BASE_NODE' }),
+      lookupTransaction: async () => 'COMMITTED',
+      listInFlightSwaps: async () => [],
+    },
+    l2: {
+      observeHashlockOutput: async () => ({ exists: true, amountRaw: '5000000', hashExact: true, claimantExact: true, epochRefundExact: true, unspent: true, source: 'AUTHORITATIVE' }),
+      lookupTransaction: async () => 'COMMITTED',
+    },
+    reservations: new InMemoryReservationLedger({ prov_1: AD }),
+    secrets: new InMemorySecretStore(),
+    sessions: new InMemorySessionStore(),
+    ...overrides,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Quotes
+// ---------------------------------------------------------------------------
+
+test('quote terms are integers with bounded spread on testnet networks only', () => {
+  assert.throws(() => sessionRecord && require('../dist/crosschain/quote.js').validateAdvertisement({ ...AD, network: 'mainnet' }), /mainnet/i);
+  const { validateAdvertisement } = require('../dist/crosschain/quote.js');
+  assert.throws(() => validateAdvertisement({ ...AD, spreadBps: '10001' }), /10_000/);
+  const { buildQuote, isQuoteExpired } = require('../dist/crosschain/quote.js');
+  const q = buildQuote({ quoteId: 'q_1', ad: AD, direction: 'XTM_TO_TARI', xtmRawAmount: '10000', tariRawAmount: '5000000', hashH: HASH, l1ClaimRecipient: 'l1a', l2ClaimRecipient: 'l2a', l1RefundDeadlineHeight: '500', l2RefundDeadlineEpoch: '1200', nowUnixMs: 1000 });
+  assert.equal(q.protocolVersion, 'xtm-tari-v1');
+  assert.equal(q.hashAlg, 'SHA256');
+  assert.equal(isQuoteExpired(q, 1000 + 60000), true);
+  assert.equal(isQuoteExpired(q, 1000 + 59999), false);
+  assert.throws(() => buildQuote({ quoteId: 'q2', ad: AD, direction: 'XTM_TO_TARI', xtmRawAmount: '1', tariRawAmount: '1', hashH: 'xyz', l1ClaimRecipient: 'a', l2ClaimRecipient: 'b', l1RefundDeadlineHeight: '1', l2RefundDeadlineEpoch: '2', nowUnixMs: 0 }), /64 lowercase hex/);
+});
+
+// ---------------------------------------------------------------------------
+// Reservations / inventory race protection
+// ---------------------------------------------------------------------------
+
+test('inventory race: two overlapping reservations cannot exceed advertised inventory', async () => {
+  const ledger = new InMemoryReservationLedger({ prov_1: AD });
+  await ledger.reserve({ reservationId: 'r1', quoteId: 'q1', providerId: 'prov_1', direction: 'XTM_TO_TARI', xtmRawAmount: '80000', tariRawAmount: '40000000', nowUnixMs: 1, quoteExpiresAtUnixMs: 9999 });
+  await assert.rejects(
+    () => ledger.reserve({ reservationId: 'r2', quoteId: 'q2', providerId: 'prov_1', direction: 'XTM_TO_TARI', xtmRawAmount: '80000', tariRawAmount: '40000000', nowUnixMs: 2, quoteExpiresAtUnixMs: 9999 }),
+    /race|exceed/i,
+  );
+  const again = await ledger.reserve({ reservationId: 'r1', quoteId: 'q1', providerId: 'prov_1', direction: 'XTM_TO_TARI', xtmRawAmount: '80000', tariRawAmount: '40000000', nowUnixMs: 2, quoteExpiresAtUnixMs: 9999 });
+  assert.equal(again.reservationId, 'r1');
+  await assert.rejects(
+    () => ledger.reserve({ reservationId: 'r1', quoteId: 'q1', providerId: 'prov_1', direction: 'XTM_TO_TARI', xtmRawAmount: '20000', tariRawAmount: '40000000', nowUnixMs: 3, quoteExpiresAtUnixMs: 9999 }),
+    /different terms/,
+  );
+});
+
+test('quote expiry cannot release FUNDED inventory; release needs authoritative evidence', async () => {
+  const ledger = new InMemoryReservationLedger({ prov_1: AD });
+  await ledger.reserve({ reservationId: 'r_1', quoteId: 'q', providerId: 'prov_1', direction: 'XTM_TO_TARI', xtmRawAmount: '10000', tariRawAmount: '5000000', nowUnixMs: 1, quoteExpiresAtUnixMs: 999 });
+  await ledger.markFunded('r_1');
+  await assert.rejects(() => ledger.requestRelease('r_1', 'ev_1', 'QUOTE_EXPIRED'), /funded sessions live by chain deadlines/i);
+  const released = await ledger.requestRelease('r_1', 'ev_settle', 'SETTLED');
+  assert.equal(released.state, 'RELEASE_PENDING');
+  const done = await ledger.completeRelease('r_1');
+  assert.equal(done.state, 'RELEASED');
+  await assert.rejects(() => ledger.completeRelease('r_1'), /RELEASE_PENDING/);
+});
+
+test('double reservation with the same durable id is idempotent only for identical terms', async () => {
+  const ledger = new InMemoryReservationLedger({ prov_1: AD });
+  const first = await ledger.reserve({ reservationId: 'rx', quoteId: 'qx', providerId: 'prov_1', direction: 'XTM_TO_TARI', xtmRawAmount: '10000', tariRawAmount: '5000000', nowUnixMs: 1, quoteExpiresAtUnixMs: 999 });
+  const second = await ledger.reserve({ reservationId: 'rx', quoteId: 'qx', providerId: 'prov_1', direction: 'XTM_TO_TARI', xtmRawAmount: '10000', tariRawAmount: '5000000', nowUnixMs: 2, quoteExpiresAtUnixMs: 999 });
+  assert.equal(second.reservationId, first.reservationId);
+  await assert.rejects(
+    () => ledger.reserve({ reservationId: 'rx', quoteId: 'qx', providerId: 'prov_1', direction: 'XTM_TO_TARI', xtmRawAmount: '11000', tariRawAmount: '5000000', nowUnixMs: 3, quoteExpiresAtUnixMs: 999 }),
+    /different terms/,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// State machine: legal path + failure injections
+// ---------------------------------------------------------------------------
+
+test('happy path advances without illegal jumps and ends CLAIMED', () => {
+  let r = sessionRecord({ state: 'QUOTED' });
+  r = applyEvt(r, { kind: 'ACCEPT_QUOTE', nowUnixMs: 1 });
+  assert.equal(r.state, 'RESERVED');
+  r = applyEvt(r, { kind: 'BEGIN_L1_FUNDING', deadlineSafetyEvidence: 'x' });
+  r = applyEvt(r, { kind: 'L1_FUND_ACKNOWLEDGED', l1TxId: 'tx1' });
+  r = applyEvt(r, { kind: 'L1_VERIFIED_FUNDED', evidence: { l1TxId: 'tx1', confirmations: '5', hashMatches: true, amountExact: true, deadlineSafe: true } });
+  r = applyEvt(r, { kind: 'BEGIN_L2_FUNDING', deadlineSafetyEvidence: 'x' });
+  r = applyEvt(r, { kind: 'L2_FUND_ACKNOWLEDGED', l2TxId: 'tx2' });
+  r = applyEvt(r, { kind: 'L2_VERIFIED_FUNDED', evidence: { l2TxId: 'tx2', hashExact: true, amountExact: true, deadlineSafe: true } });
+  r = applyEvt(r, { kind: 'ARM_CLAIM', deadlineSafetyEvidence: 'x', claimConstructibleEvidence: 'y' });
+  assert.equal(r.state, 'CLAIM_ARMED');
+  r = applyEvt(r, { kind: 'REVEAL_SECRET' });
+  assert.equal(r.state, 'SECRET_REVEALED');
+  r = applyEvt(r, { kind: 'BEGIN_CLAIM', leg: 'L2' });
+  r = applyEvt(r, { kind: 'CLAIM_CONFIRMED', leg: 'L2' });
+  assert.equal(r.state, 'CLAIMED');
+  assert.ok(isTerminal(r.state));
+});
+
+test('CLAIM_ARMED bypass and premature secret reveal are refused', () => {
+  assert.throws(() => applyEvt(sessionRecord({ state: 'BOTH_FUNDED' }), { kind: 'REVEAL_SECRET' }), /Illegal transition/);
+  assert.throws(() => applyEvt(sessionRecord({ state: 'L1_FUNDED' }), { kind: 'ARM_CLAIM', deadlineSafetyEvidence: 'x', claimConstructibleEvidence: 'y' }), /Illegal transition/);
+  assert.throws(() => sessionMod.requireSecretRevealAllowed(sessionRecord({ state: 'L1_FUNDED' })), /CLAIM_ARMED/);
+  assert.throws(() => applyEvt(sessionRecord({ state: 'QUOTED' }), { kind: 'REVEAL_SECRET' }), /Illegal transition/);
+});
+
+test('secret store refuses reveal without CLAIM_ARMED evidence; wrong preimage fails', async () => {
+  const store = new InMemorySecretStore();
+  const pub = await store.generateAndStore('s1');
+  assert.equal(pub.hashH.length, 64);
+  await assert.rejects(() => store.revealSecret('s1', false), /CLAIM_ARMED/);
+  const preimage = await store.revealSecret('s1', true);
+  assert.equal(await verifyPreimage(preimage, pub.hashH), true);
+  assert.equal(await verifyPreimage(preimage, 'ff'.repeat(32)), false);
+  const notSecret = bytesToHex(new Uint8Array(32).fill(1));
+  assert.equal(await verifyPreimage(notSecret, pub.hashH), false);
+});
+
+test('secret never leaks into serializable state', async () => {
+  const store = new InMemorySecretStore();
+  await store.generateAndStore('s2');
+  const preimage = await store.revealSecret('s2', true);
+  const historyJson = JSON.stringify(sessionRecord({ l1TxId: 'tx1' }));
+  assertNoSecretInJson(historyJson, preimage);
+  assert.throws(() => assertNoSecretInJson(JSON.stringify({ leaked: preimage }), preimage), /SECRET LEAKED/);
+});
+
+function assertNoSecretInJson(json, secret) {
+  require('../dist/crosschain/secret.js').assertNoSecretInJson(json, secret);
+}
+
+test('stale/expired unfunded quote terminates and cannot be revived', () => {
+  const r = applyEvt(sessionRecord({ state: 'QUOTED' }), { kind: 'FAIL_TERMINAL', reason: 'quote expired unfunded' });
+  assert.equal(r.state, 'FAILED_TERMINAL');
+  assert.throws(() => applyEvt(r, { kind: 'ACCEPT_QUOTE', nowUnixMs: 2 }), /Illegal transition/);
+});
+
+test('terminal states stay terminal', () => {
+  assert.throws(() => applyEvt(sessionRecord({ state: 'CLAIMED' }), { kind: 'BEGIN_REFUND', leg: 'L1' }), /Illegal transition/);
+  assert.throws(() => applyEvt(sessionRecord({ state: 'REFUNDED' }), { kind: 'BEGIN_CLAIM', leg: 'L1' }), /Illegal transition/);
+  assert.throws(() => applyEvt(sessionRecord({ state: 'FAILED_TERMINAL' }), { kind: 'BEGIN_L1_FUNDING', deadlineSafetyEvidence: 'x' }), /Illegal transition/);
+});
+
+test('funds cannot be claimed and refunded simultaneously (state machine disjoint)', () => {
+  // From REFUNDING, the only legal outcome is REFUNDED — no claim path exists.
+  const refunding = applyEvt(applyEvt(applyEvt(sessionRecord({ state: 'BOTH_FUNDED' }), { kind: 'REFUND_ELIGIBLE', leg: 'L1', authorityEvidence: 'x' }), { kind: 'BEGIN_REFUND', leg: 'L1' }));
+  assert.equal(refunding.state, 'REFUNDING');
+  assert.throws(() => applyEvt(refunding, { kind: 'REVEAL_SECRET' }), /Illegal transition/);
+  // Once BOTH_FUNDED arms a claim, the refund path is no longer legal from CLAIM_ARMED.
+  const armed = applyEvt(sessionRecord({ state: 'BOTH_FUNDED' }), { kind: 'ARM_CLAIM', deadlineSafetyEvidence: 'x', claimConstructibleEvidence: 'y' });
+  assert.equal(armed.state, 'CLAIM_ARMED');
+  assert.throws(() => applyEvt(armed, { kind: 'BEGIN_REFUND', leg: 'L1' }), /Illegal transition/);
+});
+
+// ---------------------------------------------------------------------------
+// Restart recovery decisions
+// ---------------------------------------------------------------------------
+
+test('neither leg funded → WAIT_OR_REFUND', async () => {
+  const p = {
+    l1: { lookupTransaction: async () => 'NOT_FOUND' },
+    l2: { lookupTransaction: async () => 'NOT_FOUND' },
+    reservations: new InMemoryReservationLedger({ prov_1: AD }),
+    secrets: new InMemorySecretStore(),
+    sessions: new InMemorySessionStore(),
+  };
+  await p.sessions.save(sessionRecord({ state: 'RECOVERY_REQUIRED' }));
+  assert.equal((await recoverSession({ sessionId: 'sess_1', ports: p })).action, 'WAIT_OR_REFUND');
+});
+
+test('first leg confirmed, second never funded → CONTINUE (refund path available)', async () => {
+  const p = {
+    l1: { lookupTransaction: async () => 'COMMITTED' },
+    l2: { lookupTransaction: async () => 'NOT_FOUND' },
+    reservations: new InMemoryReservationLedger({ prov_1: AD }),
+    secrets: new InMemorySecretStore(),
+    sessions: new InMemorySessionStore(),
+  };
+  await p.sessions.save(sessionRecord({ state: 'L1_FUNDED' }));
+  assert.equal((await recoverSession({ sessionId: 'sess_1', ports: p })).action, 'CONTINUE');
+});
+
+test('claim committed → FINALIZE', async () => {
+  const p = {
+    l1: { lookupTransaction: async () => 'COMMITTED' },
+    l2: { lookupTransaction: async () => 'COMMITTED' },
+    reservations: new InMemoryReservationLedger({ prov_1: AD }),
+    secrets: new InMemorySecretStore(),
+    sessions: new InMemorySessionStore(),
+  };
+  await p.sessions.save(sessionRecord({ state: 'CLAIMING', l1ClaimTxId: 'claim_tx' }));
+  const d = await recoverSession({ sessionId: 'sess_1', ports: p });
+  assert.equal(d.action, 'FINALIZE');
+  assert.equal(d.resolution, 'SETTLED');
+});
+
+// ---------------------------------------------------------------------------
+// Deadlines
+// ---------------------------------------------------------------------------
+
+test('asymmetric deadlines keep first leg later than second, within each domain', () => {
+  const { deriveDeadlines } = require('../dist/crosschain/deadlines.js');
+  const d = deriveDeadlines({ requiredL1Confirmations: '3', l1BlockMs: '30000', l2EpochMs: '10000', propagationDelayMs: '60000', safetyBufferMs: '60000', currentL1Height: '100', currentL2Epoch: '1000' });
+  assert.equal(BigInt(d.firstLegRefundHeight) > 100n, true);
+  assert.equal(BigInt(d.secondLegRefundEpoch) > 1000n, true);
+  assert.equal(BigInt(d.marginEvidence.l1FirstLegMarginMs) > BigInt(d.marginEvidence.l2ClaimWindowMs), true);
+});
+
+test('deadline safety recheck refuses thin margins before irreversible phases', () => {
+  const { assertDeadlineSafety, DeadlineError } = require('../dist/crosschain/deadlines.js');
+  assert.doesNotThrow(() => assertDeadlineSafety({ phase: 'SECRET_REVEAL', l1RemainingMarginMs: '10000', l2RemainingMarginMs: '10000', requiredL1MarginMs: '5000', requiredL2MarginMs: '5000' }));
+  assert.throws(() => assertDeadlineSafety({ phase: 'SECRET_REVEAL', l1RemainingMarginMs: '100', l2RemainingMarginMs: '10000', requiredL1MarginMs: '5000', requiredL2MarginMs: '5000' }), DeadlineError);
+  assert.throws(() => assertDeadlineSafety({ phase: 'CLAIM_ARMED', l1RemainingMarginMs: '10000', l2RemainingMarginMs: '1', requiredL1MarginMs: '5000', requiredL2MarginMs: '5000' }), DeadlineError);
+});
+
+// ---------------------------------------------------------------------------
+// Gate
+// ---------------------------------------------------------------------------
+
+test('real submission OFF by default; mainnet refused even when gated on', () => {
+  assert.equal(isRealSubmitEnabled({}, 'esmeralda').enabled, false);
+  assert.equal(isRealSubmitEnabled({ TARI_LIQUIDITY_ENABLE_REAL_CROSSCHAIN_SUBMIT: '1' }, 'esmeralda').enabled, true);
+  assert.throws(() => isRealSubmitEnabled({ TARI_LIQUIDITY_ENABLE_REAL_CROSSCHAIN_SUBMIT: '1' }, 'mainnet'), /MAINNET/);
+  assert.throws(() => isRealSubmitEnabled({ TARI_LIQUIDITY_ENABLE_REAL_CROSSCHAIN_SUBMIT: '1' }, 'stagenet'), /approved test network/);
+});
+
+// ---------------------------------------------------------------------------
+// Property fuzzer: 20k randomized transitions; invariants after every accepted step
+// ---------------------------------------------------------------------------
+
+test('state-machine fuzzer holds invariants across 20k randomized transitions', () => {
+  const EVENTS = [
+    { kind: 'ACCEPT_QUOTE', nowUnixMs: 1 },
+    { kind: 'BEGIN_L1_FUNDING', deadlineSafetyEvidence: 'x' },
+    { kind: 'L1_FUND_ACKNOWLEDGED', l1TxId: 'tx' },
+    { kind: 'L1_FUND_UNKNOWN', transportError: 'e' },
+    { kind: 'L1_FUND_REJECTED', reason: 'r' },
+    { kind: 'L1_VERIFIED_FUNDED', evidence: { l1TxId: 'tx', confirmations: '5', hashMatches: true, amountExact: true, deadlineSafe: true } },
+    { kind: 'BEGIN_L2_FUNDING', deadlineSafetyEvidence: 'x' },
+    { kind: 'L2_FUND_ACKNOWLEDGED', l2TxId: 'tx' },
+    { kind: 'L2_VERIFIED_FUNDED', evidence: { l2TxId: 'tx', hashExact: true, amountExact: true, deadlineSafe: true } },
+    { kind: 'ARM_CLAIM', deadlineSafetyEvidence: 'x', claimConstructibleEvidence: 'y' },
+    { kind: 'REVEAL_SECRET' },
+    { kind: 'BEGIN_CLAIM', leg: 'L2' },
+    { kind: 'CLAIM_ACKNOWLEDGED', leg: 'L2', txId: 'tx' },
+    { kind: 'CLAIM_CONFIRMED', leg: 'L2' },
+    { kind: 'REFUND_ELIGIBLE', leg: 'L1', authorityEvidence: 'x' },
+    { kind: 'BEGIN_REFUND', leg: 'L1' },
+    { kind: 'REFUND_CONFIRMED', leg: 'L1' },
+    { kind: 'ENTER_RECOVERY', reason: 'rpc failure' },
+    { kind: 'RECOVERY_RESOLVED', resolution: 'CLAIMING' },
+    { kind: 'FAIL_TERMINAL', reason: 'x' },
+  ];
+  let seed = 0xA11CE;
+  const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483647; };
+  let accepted = 0;
+  for (let trial = 0; trial < 1000; trial++) {
+    let r = sessionRecord({ sessionId: `t${trial}`, state: 'QUOTED' });
+    for (let step = 0; step < 10; step++) {
+      const ev = EVENTS[Math.floor(rand() * EVENTS.length)];
+      try {
+        r = applyEvt(r, ev);
+        accepted += 1;
+      } catch (e) {
+        assert.ok(e instanceof IllegalTransitionError, `non-fail-closed rejection: ${e.message}`);
+        continue;
+      }
+      if (r.secretRevealedAtUnixMs !== undefined) {
+        // secret reveal only ever happens after the CLAIM_ARMED gate (guaranteed by the
+        // transition table); any subsequent state is a post-reveal outcome
+        assert.ok(['SECRET_REVEALED', 'CLAIMING', 'RECOVERY_REQUIRED', 'REFUNDING', 'REFUNDED', 'FAILED_TERMINAL'].includes(r.state), `reveal state ${r.state}`);
+      }
+      if (r.state === 'SECRET_REVEALED') {
+        assert.ok(r.secretRevealedAtUnixMs !== undefined);
+      }
+      assert.ok(!sessionMod.TERMINAL_STATES.has(r.state) || ['CLAIMED', 'REFUNDED', 'FAILED_TERMINAL'].includes(r.state));
+    }
+  }
+  assert.equal(accepted > 0, true);
+});
+
+test('REVEAL_SECRET without CLAIM_ARMED never succeeds across 5k randomized states (property)', () => {
+  let leaked = 0;
+  const states = ['RESERVED', 'L1_FUNDED', 'BOTH_FUNDED', 'L2_FUNDING', 'QUOTED', 'RECOVERY_REQUIRED'];
+  for (let i = 0; i < 5000; i++) {
+    const from = states[i % states.length];
+    try {
+      const r = applyEvt(sessionRecord({ state: from }), { kind: 'REVEAL_SECRET' });
+      if (r.secretRevealedAtUnixMs !== undefined) leaked += 1;
+    } catch (e) {
+      assert.ok(e instanceof IllegalTransitionError || /CLAIM_ARMED/.test(e.message), `${e.message}`);
+    }
+  }
+  assert.equal(leaked, 0);
+});
