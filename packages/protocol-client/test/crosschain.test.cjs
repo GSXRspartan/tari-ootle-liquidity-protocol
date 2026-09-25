@@ -247,7 +247,7 @@ test('first leg confirmed, second never funded → CONTINUE (refund path availab
     secrets: new InMemorySecretStore(),
     sessions: new InMemorySessionStore(),
   };
-  await p.sessions.save(sessionRecord({ state: 'L1_FUNDED' }));
+  await p.sessions.save(sessionRecord({ state: 'L1_FUNDED', l1TxId: 'tx_l1' }));
   assert.equal((await recoverSession({ sessionId: 'sess_1', ports: p })).action, 'CONTINUE');
 });
 
