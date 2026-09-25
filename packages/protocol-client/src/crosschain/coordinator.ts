@@ -27,8 +27,6 @@ import { assertDeadlineSafety } from './deadlines.js';
 import { assertTestnetNetwork, requireOperationId } from './types.js';
 import { MinotariWalletProvider, OotleScriptPathLegPort } from './provider.js';
 
-import { MinotariWalletProvider, OotleScriptPathLegPort } from './provider.js';
-
 /**
  * Real cross-chain submission gate. Default OFF; MAINNET never passes (assertTestnetNetwork).
  * Single source of truth — import this constant, never re-type the string.
