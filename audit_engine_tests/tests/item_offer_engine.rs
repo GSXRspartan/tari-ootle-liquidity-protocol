@@ -360,20 +360,17 @@ fn i02_only_buyer_can_cancel_and_expired_escrow_refunds_once() {
 }
 
 #[test]
-fn i03_offer_rejects_wrong_nft_id_collection_and_non_fungible_quote() {
+fn i03_wrong_nft_id_rejected() {
     let mut t = new_test();
     let (quote_faucet, quote) = create_fungible_faucet(&mut t, "wSTABLE");
     let requested_id = NonFungibleId::from_u64(1);
     let other_id = NonFungibleId::from_u64(2);
     let (many_faucet, collection) =
         create_many_nft_faucet(&mut t, vec![requested_id.clone(), other_id.clone()], "COLX");
-    let (same_metadata_faucet, same_metadata_collection) =
-        create_nft_faucet(&mut t, requested_id.clone(), "COLX");
     let (buyer, buyer_proof, buyer_secret) = t.create_funded_account();
     let (seller, seller_proof, seller_secret) = t.create_funded_account();
     fund(&mut t, quote_faucet, buyer);
     fund_nft_by_id(&mut t, many_faucet, seller, other_id.clone());
-    fund_nft(&mut t, same_metadata_faucet, seller);
 
     let offer = create_item_offer(
         &mut t,
@@ -392,46 +389,14 @@ fn i03_offer_rejects_wrong_nft_id_collection_and_non_fungible_quote() {
         .put_last_instruction_output_on_workspace("nft")
         .call_method(offer, "accept", args![Workspace("nft"), seller])
         .build_and_seal(&seller_secret);
-    t.execute_expect_failure(wrong_id, vec![seller_proof.clone()]);
+    let reason = t.execute_expect_failure(wrong_id, vec![seller_proof.clone()]);
+    assert!(format!("{reason:?}").contains("Incorrect NFT id"));
+    assert_eq!(
+        account_balance(&mut t, seller, collection),
+        Amount::from(1u64)
+    );
 
-    let wrong_collection = t
-        .transaction()
-        .call_method(
-            seller,
-            "withdraw_non_fungible",
-            args![same_metadata_collection, requested_id.clone()],
-        )
-        .put_last_instruction_output_on_workspace("nft")
-        .call_method(offer, "accept", args![Workspace("nft"), seller])
-        .build_and_seal(&seller_secret);
-    t.execute_expect_failure(wrong_collection, vec![seller_proof.clone()]);
-
-    // An NFT bucket cannot fund an offer; the quote boundary is fungible-only.
-    fund_nft_by_id(&mut t, many_faucet, seller, requested_id.clone());
-    let item_offer_template = t.get_template_address("ItemOffer");
-    let non_fungible_quote = t
-        .transaction()
-        .call_method(
-            seller,
-            "withdraw_non_fungible",
-            args![collection, requested_id.clone()],
-        )
-        .put_last_instruction_output_on_workspace("not_quote")
-        .call_function(
-            item_offer_template,
-            "create",
-            args![
-                buyer,
-                Workspace("not_quote"),
-                collection,
-                requested_id.clone(),
-                0u64
-            ],
-        )
-        .build_and_seal(&seller_secret);
-    t.execute_expect_failure(non_fungible_quote, vec![seller_proof.clone()]);
-
-    // Failed attempts leave the original offer active and its escrow intact for the exact NFT.
+    // The rejected wrong-id attempt leaves this exact offer active and its escrow intact.
     fund_nft_by_id(&mut t, many_faucet, seller, requested_id.clone());
     t.execute_expect_success(
         t.transaction()
@@ -447,6 +412,87 @@ fn i03_offer_rejects_wrong_nft_id_collection_and_non_fungible_quote() {
     );
     assert_eq!(
         account_balance(&mut t, buyer, collection),
+        Amount::from(1u64)
+    );
+}
+
+#[test]
+fn i04_wrong_collection_rejected() {
+    let mut t = new_test();
+    let (quote_faucet, quote) = create_fungible_faucet(&mut t, "wSTABLE");
+    let requested_id = NonFungibleId::from_u64(1);
+    let (_nft_faucet, collection) = create_nft_faucet(&mut t, requested_id.clone(), "COLX");
+    let (same_metadata_faucet, same_metadata_collection) =
+        create_nft_faucet(&mut t, requested_id.clone(), "COLX");
+    let (buyer, buyer_proof, buyer_secret) = t.create_funded_account();
+    let (seller, seller_proof, seller_secret) = t.create_funded_account();
+    fund(&mut t, quote_faucet, buyer);
+    fund_nft(&mut t, same_metadata_faucet, seller);
+
+    let offer = create_item_offer(
+        &mut t,
+        buyer,
+        buyer_proof,
+        &buyer_secret,
+        quote,
+        collection,
+        requested_id.clone(),
+        Amount::from(OFFER),
+        0,
+    );
+
+    let wrong_collection = t
+        .transaction()
+        .call_method(
+            seller,
+            "withdraw_non_fungible",
+            args![same_metadata_collection, requested_id.clone()],
+        )
+        .put_last_instruction_output_on_workspace("nft")
+        .call_method(offer, "accept", args![Workspace("nft"), seller])
+        .build_and_seal(&seller_secret);
+    let reason = t.execute_expect_failure(wrong_collection, vec![seller_proof]);
+    assert!(format!("{reason:?}").contains("Incorrect NFT collection"));
+    assert_eq!(
+        account_balance(&mut t, seller, same_metadata_collection),
+        Amount::from(1u64)
+    );
+}
+
+#[test]
+fn i05_non_fungible_quote_rejected() {
+    let mut t = new_test();
+    let requested_id = NonFungibleId::from_u64(1);
+    let (nft_faucet, collection) = create_nft_faucet(&mut t, requested_id.clone(), "COLX");
+    let (seller, seller_proof, seller_secret) = t.create_funded_account();
+    fund_nft(&mut t, nft_faucet, seller);
+
+    // An NFT bucket cannot fund an offer; the quote boundary is fungible-only.
+    let item_offer_template = t.get_template_address("ItemOffer");
+    let non_fungible_quote = t
+        .transaction()
+        .call_method(
+            seller,
+            "withdraw_non_fungible",
+            args![collection, requested_id.clone()],
+        )
+        .put_last_instruction_output_on_workspace("not_quote")
+        .call_function(
+            item_offer_template,
+            "create",
+            args![
+                seller,
+                Workspace("not_quote"),
+                collection,
+                requested_id.clone(),
+                0u64
+            ],
+        )
+        .build_and_seal(&seller_secret);
+    let reason = t.execute_expect_failure(non_fungible_quote, vec![seller_proof]);
+    assert!(format!("{reason:?}").contains("Quote resource must be canonical Tari"));
+    assert_eq!(
+        account_balance(&mut t, seller, collection),
         Amount::from(1u64)
     );
 }
