@@ -9,7 +9,7 @@
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "lint": "echo 'No lint'",
-    "test": "npm run build && node --test test/marketplace.test.cjs test/amm.test.cjs test/history.test.cjs"
+    "test": "npm run build && node --test test/marketplace.test.cjs test/amm.test.cjs test/history.test.cjs test/crosschain.test.cjs"
   },
   "dependencies": {},
   "devDependencies": {
@@ -17,4 +17,5 @@
   },
   "license": "MIT"
 }
+
 
