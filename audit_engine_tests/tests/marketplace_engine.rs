@@ -2,6 +2,7 @@
 // These tests exercise the actual marketplace WASM; no frontend or metadata assertion is used
 // as settlement evidence.
 
+use tari_crypto::ristretto::RistrettoSecretKey;
 use tari_engine_types::virtual_substate::{VirtualSubstate, VirtualSubstateId};
 use tari_ootle_common_types::substate_type::SubstateType;
 use tari_ootle_transaction::args;
@@ -100,45 +101,52 @@ fn fund_nft(t: &mut TemplateTest, faucet: ComponentAddress, recipient: Component
     .expect_success();
 }
 
-macro_rules! create_listing {
-    ($t:expr, $seller:expr, $seller_proof:expr, $seller_secret:expr, $nft_resource:expr, $nft_id:expr, $quote:expr, $price:expr, $expiry:expr $(,)?) => {{
-        let template = $t.get_template_address("FixedPriceListing");
-        let result = $t.execute_expect_success(
-            $t.transaction()
-                .call_method(
-                    $seller,
-                    "withdraw_non_fungible",
-                    args![$nft_resource, $nft_id],
-                )
-                .put_last_instruction_output_on_workspace("nft")
-                .call_function(
-                    template,
-                    "create",
-                    args![$seller, Workspace("nft"), $quote, $price, $expiry],
-                )
-                .build_and_seal($seller_secret),
-            vec![$seller_proof],
-        );
-        let listing: ComponentAddress = {
-            let receipt = result.expect_success();
-            receipt
-                .up_iter()
-                .find_map(|(address, substate)| {
-                    (address.is_component()
-                        && *substate
-                            .substate_value()
-                            .component()
-                            .unwrap()
-                            .template_address()
-                            == template)
-                        .then(|| address.as_component_address())
-                        .flatten()
-                })
-                .expect("listing component not found")
-        };
-        drop(result);
-        listing
-    }};
+fn create_listing(
+    t: &mut TemplateTest,
+    seller: ComponentAddress,
+    seller_proof: NonFungibleAddress,
+    seller_secret: &RistrettoSecretKey,
+    nft_resource: ResourceAddress,
+    nft_id: NonFungibleId,
+    quote: ResourceAddress,
+    price: Amount,
+    expiry: u64,
+) -> ComponentAddress {
+    let template = t.get_template_address("FixedPriceListing");
+    let result = t.execute_expect_success(
+        t.transaction()
+            .call_method(seller, "withdraw_non_fungible", args![nft_resource, nft_id])
+            .put_last_instruction_output_on_workspace("nft")
+            .call_function(
+                template,
+                "create",
+                args![seller, Workspace("nft"), quote, price, expiry],
+            )
+            .build_and_seal(seller_secret),
+        vec![seller_proof],
+    );
+    let listing: ComponentAddress = {
+        let receipt = result.expect_success();
+        receipt
+            .up_iter()
+            .find_map(|(address, substate)| {
+                if address.is_component()
+                    && *substate
+                        .substate_value()
+                        .component()
+                        .unwrap()
+                        .template_address()
+                        == template
+                {
+                    address.as_component_address()
+                } else {
+                    None
+                }
+            })
+            .expect("listing component not found")
+    };
+    drop(result);
+    listing
 }
 
 fn account_balance(
@@ -163,7 +171,7 @@ fn m01_listing_purchase_escrows_and_settles_exact_nft() {
     fund_nft(&mut t, nft_faucet, seller);
     fund(&mut t, quote_faucet, buyer);
 
-    let listing = create_listing!(
+    let listing = create_listing(
         &mut t,
         seller,
         seller_proof.clone(),
@@ -238,7 +246,7 @@ fn m02_only_seller_can_cancel_and_cancellation_returns_escrowed_nft() {
     let (attacker, attacker_proof, attacker_secret) = t.create_funded_account();
     fund_nft(&mut t, nft_faucet, seller);
     fund(&mut t, quote_faucet, attacker);
-    let listing = create_listing!(
+    let listing = create_listing(
         &mut t,
         seller,
         seller_proof.clone(),
@@ -291,7 +299,7 @@ fn m03_listing_rejects_wrong_quote_insufficient_payment_non_nft_and_nft_quote() 
     fund(&mut t, quote_faucet, buyer);
     fund(&mut t, quote_faucet, seller);
     fund(&mut t, wrong_quote_faucet, buyer);
-    let listing = create_listing!(
+    let listing = create_listing(
         &mut t,
         seller,
         seller_proof.clone(),
@@ -370,7 +378,7 @@ fn m04_expired_listing_cannot_be_bought_at_the_consensus_epoch_boundary() {
     let (buyer, buyer_proof, buyer_secret) = t.create_funded_account();
     fund_nft(&mut t, nft_faucet, seller);
     fund(&mut t, quote_faucet, buyer);
-    let listing = create_listing!(
+    let listing = create_listing(
         &mut t,
         seller,
         seller_proof,

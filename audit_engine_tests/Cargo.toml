@@ -20,3 +20,4 @@ tari_template_abi = { git = "https://github.com/tari-project/tari-ootle.git", re
 tari_ootle_transaction = { git = "https://github.com/tari-project/tari-ootle.git", rev = "4732f65ec17a96547050989d78fd70a4e3d94113" }
 tari_ootle_common_types = { git = "https://github.com/tari-project/tari-ootle.git", rev = "4732f65ec17a96547050989d78fd70a4e3d94113" }
 tari_engine_types = { git = "https://github.com/tari-project/tari-ootle.git", rev = "4732f65ec17a96547050989d78fd70a4e3d94113" }
+tari_crypto = "0.23"
