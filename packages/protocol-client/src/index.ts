@@ -17,6 +17,12 @@ export * from './multihop/route';
 export * from './multihop/hops';
 export * from './multihop/compose';
 export * from './multihop/frontend';
+export * from './marketdata/price';
+export * from './marketdata/types';
+export * from './marketdata/candle';
+export * from './marketdata/store';
+export * from './marketdata/indexer';
+export * from './marketdata/api';
 
 export interface IndexerResponse<T> {
   data: T;
