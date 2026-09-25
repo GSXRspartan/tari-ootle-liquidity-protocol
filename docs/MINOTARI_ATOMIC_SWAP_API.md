@@ -44,6 +44,15 @@ No new swap template is introduced.
 
 ## PENDING TRACE (blocks L1 adapter wiring, not the protocol architecture)
 
+**Additive reference (2026-09-25):** `chironbuilds/tari-l1-wallet-ui` (tree
+`e76cc7289fde6e1d3b69c3dbe6ede571188138d1`, CPAL-1.0, REFERENCE_ONLY_PENDING_LICENSE_REVIEW)
+was inspected as the browser-path candidate. Its `window.tari` dApp API (Sapient-shaped)
+already exposes the L2 hashlock leg (`htlcFund`/`htlcClaim`/`htlcRefund`,
+`tari_getSubstate`, `tari_getCapabilities`), and its L1 stack (`vendor/tari-l1-wasm`, BSD-3)
+builds/signs/submits tXTM transactions in-page — but contains NO L1 SHA atomic-swap
+construction. Full analysis + proposed provider extension:
+`docs/TARI_BROWSER_ATOMIC_SWAP_PROVIDER_GAP.md`.
+
 To be traced against `tari-project/tari` when network/source is available:
 
 - [ ] `init-sha-atomic-swap` — exact method path, parameters (amount, hash form, refund height
