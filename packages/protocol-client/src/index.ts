@@ -10,6 +10,7 @@ export * from './amm';
 export * from './history';
 export * from './execution_flow';
 export * from './chains/minotari';
+export * from './chains/minotari_grpc';
 
 export interface IndexerResponse<T> {
   data: T;

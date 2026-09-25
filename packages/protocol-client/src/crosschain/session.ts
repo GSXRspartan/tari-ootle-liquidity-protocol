@@ -30,10 +30,16 @@ export type CrossChainEvent =
   | { kind: 'ACCEPT_QUOTE'; nowUnixMs: number }
   | { kind: 'QUOTE_EXPIRED_UNFUNDED'; nowUnixMs: number }
   | { kind: 'BEGIN_L1_FUNDING'; deadlineSafetyEvidence: string }
-  | { kind: 'L1_FUND_ACKNOWLEDGED'; l1TxId: string }
+  /**
+   * L1 funding acknowledged. When the REAL Minotari wallet primitive is used the
+   * wallet-generated preimage and funded output hash arrive HERE (the wallet generates
+   * S itself — tari v6.0.0 service.rs:2203-2204). hashHex binds H at this point; it must
+   * equal SHA256(walletPreimageHex) and any previously bound hashH (else illegal).
+   */
+  | { kind: 'L1_FUND_ACKNOWLEDGED'; l1TxId: string; walletPreimageHex?: string; hashHex?: string }
   | { kind: 'L1_FUND_UNKNOWN'; transportError: string }
   | { kind: 'L1_FUND_REJECTED'; reason: string }
-  | { kind: 'L1_VERIFIED_FUNDED'; evidence: { l1TxId: string; confirmations: string; hashMatches: boolean; amountExact: boolean; deadlineSafe: boolean } }
+  | { kind: 'L1_VERIFIED_FUNDED'; evidence: { l1TxId: string; confirmations: string; hashMatches: boolean; amountExact: boolean; amountAuthoritative?: boolean; deadlineSafe: boolean; hashFromScriptHex?: string } }
   | { kind: 'BEGIN_L2_FUNDING'; deadlineSafetyEvidence: string }
   | { kind: 'L2_FUND_ACKNOWLEDGED'; l2TxId: string }
   | { kind: 'L2_FUND_UNKNOWN'; transportError: string }
@@ -175,12 +181,28 @@ function allowedTargets(record: CrossChainSessionRecord, event: CrossChainEvent)
 function updated(record: CrossChainSessionRecord, event: CrossChainEvent, target: CrossChainSessionState): CrossChainSessionRecord {
   const next: CrossChainSessionRecord = { ...record, state: target, updatedAtUnixMs: Date.now() };
   switch (event.kind) {
-    case 'L1_FUND_ACKNOWLEDGED':
-      return { ...next, l1TxId: String(event.l1TxId) };
+    case 'L1_FUND_ACKNOWLEDGED': {
+      const withTx: CrossChainSessionRecord = { ...next, l1TxId: String(event.l1TxId) };
+      if (event.hashHex !== undefined) {
+        if (withTx.hashH && withTx.hashH !== '' && withTx.hashH !== event.hashHex) {
+          throw new IllegalTransitionError(`L1 funding hash ${event.hashHex} does not match the accepted quote hash`);
+        }
+        if (!/^[0-9a-f]{64}$/.test(event.hashHex)) throw new IllegalTransitionError('L1 funding hash must be 64 lowercase hex chars');
+        return { ...withTx, hashH: event.hashHex };
+      }
+      return withTx;
+    }
     case 'L2_FUND_ACKNOWLEDGED':
       return { ...next, l2TxId: String(event.l2TxId) };
-    case 'L1_VERIFIED_FUNDED':
-      return { ...next, l1TxId: event.evidence.l1TxId };
+    case 'L1_VERIFIED_FUNDED': {
+      const withTx: CrossChainSessionRecord = { ...next, l1TxId: event.evidence.l1TxId };
+      // Bind H from AUTHORITATIVE script readback when the quote did not fix it
+      // (TARI_TO_XTM: the counterparty's L1 wallet generates S; H is read from the chain).
+      if (event.evidence.hashFromScriptHex && (!withTx.hashH || withTx.hashH === '')) {
+        return { ...withTx, hashH: event.evidence.hashFromScriptHex };
+      }
+      return withTx;
+    }
     case 'L2_VERIFIED_FUNDED':
       return { ...next, l2TxId: event.evidence.l2TxId };
     case 'REVEAL_SECRET':
@@ -209,4 +231,16 @@ export function requireSecretRevealAllowed(record: CrossChainSessionRecord): voi
   if (record.state !== 'CLAIM_ARMED') {
     throw new IllegalTransitionError(`Secret reveal requires CLAIM_ARMED (state ${record.state})`);
   }
+}
+
+/**
+ * H must be bound (64 lowercase hex) before ANY second-leg funding, claim arming, or
+ * secret reveal. Unbound ('') is only legal while the first leg is still being funded
+ * (the real Minotari wallet generates S at funding time).
+ */
+export function requireHashHBound(record: CrossChainSessionRecord): string {
+  if (!/^[0-9a-f]{64}$/.test(record.hashH)) {
+    throw new IllegalTransitionError(`Hashlock H is not authoritatively bound for session ${record.sessionId}`);
+  }
+  return record.hashH;
 }

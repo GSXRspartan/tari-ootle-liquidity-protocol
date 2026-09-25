@@ -18,6 +18,13 @@ export interface SecretPublicPart {
 export interface CrossChainSecretStore {
   /** Generates S, stores it under sessionId, returns ONLY the public hash part. */
   generateAndStore(sessionId: string): Promise<SecretPublicPart>;
+  /**
+   * TESTNET_REFERENCE path: ingest an EXTERNALLY generated preimage (the real Minotari
+   * wallet generates S inside SendShaAtomicSwapTransaction and returns it to the
+   * initiator — tari v6.0.0 service.rs:2203). Stored under the same CLAIM_ARMED-only
+   * reveal discipline. Optional: coordinators must handle stores without ingestion.
+   */
+  ingestExternalSecret?(sessionId: string, secretHex: SecretHex): Promise<SecretPublicPart>;
   /** Returns S ONLY when the caller passes CLAIM_ARMED evidence. */
   revealSecret(sessionId: string, claimArmed: boolean): Promise<SecretHex>;
   hasSecret(sessionId: string): Promise<boolean>;
@@ -60,6 +67,15 @@ export class InMemorySecretStore implements CrossChainSecretStore {
     const bytes = this.secrets.get(sessionId);
     if (!bytes) throw new Error(`No secret stored for session ${sessionId}`);
     return bytesToHex(bytes);
+  }
+
+  async ingestExternalSecret(sessionId: string, secretHex: SecretHex): Promise<SecretPublicPart> {
+    if (!/^[0-9a-f]{64}$/.test(secretHex)) throw new Error('external preimage must be 64 lowercase hex chars');
+    const bytes = hexToBytes(secretHex);
+    this.secrets.set(sessionId, bytes);
+    const hashH = bytesToHex(await sha256(bytes));
+    this.hashes.set(sessionId, hashH);
+    return { hashH, secretLengthBytes: bytes.length };
   }
 
   async hasSecret(sessionId: string): Promise<boolean> {

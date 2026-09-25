@@ -19,6 +19,7 @@ const {
 const { deriveDeadlines, assertDeadlineSafety, DeadlineError } = require('../dist/crosschain/deadlines.js');
 const {
   acceptQuote,
+  verifyL1Funded,
   revealAndClaimL2,
   claimL1,
   assessRefundEligibility,
@@ -249,6 +250,37 @@ test('first leg confirmed, second never funded → CONTINUE (refund path availab
   };
   await p.sessions.save(sessionRecord({ state: 'L1_FUNDED', l1TxId: 'tx_l1' }));
   assert.equal((await recoverSession({ sessionId: 'sess_1', ports: p })).action, 'CONTINUE');
+});
+
+test('authoritative L1 verification refuses a merely-remembered amount', async () => {
+  const sessions = new InMemorySessionStore();
+  await sessions.save(sessionRecord({ state: 'L1_FUNDED', l1TxId: 'tx_l1' }));
+  const observed = (over) => ({
+    l1TxId: 'tx_l1',
+    exists: true,
+    amountRaw: '10000',
+    hashHex: HASH,
+    refundHeight: '500',
+    confirmations: '5',
+    currentHeight: '510',
+    spent: false,
+    source: 'BASE_NODE',
+    ...over,
+  });
+  const deadlineSafety = { l1RemainingMarginMs: '900000', l2RemainingMarginMs: '900000', requiredL1MarginMs: '60000', requiredL2MarginMs: '60000' };
+  // Blinded-amount adapter (the real Minotari base-node readback): the amount matches the
+  // intent but is NOT independently proven, so settlement must refuse to treat it as exact.
+  const blinded = ports({ sessions, l1: { providerName: () => 'dev', primitivesStatus: () => 'VERIFIED', network: () => 'esmeralda', observeHtlc: async () => observed({ amountAuthoritative: false }), lookupTransaction: async () => 'COMMITTED', listInFlightSwaps: async () => [] } });
+  const refused = await verifyL1Funded({ sessionId: 'sess_1', ports: blinded, deadlineSafety });
+  assert.equal(refused.verified, false);
+  assert.equal(refused.evidence.amountExact, false);
+  assert.equal(refused.evidence.amountAuthoritative, false);
+  assert.equal(refused.evidence.hashMatches, true);
+  // An adapter that supplies a chain-validated opening verifies the same observation.
+  const proven = ports({ sessions, l1: { providerName: () => 'dev', primitivesStatus: () => 'VERIFIED', network: () => 'esmeralda', observeHtlc: async () => observed({ amountAuthoritative: true }), lookupTransaction: async () => 'COMMITTED', listInFlightSwaps: async () => [] } });
+  const verified = await verifyL1Funded({ sessionId: 'sess_1', ports: proven, deadlineSafety });
+  assert.equal(verified.verified, true);
+  assert.equal(verified.evidence.amountExact, true);
 });
 
 test('claim committed → FINALIZE', async () => {

@@ -19,13 +19,14 @@ import {
   SessionStore,
   applyEvent,
   isTerminal,
+  requireHashHBound,
   requireSecretRevealAllowed,
 } from './session.js';
 import { ReservationLedger } from './reservation.js';
-import { CrossChainSecretStore } from './secret.js';
+import { CrossChainSecretStore, bytesToHex, hexToBytes, sha256, verifyPreimage } from './secret.js';
 import { assertDeadlineSafety } from './deadlines.js';
 import { assertTestnetNetwork, requireOperationId } from './types.js';
-import { MinotariWalletProvider, OotleScriptPathLegPort } from './provider.js';
+import { MinotariWalletProvider, OotleScriptPathLegPort, requireLegCapabilities, requireLegCapabilitiesSingle } from './provider.js';
 
 /**
  * Real cross-chain submission gate. Default OFF; MAINNET never passes (assertTestnetNetwork).
@@ -76,13 +77,17 @@ export interface AcceptQuoteRequest {
   nowUnixMs: number;
 }
 
-/** ACCEPT_QUOTE: create the durable reservation + session (idempotent by durable ids). */
+/** ACCEPT_QUOTE: create the durable reservation + session (idempotent by durable ids).
+ * Capability negotiation happens HERE — before any reservation/funding — so missing
+ * wallet functionality can never be discovered mid-swap. */
 export async function acceptQuote(input: { request: AcceptQuoteRequest; ports: CoordinatorPorts }): Promise<{ session: CrossChainSessionRecord }> {
   const q = input.request.quote;
   requireOperationId(input.request.sessionId);
   requireOperationId(input.request.reservationId);
   assertTestnetNetwork(q.l1Network);
   assertTestnetNetwork(q.l2Network);
+  // Capability negotiation: fail BEFORE inventory is reserved.
+  requireLegCapabilities(q.direction, input.ports.l1.capabilities?.(), input.ports.l2.capabilities?.());
   await input.ports.reservations.reserve({
     reservationId: input.request.reservationId,
     quoteId: q.quoteId,
@@ -133,11 +138,13 @@ export interface LegFundOutcome {
   reason?: string;
 }
 
-/** BEGIN_L1_FUNDING: gate → deadline safety → construct → authorize → submit. */
+/** BEGIN_L1_FUNDING: capabilities → gate → deadline safety → construct → authorize → submit. */
 export async function beginL1Funding(input: { sessionId: string; ports: CoordinatorPorts; env: Record<string, string | undefined>; deadlineSafety: { l1RemainingMarginMs: string; l2RemainingMarginMs: string; requiredL1MarginMs: string; requiredL2MarginMs: string } }): Promise<LegFundOutcome> {
   const record = await requireState(input.sessionId, input.ports, ['RESERVED']);
   const gate = isRealSubmitEnabled(input.env, input.ports.l1.network());
   if (!gate.enabled) return { outcome: 'REFUSED', reason: gate.reason };
+  // Fail closed on missing L1 wallet capabilities before ANY funding occurs.
+  requireLegCapabilitiesSingle(record.direction, 'L1', input.ports.l1.capabilities?.());
   assertDeadlineSafety({ phase: 'FIRST_LEG_FUNDING', ...input.deadlineSafety });
   const advanced = applyEvent(record, { kind: 'BEGIN_L1_FUNDING', deadlineSafetyEvidence: 'deadline-recheck-passed' });
   await input.ports.sessions.save(advanced);
@@ -145,6 +152,10 @@ export async function beginL1Funding(input: { sessionId: string; ports: Coordina
     amountRaw: advanced.xtmRawAmount,
     hash: advanced.hashH,
     claimRecipient: advanced.l1ClaimRecipient,
+    // TRACED REALITY: the real Minotari refund branch is the FUNDING WALLET'S own one-sided
+    // spend key (wallet-derived, not caller-supplied; no refund recipient on the RPC). The
+    // claim address is passed only as the informational intent field, and the authoritative
+    // refund identity is re-derived from the observed script during verification below.
     refundRecipient: advanced.l1ClaimRecipient,
     refundHeight: advanced.l1RefundDeadlineHeight,
     network: input.ports.l1.network(),
@@ -153,7 +164,13 @@ export async function beginL1Funding(input: { sessionId: string; ports: Coordina
   await input.ports.l1.authorizeFunding(intent);
   try {
     const submitted = await input.ports.l1.submitFunding(intent.intent);
-    const acked = applyEvent(advanced, { kind: 'L1_FUND_ACKNOWLEDGED', l1TxId: submitted.l1TxId });
+    // REAL wallet primitive: the wallet generates S itself and returns it with the ack.
+    // Verify + bind H and store S BEFORE any second-leg work can happen.
+    let boundHashHex: string | undefined;
+    if (submitted.walletPreimageHex !== undefined) {
+      boundHashHex = await ingestWalletGeneratedSecret(input.ports, input.sessionId, advanced, submitted.walletPreimageHex);
+    }
+    const acked = applyEvent(advanced, { kind: 'L1_FUND_ACKNOWLEDGED', l1TxId: submitted.l1TxId, hashHex: boundHashHex });
     await input.ports.sessions.save(acked);
     return { outcome: 'SUBMITTED', txId: submitted.l1TxId };
   } catch (error) {
@@ -163,21 +180,59 @@ export async function beginL1Funding(input: { sessionId: string; ports: Coordina
   }
 }
 
+/**
+ * Ingest a WALLET-GENERATED preimage (real Minotari primitive — SendShaAtomicSwap returns
+ * pre_image to the initiator). S is stored in the secret store (TESTNET_REFERENCE
+ * discipline, CLAIM_ARMED-only reveal) and H = SHA256(S) is returned for binding.
+ * A mismatch with an already-bound quote hash throws — never silent acceptance.
+ */
+async function ingestWalletGeneratedSecret(ports: CoordinatorPorts, sessionId: string, record: CrossChainSessionRecord, walletPreimageHex: string): Promise<string> {
+  if (!/^[0-9a-f]{64}$/.test(walletPreimageHex)) throw new Error('wallet preimage must be 64 lowercase hex chars');
+  const computedH = bytesToHex(await sha256(hexToBytes(walletPreimageHex)));
+  if (record.hashH && record.hashH !== '' && record.hashH !== computedH) {
+    throw new Error(`wallet-generated H does not match the accepted quote hash (session ${sessionId}) — reconcile`);
+  }
+  if (ports.secrets.ingestExternalSecret) {
+    const stored = await ports.secrets.ingestExternalSecret(sessionId, walletPreimageHex);
+    if (stored.hashH !== computedH) throw new Error('secret store hash disagrees with SHA256(S)');
+  } else {
+    // Without ingestion the ONLY durable copy of S is inside the L1 wallet. Proceed only
+    // if the coordinator already retains a matching secret (e.g. a provider honoring an
+    // external hash); otherwise a later claim could not reveal S.
+    const hasMatching = await ports.secrets.hasSecret(sessionId);
+    if (!hasMatching) {
+      throw new Error('secret store cannot retain the wallet-generated preimage — refusing to continue without durable S');
+    }
+  }
+  return computedH;
+}
+
 /** AUTHORITATIVE first-leg verification — required before funding the second leg. */
 export async function verifyL1Funded(input: { sessionId: string; ports: CoordinatorPorts; deadlineSafety: { l1RemainingMarginMs: string; l2RemainingMarginMs: string; requiredL1MarginMs: string; requiredL2MarginMs: string } }): Promise<VerifyOutcome> {
   const record = await requireState(input.sessionId, input.ports, ['L1_FUNDED', 'L1_FUNDING']);
   if (!record.l1TxId) return { verified: false, reason: 'No L1 transaction id recorded' };
   const obs = await input.ports.l1.observeHtlc(record.l1TxId);
+  // When the quote did not fix H (real wallet generates S at funding time), the FIRST
+  // authoritative on-chain script readback binds it — TARI_TO_XTM direction.
+  const hashUnbound = !record.hashH || record.hashH === '';
+  const hashFromScriptHex = hashUnbound && obs.hashHex && obs.source !== 'PROVIDER_ASSERTION' ? obs.hashHex : undefined;
+  // The amount is only "exact" if it is INDEPENDENTLY PROVEN. A provider that merely
+  // remembers the funding intent (e.g. the Minotari reference provider, whose base-node
+  // readback yields a blinded commitment, not a revealed value) must set
+  // `amountAuthoritative: false`, and settlement then refuses to treat the amount as proven.
+  const amountAuthoritative = obs.amountAuthoritative !== false;
   const evidence = {
     l1TxId: record.l1TxId,
     confirmations: obs.confirmations,
-    hashMatches: obs.hashHex === record.hashH,
-    amountExact: obs.amountRaw === record.xtmRawAmount,
+    hashMatches: hashUnbound ? hashFromScriptHex !== undefined : obs.hashHex === record.hashH,
+    amountExact: obs.amountRaw === record.xtmRawAmount && amountAuthoritative,
+    amountAuthoritative,
     deadlineSafe: obs.refundHeight === record.l1RefundDeadlineHeight,
+    hashFromScriptHex,
     source: obs.source,
     confirmationsSufficient: BigInt(obs.confirmations) >= BigInt(record.requiredL1Confirmations),
   };
-  const verified = evidence.hashMatches && evidence.amountExact && evidence.deadlineSafe && evidence.confirmationsSufficient && obs.exists && obs.source !== 'PROVIDER_ASSERTION';
+  const verified = evidence.hashMatches && evidence.amountExact && evidence.deadlineSafe && evidence.confirmationsSufficient && obs.exists && obs.source !== 'PROVIDER_ASSERTION' && (hashUnbound ? hashFromScriptHex !== undefined : true);
   if (verified) {
     await input.ports.sessions.save(applyEvent(record, { kind: 'L1_VERIFIED_FUNDED', evidence }));
   }
@@ -195,6 +250,10 @@ export async function beginL2Funding(input: { sessionId: string; ports: Coordina
   const record = await requireState(input.sessionId, input.ports, ['L1_FUNDED']);
   const gate = isRealSubmitEnabled(input.env, input.ports.l1.network());
   if (!gate.enabled) return { outcome: 'REFUSED', reason: gate.reason };
+  // H must be authoritatively bound before the second leg is constructed.
+  requireHashHBound(record);
+  // Fail closed on missing L2 wallet capabilities before ANY second-leg funding.
+  requireLegCapabilitiesSingle(record.direction, 'L2', input.ports.l2.capabilities?.());
   // Never fund the second leg on the first party's word alone: the caller must pass
   // authoritative L1 verification; we re-check the session state enforces it.
   assertDeadlineSafety({ phase: 'SECOND_LEG_FUNDING', ...input.deadlineSafety });
@@ -236,6 +295,7 @@ export async function verifyL2Funded(input: { sessionId: string; ports: Coordina
 /** CLAIM_ARMED: mandatory checks before ANY secret disclosure. */
 export async function armClaim(input: { sessionId: string; ports: CoordinatorPorts; deadlineSafety: { l1RemainingMarginMs: string; l2RemainingMarginMs: string; requiredL1MarginMs: string; requiredL2MarginMs: string }; claimConstructibleEvidence: string }): Promise<{ armed: boolean; reason?: string }> {
   const record = await requireState(input.sessionId, input.ports, ['BOTH_FUNDED']);
+  requireHashHBound(record);
   try {
     assertDeadlineSafety({ phase: 'CLAIM_ARMED', ...input.deadlineSafety });
   } catch (error) {
@@ -258,9 +318,16 @@ export async function revealAndClaimL2(input: { sessionId: string; ports: Coordi
   const record = await requireState(input.sessionId, input.ports, ['CLAIM_ARMED']);
   const gate = isRealSubmitEnabled(input.env, input.ports.l1.network());
   if (!gate.enabled) return { outcome: 'REFUSED', reason: gate.reason };
+  requireHashHBound(record);
   requireSecretRevealAllowed(record);
   assertDeadlineSafety({ phase: 'SECRET_REVEAL', ...input.deadlineSafety });
   const preimage = await input.ports.secrets.revealSecret(record.sessionId, record.state === 'CLAIM_ARMED');
+  // The preimage must hash to the BOUND session hash — never trust storage blindly.
+  if (!(await verifyPreimage(preimage, record.hashH))) {
+    const bad = applyEvent(record, { kind: 'ENTER_RECOVERY', reason: 'stored preimage does not hash to the bound session hash' });
+    await input.ports.sessions.save(bad);
+    return { outcome: 'UNKNOWN', reason: 'stored preimage does not match bound hash; reconcile' };
+  }
   const revealed = applyEvent(record, { kind: 'REVEAL_SECRET' });
   await input.ports.sessions.save(revealed);
   try {
@@ -280,10 +347,18 @@ export async function revealAndClaimL2(input: { sessionId: string; ports: Coordi
 /** Opposite-leg claim (L1 by the provider/taker after the preimage is observable). */
 export async function claimL1(input: { sessionId: string; preimage: string; ports: CoordinatorPorts }): Promise<LegFundOutcome> {
   const record = await requireState(input.sessionId, input.ports, ['CLAIMING', 'RECOVERY_REQUIRED', 'CLAIMED']);
+  if (input.ports.l1.capabilities && !input.ports.l1.capabilities().l1ShaClaim) {
+    return { outcome: 'REFUSED', reason: 'L1 wallet cannot claim SHA atomic-swap outputs (capability l1ShaClaim unavailable)' };
+  }
   if (record.l1ClaimTxId) {
     // Idempotent: a claim already exists for this session; reconcile it.
     const status = await input.ports.l1.lookupTransaction(record.l1ClaimTxId);
     return { outcome: status === 'COMMITTED' ? 'SUBMITTED' : 'UNKNOWN', txId: record.l1ClaimTxId };
+  }
+  // Never submit a preimage that does not hash to the bound hash (real hashlock refusal).
+  requireHashHBound(record);
+  if (!(await verifyPreimage(input.preimage, record.hashH))) {
+    return { outcome: 'REFUSED', reason: 'preimage does not hash to the bound session hash — refusing L1 claim' };
   }
   try {
     await input.ports.l1.constructClaim(record.l1TxId!, input.preimage, record.l1ClaimRecipient, `claim_l1_${record.sessionId}`);
