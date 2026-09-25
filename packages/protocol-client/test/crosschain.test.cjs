@@ -2,7 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const sessionMod = require('../dist/crosschain/session.js');
-const { IllegalTransitionError } = sessionMod;
+const { IllegalTransitionError, isTerminal, InMemorySessionStore } = sessionMod;
 const {
   buildQuote,
   isQuoteExpired,
@@ -110,38 +110,38 @@ test('quote terms are integers with bounded spread on testnet networks only', ()
 
 test('inventory race: two overlapping reservations cannot exceed advertised inventory', async () => {
   const ledger = new InMemoryReservationLedger({ prov_1: AD });
-  await ledger.reserve({ reservationId: 'r1', quoteId: 'q1', providerId: 'prov_1', direction: 'XTM_TO_TARI', xtmRawAmount: '80000', tariRawAmount: '40000000', nowUnixMs: 1, quoteExpiresAtUnixMs: 9999 });
+  await ledger.reserve({ reservationId: 'res_race_1', quoteId: 'quote_race_1', providerId: 'prov_1', direction: 'XTM_TO_TARI', xtmRawAmount: '80000', tariRawAmount: '40000000', nowUnixMs: 1, quoteExpiresAtUnixMs: 9999 });
   await assert.rejects(
-    () => ledger.reserve({ reservationId: 'r2', quoteId: 'q2', providerId: 'prov_1', direction: 'XTM_TO_TARI', xtmRawAmount: '80000', tariRawAmount: '40000000', nowUnixMs: 2, quoteExpiresAtUnixMs: 9999 }),
+    () => ledger.reserve({ reservationId: 'res_race_2', quoteId: 'quote_race_2', providerId: 'prov_1', direction: 'XTM_TO_TARI', xtmRawAmount: '80000', tariRawAmount: '40000000', nowUnixMs: 2, quoteExpiresAtUnixMs: 9999 }),
     /race|exceed/i,
   );
-  const again = await ledger.reserve({ reservationId: 'r1', quoteId: 'q1', providerId: 'prov_1', direction: 'XTM_TO_TARI', xtmRawAmount: '80000', tariRawAmount: '40000000', nowUnixMs: 2, quoteExpiresAtUnixMs: 9999 });
-  assert.equal(again.reservationId, 'r1');
+  const again = await ledger.reserve({ reservationId: 'res_race_1', quoteId: 'quote_race_1', providerId: 'prov_1', direction: 'XTM_TO_TARI', xtmRawAmount: '80000', tariRawAmount: '40000000', nowUnixMs: 2, quoteExpiresAtUnixMs: 9999 });
+  assert.equal(again.reservationId, 'res_race_1');
   await assert.rejects(
-    () => ledger.reserve({ reservationId: 'r1', quoteId: 'q1', providerId: 'prov_1', direction: 'XTM_TO_TARI', xtmRawAmount: '20000', tariRawAmount: '40000000', nowUnixMs: 3, quoteExpiresAtUnixMs: 9999 }),
+    () => ledger.reserve({ reservationId: 'res_race_1', quoteId: 'quote_race_1', providerId: 'prov_1', direction: 'XTM_TO_TARI', xtmRawAmount: '20000', tariRawAmount: '40000000', nowUnixMs: 3, quoteExpiresAtUnixMs: 9999 }),
     /different terms/,
   );
 });
 
 test('quote expiry cannot release FUNDED inventory; release needs authoritative evidence', async () => {
   const ledger = new InMemoryReservationLedger({ prov_1: AD });
-  await ledger.reserve({ reservationId: 'r_1', quoteId: 'q', providerId: 'prov_1', direction: 'XTM_TO_TARI', xtmRawAmount: '10000', tariRawAmount: '5000000', nowUnixMs: 1, quoteExpiresAtUnixMs: 999 });
-  await ledger.markFunded('r_1');
-  await assert.rejects(() => ledger.requestRelease('r_1', 'ev_1', 'QUOTE_EXPIRED'), /funded sessions live by chain deadlines/i);
-  const released = await ledger.requestRelease('r_1', 'ev_settle', 'SETTLED');
+  await ledger.reserve({ reservationId: 'res_exp_0001', quoteId: 'quote_exp_01', providerId: 'prov_1', direction: 'XTM_TO_TARI', xtmRawAmount: '10000', tariRawAmount: '5000000', nowUnixMs: 1, quoteExpiresAtUnixMs: 999 });
+  await ledger.markFunded('res_exp_0001');
+  await assert.rejects(() => ledger.requestRelease('res_exp_0001', 'ev_exp_0001', 'QUOTE_EXPIRED'), /funded sessions live by chain deadlines/i);
+  const released = await ledger.requestRelease('res_exp_0001', 'ev_settle_1', 'SETTLED');
   assert.equal(released.state, 'RELEASE_PENDING');
-  const done = await ledger.completeRelease('r_1');
+  const done = await ledger.completeRelease('res_exp_0001');
   assert.equal(done.state, 'RELEASED');
-  await assert.rejects(() => ledger.completeRelease('r_1'), /RELEASE_PENDING/);
+  await assert.rejects(() => ledger.completeRelease('res_exp_0001'), /RELEASE_PENDING/);
 });
 
 test('double reservation with the same durable id is idempotent only for identical terms', async () => {
   const ledger = new InMemoryReservationLedger({ prov_1: AD });
-  const first = await ledger.reserve({ reservationId: 'rx', quoteId: 'qx', providerId: 'prov_1', direction: 'XTM_TO_TARI', xtmRawAmount: '10000', tariRawAmount: '5000000', nowUnixMs: 1, quoteExpiresAtUnixMs: 999 });
-  const second = await ledger.reserve({ reservationId: 'rx', quoteId: 'qx', providerId: 'prov_1', direction: 'XTM_TO_TARI', xtmRawAmount: '10000', tariRawAmount: '5000000', nowUnixMs: 2, quoteExpiresAtUnixMs: 999 });
+  const first = await ledger.reserve({ reservationId: 'res_dup_0001', quoteId: 'quote_dup_1', providerId: 'prov_1', direction: 'XTM_TO_TARI', xtmRawAmount: '10000', tariRawAmount: '5000000', nowUnixMs: 1, quoteExpiresAtUnixMs: 999 });
+  const second = await ledger.reserve({ reservationId: 'res_dup_0001', quoteId: 'quote_dup_1', providerId: 'prov_1', direction: 'XTM_TO_TARI', xtmRawAmount: '10000', tariRawAmount: '5000000', nowUnixMs: 2, quoteExpiresAtUnixMs: 999 });
   assert.equal(second.reservationId, first.reservationId);
   await assert.rejects(
-    () => ledger.reserve({ reservationId: 'rx', quoteId: 'qx', providerId: 'prov_1', direction: 'XTM_TO_TARI', xtmRawAmount: '11000', tariRawAmount: '5000000', nowUnixMs: 3, quoteExpiresAtUnixMs: 999 }),
+    () => ledger.reserve({ reservationId: 'res_dup_0001', quoteId: 'quote_dup_1', providerId: 'prov_1', direction: 'XTM_TO_TARI', xtmRawAmount: '11000', tariRawAmount: '5000000', nowUnixMs: 3, quoteExpiresAtUnixMs: 999 }),
     /different terms/,
   );
 });
@@ -212,7 +212,9 @@ test('terminal states stay terminal', () => {
 
 test('funds cannot be claimed and refunded simultaneously (state machine disjoint)', () => {
   // From REFUNDING, the only legal outcome is REFUNDED — no claim path exists.
-  const refunding = applyEvt(applyEvt(applyEvt(sessionRecord({ state: 'BOTH_FUNDED' }), { kind: 'REFUND_ELIGIBLE', leg: 'L1', authorityEvidence: 'x' }), { kind: 'BEGIN_REFUND', leg: 'L1' }));
+  const refundable = applyEvt(sessionRecord({ state: 'BOTH_FUNDED' }), { kind: 'REFUND_ELIGIBLE', leg: 'L1', authorityEvidence: 'x' });
+  assert.equal(refundable.state, 'REFUND_ELIGIBLE');
+  const refunding = applyEvt(refundable, { kind: 'BEGIN_REFUND', leg: 'L1' });
   assert.equal(refunding.state, 'REFUNDING');
   assert.throws(() => applyEvt(refunding, { kind: 'REVEAL_SECRET' }), /Illegal transition/);
   // Once BOTH_FUNDED arms a claim, the refund path is no longer legal from CLAIM_ARMED.
