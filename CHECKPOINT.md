@@ -1,3 +1,49 @@
+# END-OF-RUN CHECKPOINT (2026-09-25) — unified multi-hop route (XTM → TARI → AMM)
+
+> Supersedes only the facts it contradicts below; all prior checkpoint sections are retained.
+
+## A1. Outcome
+**NO KNOWN MULTI-HOP ROUTE DRAIN FOUND UNDER TESTED MODEL.** 68 attack-matrix rows, all
+classified, no UNKNOWN. Open CRITICAL: 0. Open HIGH: 0.
+
+The route is XTM L1 → FAST_XTM_TARI → TARI L2 → AMM → public fungible. The AMM hop is
+unreachable until hop 1 mints a chain-proven `TerminalSettlementProof`.
+
+## A2. Findings (all fixed, all retained as regressions)
+| Severity | Count | Highlights |
+|---|---|---|
+| CRITICAL | 0 | — |
+| HIGH | 3 | (1) a failed hop 2 mapped to ROUTE_FAILED_TERMINAL, misreporting a completed cross-layer trade as a total loss — now pauses with the user's TARI intact; (2) a blank hop-2 operation id was accepted, weakening idempotency; (3) the AMM quote could be frozen at route-quote time — hop 2's input is now only ever the proven settled amount, filled from the proof |
+| MEDIUM | 3 | `HOP1_SETTLED` accepted a zero settled amount (silent loss of the intermediate TARI — found by the fuzzer); `HOP2_SETTLED` did not enforce the accepted final minimum; `RESOLVE_SETTLED` could settle hop 2 with no proof, no settled hop 1, and no txid (found by the fuzzer) |
+
+## A3. Evidence
+| Suite | Result |
+|---|---|
+| `test/multihop_hostile.test.cjs` | 28/28 |
+| `test/multihop_fuzz.test.cjs` | 4/4 (100,000 route transitions + 20,000 proof-tamper attempts) |
+| protocol-client total | **138/138** (was 106) |
+| wallet-adapter | **12/12** |
+| persisted failing fuzz seeds | **0** |
+| multi-hop matrix | 68 rows: PASS 58, FIXED 6, N/A 1, EXTERNAL_RISK 1, BLOCKED_EXTERNAL 2, UNKNOWN 0 |
+| cross-layer regressions | all 146 rows still green — no coordinator change in this phase |
+| AMM regressions | green — `resolveSwap` reused unchanged, no AMM math touched |
+
+## A4. Not established
+No live Esmeralda composed execution (no concrete Ootle ScriptPath provider exists), no
+live L2 HTLC leg, no production restart-safe secret storage, no market-data aggregation.
+Reverse routes (→ XTM) are refused with a structured BLOCKED_EXTERNAL and the exact
+prerequisite, not pretended. The route is EXPERIMENTAL/TESTNET: real submit OFF by default,
+mainnet refused.
+
+## A5. Next exact phase
+**MARKET DATA / TRADE INDEXING / OHLC CANDLES, then FRONTEND V1.** The seam is ready:
+`buildMarketDataEvent` emits pool, input/output resource, amounts, exact price inputs
+(reserves before AND after), fee bps, txid, and epoch/version on successful hop-2
+settlement. `RouteView` is the stable frontend contract. Candle aggregation is
+deliberately not implemented.
+
+---
+
 # END-OF-RUN CHECKPOINT (2026-09-25) — hostile cross-layer audit
 
 > Supersedes only the facts it contradicts below; the AMM/template history in the
