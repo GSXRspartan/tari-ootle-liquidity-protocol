@@ -199,16 +199,19 @@ fn b01_sequential_fills_decrement_exact_escrow_and_quantity() {
         NonFungibleId::from_u64(1),
         NonFungibleId::from_u64(2),
         NonFungibleId::from_u64(3),
+        NonFungibleId::from_u64(4),
     ];
     let (nft_faucet, collection) = create_many_nft_faucet(&mut t, ids.clone(), "COLA");
     let (buyer, buyer_proof, buyer_secret) = t.create_funded_account();
     let (seller_one, seller_one_proof, seller_one_secret) = t.create_funded_account();
     let (seller_two, seller_two_proof, seller_two_secret) = t.create_funded_account();
     let (seller_three, seller_three_proof, seller_three_secret) = t.create_funded_account();
+    let (seller_four, seller_four_proof, seller_four_secret) = t.create_funded_account();
     fund(&mut t, quote_faucet, buyer);
     fund_nft_by_id(&mut t, nft_faucet, seller_one, ids[0].clone());
     fund_nft_by_id(&mut t, nft_faucet, seller_two, ids[1].clone());
     fund_nft_by_id(&mut t, nft_faucet, seller_three, ids[2].clone());
+    fund_nft_by_id(&mut t, nft_faucet, seller_four, ids[3].clone());
 
     let buyer_quote_before = account_balance(&mut t, buyer, quote);
     let bid = create_bid(
@@ -241,7 +244,13 @@ fn b01_sequential_fills_decrement_exact_escrow_and_quantity() {
         account_balance(&mut t, seller_one, quote) - one_before,
         Amount::from(PRICE)
     );
+    assert_eq!(t.extract_component_value::<u64>(bid, "$.6"), 2);
+    assert_eq!(
+        t.extract_component_value::<Amount>(bid, "$.8"),
+        Amount::from(PRICE * 2)
+    );
 
+    let two_before = account_balance(&mut t, seller_two, quote);
     fill_bid(
         &mut t,
         bid,
@@ -251,6 +260,11 @@ fn b01_sequential_fills_decrement_exact_escrow_and_quantity() {
         collection,
         ids[1].clone(),
     );
+    assert_eq!(
+        account_balance(&mut t, seller_two, quote) - two_before,
+        Amount::from(PRICE)
+    );
+    let three_before = account_balance(&mut t, seller_three, quote);
     fill_bid(
         &mut t,
         bid,
@@ -261,6 +275,10 @@ fn b01_sequential_fills_decrement_exact_escrow_and_quantity() {
         ids[2].clone(),
     );
     assert_eq!(
+        account_balance(&mut t, seller_three, quote) - three_before,
+        Amount::from(PRICE)
+    );
+    assert_eq!(
         account_balance(&mut t, buyer, collection),
         Amount::from(3u64)
     );
@@ -268,12 +286,27 @@ fn b01_sequential_fills_decrement_exact_escrow_and_quantity() {
         buyer_quote_before - account_balance(&mut t, buyer, quote),
         Amount::from(PRICE * 3)
     );
+    assert_eq!(t.extract_component_value::<u64>(bid, "$.6"), 0);
+    assert_eq!(
+        t.extract_component_value::<Amount>(bid, "$.8"),
+        Amount::zero()
+    );
 
     let overfill = t
         .transaction()
-        .call_method(bid, "fill", args![Workspace("nft"), seller_one])
-        .build_and_seal(&seller_one_secret);
-    t.execute_expect_failure(overfill, vec![]);
+        .call_method(
+            seller_four,
+            "withdraw_non_fungible",
+            args![collection, ids[3].clone()],
+        )
+        .put_last_instruction_output_on_workspace("nft")
+        .call_method(bid, "fill", args![Workspace("nft"), seller_four])
+        .build_and_seal(&seller_four_secret);
+    t.execute_expect_failure(overfill, vec![seller_four_proof]);
+    assert_eq!(
+        account_balance(&mut t, seller_four, collection),
+        Amount::from(1u64)
+    );
 }
 
 #[test]
