@@ -58,7 +58,7 @@ never `"*"`).
 | Refund epoch (L2) | **YES** (`refundEpoch`, `htlcRefund` with `outputMask`) | YES | YES |
 | Atomic-swap finalise (L2) | **YES** (`htlcClaim` with `preimageHex`) | YES | YES |
 | Atomic-swap refund (L2) | **YES** (`htlcRefund`) | YES | YES |
-| **L1 tXTM SHA atomic swap** | **NO** — dApp operations are Ootle-side only; L1 txs are built in-page via `vendor/tari-l1-wasm` (burn/send only) | YES (console wallet commands; trace pending) | **YES — L1 leg** |
+| **L1 tXTM SHA atomic swap** | **NO** — dApp operations are Ootle-side only; L1 txs are built in-page via `vendor/tari-l1-wasm` (burn/send only) | YES (console wallet commands; FULLY TRACED against v6.0.0 — see `docs/MINOTARI_ATOMIC_SWAP_API.md`) | **YES — L1 leg** |
 | Restart recovery | PARTIAL (requestIds in wallet memory; lost when wallet closes — documented) | YES | YES |
 
 ## Verdict
@@ -100,6 +100,10 @@ Lower-level alternative (if the wallet prefers generic primitives): expose
 `buildL1CustomScriptOutput({ script, covenant, features, refund_height })` on
 `WasmTxBuilder` + a `spendScriptOutput` op — but the named swap ops are safer and match
 the existing `htlcFund/Claim/Refund` naming.
+
+The full layer-by-layer extension request (WASM primitive → wallet dApp surface → our
+adapter), the secret-boundary rules for `S`, the blinded-amount limitation, and the
+acceptance criteria are specified in `docs/TARI_BROWSER_SHA_SWAP_UPSTREAM_PLAN.md`.
 
 ## Upstream contribution estimate
 

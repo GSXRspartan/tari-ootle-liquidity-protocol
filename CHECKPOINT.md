@@ -1,3 +1,53 @@
+# END-OF-RUN CHECKPOINT (2026-09-25) — FAST_XTM_TARI Minotari phase
+
+> Supersedes only the facts it contradicts below; the AMM/template history in the
+> 2026-09-23 checkpoint is retained for reference.
+
+## A. Pinned upstreams
+| Repo | Path | Revision |
+|---|---|---|
+| Minotari L1 (`tari-project/tari`) | `C:\tmp-tari-l1` | tag `v6.0.0`, commit `97aa59ecfaf70d8334f14e71d8f7afd6bd40e5e3` (network Esmeralda) |
+| tari-ootle L2 | `C:\tmp-tari` | `2d6083e6cc7c98cde93dacebe2fb76b17703f588` (workspace 0.41.1) |
+
+## B. Git state
+- Branch: `feat/multi-asset-stablecoin-markets`
+- HEAD: `3f20e4c` — recovery fixture bound to durable `l1TxId`; esbuild build approved.
+- The Minotari provider/coordinator/docs work in the working tree is **uncommitted** at this
+  checkpoint.
+
+## C. Test status (this contradicts §16 "TypeScript tests: None")
+| Suite | Result |
+|---|---|
+| `@tari-ootle/protocol-client` | **66/66 pass** (includes 17 Minotari SHA/script/provider tests + 20 crosschain tests) |
+| `@tari-ootle/wallet-adapter` | **12/12 pass** |
+| Workspace typecheck (all packages) | green |
+| CI-equivalent pnpm commands | green |
+| Rust crates | unchanged this phase (32 tests) |
+
+## D. Delivered this phase
+- `src/chains/minotari.ts` — traced script serializer/decoder, SHA256 interop, fail-closed
+  branch verifier.
+- `src/chains/minotari_grpc.ts` — `MinotariDevGrpcProvider` (`DEVELOPMENT_REFERENCE_PROVIDER`),
+  capability advertisement, base-node readback port, mainnet refusal.
+- Coordinator/session/secret/provider changes — capability negotiation per leg, wallet-generated
+  preimage ingestion, authoritative H binding, `amountAuthoritative` fail-closed gate.
+- Docs: `MINOTARI_ATOMIC_SWAP_API.md` (full source trace + honest limits),
+  `TARI_BROWSER_SHA_SWAP_UPSTREAM_PLAN.md` (new), `UPSTREAM_BASELINE.md` (L1 pin),
+  `TARI_BROWSER_ATOMIC_SWAP_PROVIDER_GAP.md` (trace no longer pending).
+
+## E. Honest open limits (do not overstate)
+1. Funded **amount** is not provable from base-node evidence (blinded commitment) → the
+   provider reports `amountAuthoritative: false` and settlement refuses to treat it as proven.
+2. Wallet transport and base-node readback are **interfaces**; no concrete client is committed
+   and nothing has run against a live node.
+3. In-flight funding map is in-memory (not restart-safe).
+4. Browser `window.tari` L1 SHA support is **missing upstream** (`tari_l1_wasm` exposes no
+   SHA atomic swap) → normal-user browser path still blocked; plan documented, not implemented.
+5. No live Esmeralda happy/refund/wrong-preimage/UNKNOWN/restart execution yet (no funded
+   wallet, no local gRPC endpoint).
+
+---
+
 # END-OF-RUN CHECKPOINT (2026-09-23)
 
 ## 1. Exact repo path
