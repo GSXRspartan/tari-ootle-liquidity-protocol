@@ -5,9 +5,7 @@
 use tari_engine_types::virtual_substate::{VirtualSubstate, VirtualSubstateId};
 use tari_ootle_common_types::substate_type::SubstateType;
 use tari_ootle_transaction::args;
-use tari_template_lib::types::{
-    Amount, ComponentAddress, NonFungibleAddress, NonFungibleId, ResourceAddress,
-};
+use tari_template_lib::types::{Amount, ComponentAddress, NonFungibleId, ResourceAddress};
 use tari_template_test_tooling::TemplateTest;
 
 const CRATE_PATH: &str = env!("CARGO_MANIFEST_DIR");
@@ -121,22 +119,25 @@ macro_rules! create_listing {
                 .build_and_seal($seller_secret),
             vec![$seller_proof],
         );
-        result
-            .expect_success()
-            .up_iter()
-            .find(|(address, substate)| {
-                address.is_component()
-                    && *substate
-                        .substate_value()
-                        .component()
-                        .unwrap()
-                        .template_address()
-                        == template
-            })
-            .unwrap()
-            .0
-            .as_component_address()
-            .unwrap()
+        let listing: ComponentAddress = {
+            let receipt = result.expect_success();
+            receipt
+                .up_iter()
+                .find_map(|(address, substate)| {
+                    (address.is_component()
+                        && *substate
+                            .substate_value()
+                            .component()
+                            .unwrap()
+                            .template_address()
+                            == template)
+                        .then(|| address.as_component_address())
+                        .flatten()
+                })
+                .expect("listing component not found")
+        };
+        drop(result);
+        listing
     }};
 }
 
