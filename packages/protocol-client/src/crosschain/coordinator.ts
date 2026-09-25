@@ -27,6 +27,14 @@ import { assertDeadlineSafety } from './deadlines.js';
 import { assertTestnetNetwork, requireOperationId } from './types.js';
 import { MinotariWalletProvider, OotleScriptPathLegPort } from './provider.js';
 
+import { MinotariWalletProvider, OotleScriptPathLegPort } from './provider.js';
+
+/**
+ * Real cross-chain submission gate. Default OFF; MAINNET never passes (assertTestnetNetwork).
+ * Single source of truth — import this constant, never re-type the string.
+ */
+export const REAL_CROSSCHAIN_SUBMIT_ENV = 'TARI_LIQUIDITY_ENABLE_REAL_CROSSCHAIN_SUBMIT';
+
 /** Real cross-chain submission is OFF unless the gate passes. MAINNET never passes. */
 export function isRealSubmitEnabled(env: Record<string, string | undefined>, network: string): { enabled: boolean; reason: string } {
   assertTestnetNetwork(network);
@@ -322,7 +330,7 @@ export async function finalizeSession(input: { sessionId: string; ports: Coordin
 export async function recoverSession(input: { sessionId: string; ports: CoordinatorPorts; preimage?: string }): Promise<RecoveryDecision> {
   const record = await input.ports.sessions.get(input.sessionId);
   if (!record) throw new CoordinatorRefusal('no such session');
-  if (isTerminal(record.state)) return { action: 'NONE', reason: `terminal state ${record.state}` };
+  if (isTerminal(record.state)) return { action: undefined, reason: `terminal state ${record.state}; no recovery action required` };
   const l1Status = record.l1TxId ? await input.ports.l1.lookupTransaction(record.l1TxId) : 'NOT_FOUND';
   const l2Status = record.l2TxId ? await input.ports.l2.lookupTransaction(record.l2TxId) : 'NOT_FOUND';
   if (record.l1ClaimTxId) {
@@ -345,7 +353,11 @@ export async function recoverSession(input: { sessionId: string; ports: Coordina
 }
 
 export interface RecoveryDecision {
-  action: 'CONTINUE' | 'ARM' | 'CLAIM' | 'WAIT_OR_REFUND' | 'RECONCILE' | 'FINALIZE';
+  /**
+   * The recovery action, or `undefined` when NO action is required (terminal session —
+   * its outcome is already durable and must not be re-driven).
+   */
+  action?: 'CONTINUE' | 'ARM' | 'CLAIM' | 'WAIT_OR_REFUND' | 'RECONCILE' | 'FINALIZE';
   resolution?: 'SETTLED' | 'REFUNDED';
   reason: string;
 }

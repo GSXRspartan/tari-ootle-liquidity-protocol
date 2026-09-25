@@ -68,7 +68,7 @@ export function deriveDeadlines(input: DeadlinePolicyInput): DerivedDeadlines {
   return {
     secondLegRefundEpoch,
     firstLegRefundHeight,
-    marginEvidence: { confirmationsMs: confirmationsMs.toString(), l2ClaimWindowMs: l2ClaimWindowMs.toString(), l1FirstLegMarginMs: firstLegMarginMs.toString() },
+    marginEvidence: { confirmationsMs: confirmationsMs.toString(), l2ClaimWindowMs: l2ClaimWindowMs.toString(), l1FirstLegMarginMs: l1FirstLegMarginMs.toString() },
   };
 }
 
