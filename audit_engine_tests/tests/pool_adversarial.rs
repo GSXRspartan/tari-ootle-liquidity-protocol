@@ -552,7 +552,6 @@ fn w08_wrong_resource_swap_rejected_at_boundary() {
     let mut ctx = new_ctx(30);
     add_liquidity(&mut ctx, 1_000_000, 1_000_000);
     let a = ctx.a;
-    let b = ctx.b;
     let (c_faucet, c) = faucet(&mut ctx.t, "CCC");
     {
         let account = ctx.account;
