@@ -1,3 +1,65 @@
+# END-OF-RUN CHECKPOINT (2026-09-25) — market-data foundation
+
+> Supersedes only the facts it contradicts below; all prior checkpoint sections are retained.
+
+## A1. Outcome
+Market data is **INFORMATIONAL ONLY** and is structurally prevented from influencing
+execution. No React, no chart library, no new frontend dependency, no AMM math change.
+
+## A2. Settlement proof freshness gap: CLOSED (`57399d5`)
+A `SettlementRevalidator` is now MANDATORY before hop-2 construction. It re-derives the
+settled state from an authoritative source and compares identity, canonical TARI resource,
+exact amount, recipient account, transaction/substate identity, settled state, and
+confirmations. A missing, malformed, throwing, or non-authoritative revalidator returns
+`AUTHORITATIVE_REVALIDATION_UNAVAILABLE` — the proof's age window is explicitly a LIVENESS
+bound, never treated as equivalent to a chain read. A reorg is distinguished from a mismatch.
+
+## A3. Source model (traced, `docs/MARKET_DATA_SOURCE_MODEL.md`)
+| Capability | Reality |
+|---|---|
+| Historical trades | GraphQL `get_events` (offset/limit, ≤1000) or cursor-paginated backfill |
+| Live | SSE `/transactions/events/stream` with a monotonic `id` cursor; NO GraphQL subscription exists |
+| Consensus timestamp | **None exposed** — wall-clock sub-epoch candles are marked UNSUPPORTED, not fabricated |
+| Our pool template | **Emits no events** — ingestion is source-pluggable and verified against authoritative pool state |
+| Reorg signal | **None** — invalidation is a model + API, automatic detection is BLOCKED_EXTERNAL |
+
+## A4. What was built
+`src/marketdata/`: exact rational prices; canonical `PoolActivityRecord` (TRADE /
+ADD_LIQUIDITY / REMOVE_LIQUIDITY) and immutable `CanonicalTrade`; DERIVED, always-rebuildable
+OHLCV candles; `MarketDataStore` with chain-derived idempotent trade identity; an indexer
+(DISCOVER→VERIFY→NORMALIZE→DEDUPE→STORE→AGGREGATE→EMIT) with authoritative corroboration;
+pool metrics; the frontend query API; live subscriptions; and `toChartSeries` as the single,
+documented display boundary where a Number may appear.
+
+## A5. Findings (all fixed, all retained)
+| Severity | Count | Highlights |
+|---|---|---|
+| CRITICAL / HIGH | 0 | — |
+| MEDIUM | 3 | a trade for a different pool passed validation; a finality promotion updated the activity but not the trade index (candles kept reading a provisional trade); the reserve-growth sanity check compared the wrong reserve pair in one direction |
+
+## A6. Evidence
+| Suite | Result |
+|---|---|
+| `test/marketdata_fuzz.test.cjs` | 6/6 — **100,000 randomized insertions**, 0 failing seeds |
+| `test/marketdata_hostile.test.cjs` | 19/19 — 17 malicious-observation classes, dedupe, reorg, boundary, health |
+| protocol-client total | **168/168** (was 143) |
+| wallet-adapter | **12/12** |
+| cross-layer (146 rows) | green, unchanged |
+| multi-hop (68 rows) | green, unchanged |
+| engine security | green |
+
+## A7. Still not established
+No live indexer was queried; all source claims are traced from pinned upstream
+(`2d6083e`) rather than observed at runtime. Automatic reorg detection, consensus
+timestamps, and third-party pool trade indexing are upstream gaps
+(`BLOCKED_EXTERNAL`). Real submission remains OFF; mainnet refused.
+
+## A8. Next exact phase
+**FRONTEND V1** — pool discovery, pool page, TradingView-style candlestick chart, swap card,
+add/remove liquidity, NFT marketplace, wallet/provider connection, transaction/history UI.
+
+---
+
 # END-OF-RUN CHECKPOINT (2026-09-25) — unified multi-hop route (XTM → TARI → AMM)
 
 > Supersedes only the facts it contradicts below; all prior checkpoint sections are retained.
