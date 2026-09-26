@@ -230,16 +230,30 @@ class TariBridgeWalletAdapter implements WalletBridge {
     if (reviewedRequest === undefined || reviewedRequest === null || typeof reviewedRequest !== 'object') {
       throw new TariProviderError('Refusing to sign: no reviewed transaction request was supplied.', 'REJECTED');
     }
+    // `buildWalletRequest` produces `{ transaction, display }`, which is already
+    // the provider's documented envelope. `signAndSubmit` wraps whatever it is
+    // given as `{ transaction: <payload>, display: <expectation> }`, so the
+    // reviewed request's OWN `transaction` member is what must be handed over.
+    // Passing the whole envelope instead produced a `transaction.transaction`
+    // on the wire, which no wallet is documented to expect.
+    const payload = (reviewedRequest as { transaction?: unknown }).transaction;
+    if (payload === undefined || payload === null || typeof payload !== 'object') {
+      throw new TariProviderError('Refusing to sign: the reviewed request has no transaction body.', 'REJECTED');
+    }
+    const reviewedDisplay = (reviewedRequest as { display?: { assets?: string[]; operation?: string; network?: string; account?: string } }).display;
     const result = await signAndSubmit(
       this.provider,
-      { ...reviewedRequest, display: { ...(preview.privacyDisclosure === undefined ? {} : { disclosure: preview.privacyDisclosure }) } },
+      payload as Record<string, unknown>,
       {
-        assets: context.assets,
-        operation: context.operation,
-        network: context.network,
+        // Prefer the assets stated in the review: they are the amounts the user
+        // actually approved, not a re-derivation from the preview.
+        assets: reviewedDisplay?.assets ?? context.assets,
+        operation: reviewedDisplay?.operation ?? context.operation,
+        network: reviewedDisplay?.network ?? context.network,
         poolOrDestination: context.poolOrDestination,
       },
     );
+    void preview;
     return { transactionId: result.transactionId, epoch: result.epoch === undefined ? 0 : Number(result.epoch), status: 'pending' };
   }
 
