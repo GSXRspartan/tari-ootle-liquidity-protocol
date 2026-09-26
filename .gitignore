@@ -8,3 +8,11 @@ target/
 !.env.example
 *.log
 .DS_Store
+
+# Browser security harness output. Failure artefacts are CI diagnostics, not
+# source, and `test-results/` can hold large traces.
+test-results/
+playwright-report/
+blob-report/
+*.tsbuildinfo
+
