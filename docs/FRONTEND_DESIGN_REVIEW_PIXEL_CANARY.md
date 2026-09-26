@@ -120,12 +120,16 @@ controls because the chart owns its own container and its own effect cleanup.
 
 What is missing, in order of value:
 
-1. **A visible "backfill only, not live" statement.** `MarketDataService.follow()`
-   is never called, so the chart never updates while the page is open, while the
-   interface implies a live market. This is the most misleading thing in the
-   current interface and should be fixed either by wiring `follow()` with a real
-   discovery source, or by saying so.
-2. A no-data-yet skeleton distinct from a no-trades-ever empty state.
+1. **A statement of what the chart can actually be.** `AppContext` constructs
+   `MarketDataService` with `pools: []`, no `TradeDiscoverySource` and no
+   readback, so the indexer is never constructed: no trade is ever stored and
+   every pool reports an unavailable market-data state, while the interface
+   implies a live market. Either a real discovery source is wired, or the chart
+   says plainly that indexed data is not available in this build. This is the
+   most misleading thing in the current client.
+2. `MarketDataService.follow()` and `Bundle.stop()` are exported and called
+   from nowhere, so there is neither a live subscription nor a cleanup path
+   yet. A no-data-yet skeleton distinct from a no-trades-ever empty state.
 3. A stale marker *on the chart frame*, not only in the header badge, so a
    screenshot of the chart carries its own freshness.
 

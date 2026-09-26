@@ -101,8 +101,12 @@ in the app — the right shape.
 **2.5 Dead and misleading code.** `PoolHealthBadge` looked a pool up and discarded
 it (`void pool`), reading as a resolved per-pool state that did not exist (now
 removed). `MarketDataService.follow()` and `Bundle.stop()` are exported but called
-from nowhere, so charts are backfill-only — a fact the UI does not state. These
-are honesty defects rather than security ones, and they are recorded because "the
+from nowhere — and, more importantly, `AppContext` never supplies a
+`TradeDiscoverySource`, so the indexer is never constructed and **no trade is
+ever stored in the browser at all**. The protocol-client market-data subsystem
+is complete and tested; the application has not connected it, and the UI does
+not say so. These are honesty defects rather than security ones, and they are
+recorded because "the
 
 ---
 
