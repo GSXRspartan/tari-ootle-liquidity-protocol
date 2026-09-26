@@ -10,7 +10,7 @@
  * explicit statement that it is not guaranteed best execution.
  */
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { resolveBuyNow, resolveSellNow, type MarketplaceResolution } from '@tari-ootle/protocol-client';
 import { marketplaceReadbackFrom, type MarketplaceSource, type NftDescriptor } from '../services/marketplace.js';
 import { loadNftMetadata, type NftMetadata } from '../services/nftMetadata.js';
@@ -30,10 +30,10 @@ import { Badge, Card, CardHeader, DataRow, EmptyState, Notice } from './primitiv
  */
 function failureStatus(error: unknown, operation: string): { tone: 'warn' | 'danger'; title: string; detail: string } {
   if (error instanceof IdentityChangedError) {
-    return { tone: 'warn', title: `Not submitted — wallet changed`, detail: `${error.message} Nothing was signed.` };
+    return { tone: 'warn', title: `Not submitted ï¿½ wallet changed`, detail: `${error.message} Nothing was signed.` };
   }
   if (error instanceof ReviewMismatchError) {
-    return { tone: 'danger', title: 'Not submitted — review mismatch', detail: error.message };
+    return { tone: 'danger', title: 'Not submitted ï¿½ review mismatch', detail: error.message };
   }
   return { tone: 'danger', title: `${operation} not submitted`, detail: normalizeError({ error }).message };
 }
@@ -56,6 +56,14 @@ export function NftDetailPanel({
   const [quoteResource, setQuoteResource] = useState<string | undefined>(undefined);
   const [status, setStatus] = useState<{ tone: 'warn' | 'danger' | 'info'; title: string; detail: string } | undefined>(undefined);
   const [busy, setBusy] = useState(false);
+  /**
+   * Synchronous submission guard. usy is React state, so it stays alse
+   * for every click that lands before the re-render, and a rapid double click
+   * starts two submissions and creates two durable operations. A ref is
+   * updated in the same tick, so the second click is refused. The same guard
+   * covers buy and sell, which must not run concurrently against one wallet.
+   */
+  const submitGuard = useRef(false);
   const [route, setRoute] = useState<MarketplaceResolution<MarketplaceTransactionIntent> | undefined>(undefined);
 
   useEffect(() => {
@@ -81,7 +89,9 @@ export function NftDetailPanel({
   const canAct = wallet.status === 'CONNECTED' && readbackProvider !== undefined;
 
   const buyNow = async () => {
+    if (submitGuard.current) return;
     if (readbackProvider === undefined || quoteResource === undefined || item?.listingAddress === undefined) return;
+    submitGuard.current = true;
     setBusy(true);
     setStatus(undefined);
     try {
@@ -110,12 +120,15 @@ export function NftDetailPanel({
     } catch (error) {
       setStatus(failureStatus(error, 'Buy now'));
     } finally {
+      submitGuard.current = false;
       setBusy(false);
     }
   };
 
   const sellNow = async () => {
+    if (submitGuard.current) return;
     if (readbackProvider === undefined || quoteResource === undefined) return;
+    submitGuard.current = true;
     setBusy(true);
     setStatus(undefined);
     try {
@@ -144,6 +157,7 @@ export function NftDetailPanel({
     } catch (error) {
       setStatus(failureStatus(error, 'Sell now'));
     } finally {
+      submitGuard.current = false;
       setBusy(false);
     }
   };
@@ -164,10 +178,19 @@ export function NftDetailPanel({
     // The review is built from the READBACK values the resolver used, never from
     // the discovery payload the user saw first. If they differ, the resolver has
     // already returned STALE and execution never reaches this point.
+    // The review is bound to the SIGNER, not to the asset. It previously carried
+    // the input asset's resource address in both ternary branches, so every NFT
+    // review claimed an account that was not the connected wallet, and the
+    // account check in the differential review could never mean anything.
+    const settlementAccount = wallet.account;
+    if (settlementAccount === undefined || settlementAccount === '') {
+      setStatus({ tone: 'danger', title: 'Not submitted', detail: 'No connected account is available to bind this review to.' });
+      return;
+    }
     const review = createReview({
       operationId: newOperationId('nft'),
       network: wallet.networkId ?? 'unknown',
-      account: outcome.route.inputAsset.nftId === undefined ? outcome.route.inputAsset.resourceAddress : outcome.route.inputAsset.resourceAddress,
+      account: settlementAccount,
       identity,
       legs: [
         {
@@ -324,5 +347,7 @@ export function NftDetailPanel({
     </div>
   );
 }
+
+
 
 

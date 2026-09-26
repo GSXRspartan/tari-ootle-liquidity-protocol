@@ -11,7 +11,8 @@
     "lint": "echo 'No lint'",
     "build:test": "tsc -p tsconfig.test.json && node ./test/write-cjs-marker.mjs",
     "test": "npm run build:test && node --test test/*.test.cjs",
-    "test:e2e": "npm run build && playwright test",
+    "test:e2e": "npm run build && playwright test --project=chromium-desktop --project=chromium-mobile",
+    "test:e2e:all": "npm run build && playwright test",
     "test:e2e:install": "playwright install --with-deps chromium firefox"
   },
   "dependencies": {

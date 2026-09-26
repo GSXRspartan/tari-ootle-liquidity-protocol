@@ -310,6 +310,141 @@ export function diffReviewAgainstIntent(review: TransactionReview, intent: AmmIn
   return { ok: mismatches.length === 0, mismatches };
 }
 
+// ===========================================================================
+// MARKETPLACE / NFT INTENT
+// ===========================================================================
+
+/** The subset of a marketplace intent the review must agree with. */
+export interface MarketplaceIntentLike {
+  operation: string;
+  target: { componentOrOrderId?: string; nftResource: string; nftId?: string; quoteResource: string; amount?: string };
+  calls: Array<{ componentAddress?: string; method: string; args: Array<string | number | unknown> }>;
+  instructions: Array<{ kind: string; accountAddress?: string; resourceAddress?: string; nftResource?: string; nftId?: string; amount?: string }>;
+}
+
+const MARKETPLACE_OPERATION_PREFIX: ReadonlySet<string> = new Set([
+  'create_listing',
+  'cancel_listing',
+  'buy_listing',
+  'create_item_offer',
+  'cancel_item_offer',
+  'accept_item_offer',
+  'refund_expired_item_offer',
+  'create_collection_bid',
+  'fill_collection_bid',
+  'cancel_collection_bid',
+]);
+
+/** True when the intent is a marketplace intent rather than an AMM intent. */
+export function isMarketplaceIntent(intent: unknown): boolean {
+  const record = intent as { operation?: unknown; target?: unknown } | undefined;
+  if (record === undefined || record === null) return false;
+  if (typeof record.operation !== 'string') return false;
+  if (!MARKETPLACE_OPERATION_PREFIX.has(record.operation)) return false;
+  return typeof record.target === 'object' && record.target !== null;
+}
+
+/**
+ * Differential review for a marketplace intent.
+ *
+ * The AMM differential cannot be reused here: a marketplace intent has no pool
+ * and no settlement account, so an AMM comparison would report a mismatch on
+ * every single NFT trade and block the feature outright. The invariants are the
+ * same in spirit - the review must name the same order, the same NFT, the same
+ * amount, and the wallet request must carry them.
+ */
+export function diffReviewAgainstMarketplaceIntent(review: TransactionReview, intent: MarketplaceIntentLike): ReviewDiff {
+  const mismatches: string[] = [];
+  if (review.legs.length !== 1) {
+    mismatches.push(`expected exactly one leg for a marketplace intent, found ${review.legs.length}`);
+  }
+  const leg = review.legs[0];
+  if (leg === undefined) return { ok: false, mismatches };
+
+  // The leg must name the order or listing the intent targets.
+  if (leg.componentAddress !== intent.target.componentOrOrderId) {
+    mismatches.push(`target: review ${String(leg.componentAddress)} != intent ${String(intent.target.componentOrOrderId)}`);
+  }
+
+  // The signed-in account must be the account the intent settles from. This is
+  // the check that catches a review bound to an asset address instead of the
+  // signer, which would let any review "match" an unrelated account.
+  for (const instruction of intent.instructions) {
+    if (instruction.accountAddress !== undefined && instruction.accountAddress !== review.account) {
+      mismatches.push(`account: review ${review.account} != intent settlement account ${instruction.accountAddress}`);
+    }
+  }
+
+  // The NFT the intent moves must be the NFT the user was shown.
+  const nftLeg = leg.amounts.find((amount) => amount.nftId !== undefined);
+  if (intent.target.nftId !== undefined) {
+    if (nftLeg === undefined) {
+      mismatches.push(`the intent moves NFT ${intent.target.nftId} but the review shows no NFT`);
+    } else if (nftLeg.nftId !== intent.target.nftId) {
+      mismatches.push(`nftId: review ${String(nftLeg.nftId)} != intent ${intent.target.nftId}`);
+    } else if (nftLeg.resourceAddress !== intent.target.nftResource) {
+      mismatches.push(`nftResource: review ${nftLeg.resourceAddress} != intent ${intent.target.nftResource}`);
+    }
+  }
+
+  // Every fungible amount the intent moves must appear in the review unchanged.
+  for (const instruction of intent.instructions) {
+    if (instruction.kind !== 'withdraw_fungible' && instruction.kind !== 'deposit_fungible') continue;
+    const resource = instruction.resourceAddress;
+    const amount = instruction.amount;
+    if (resource === undefined || amount === undefined) continue;
+    const stated = leg.amounts.some((entry) => entry.resourceAddress === resource && entry.amountRaw === amount);
+    if (!stated) {
+      mismatches.push(`the intent moves ${amount} of ${resource} but the review does not state that amount`);
+    }
+  }
+
+  // The method must be one the intent actually calls.
+  const methods = new Set(intent.calls.map((call) => call.method));
+  if (methods.size > 0 && !methods.has(leg.method)) {
+    mismatches.push(`method: the review shows "${leg.method}" but the intent calls ${[...methods].join(', ')}`);
+  }
+
+  // And the wallet request must carry the reviewed leg, not merely resemble it.
+  const request = review.walletRequest as {
+    transaction?: { legs?: Array<{ componentAddress?: string; method?: string; args?: Array<{ resourceAddress?: string; amountRaw?: string; nftId?: string }> }> };
+  };
+  const requestLeg = request.transaction?.legs?.[0];
+  if (requestLeg === undefined) {
+    mismatches.push('the wallet request has no leg');
+  } else {
+    if (requestLeg.componentAddress !== leg.componentAddress) {
+      mismatches.push('the wallet request names a different order than the review');
+    }
+    if (requestLeg.method !== leg.method) {
+      mismatches.push('the wallet request calls a different method than the review');
+    }
+    for (const amount of leg.amounts) {
+      const sent = requestLeg.args?.find((arg) => arg.resourceAddress === amount.resourceAddress);
+      if (sent === undefined || sent.amountRaw !== amount.amountRaw) {
+        mismatches.push(`the wallet request does not carry ${amount.amountRaw} of ${amount.resourceAddress}`);
+      }
+    }
+  }
+
+  return { ok: mismatches.length === 0, mismatches };
+}
+
+/**
+ * Dispatch to the differential that matches the intent.
+ *
+ * Guessing wrong here is not cosmetic: running the AMM comparison against a
+ * marketplace intent blocks every NFT trade, and running the marketplace
+ * comparison against an AMM intent would skip the min_output and pool checks.
+ */
+export function diffReviewForIntent(review: TransactionReview, intent: unknown): ReviewDiff {
+  if (isMarketplaceIntent(intent)) {
+    return diffReviewAgainstMarketplaceIntent(review, intent as MarketplaceIntentLike);
+  }
+  return diffReviewAgainstIntent(review, intent as AmmIntentLike);
+}
+
+
 /** A stable digest of the review, used to detect a change across a modal. */
 export function reviewFingerprint(review: TransactionReview): string {
   const material = JSON.stringify({

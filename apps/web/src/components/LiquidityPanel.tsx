@@ -12,7 +12,7 @@
  *     protocol derives them defensibly yet
  */
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { resolveAddLiquidity, resolveRemoveLiquidity } from '@tari-ootle/protocol-client';
 import { ammLiquidityIntentBuilder, toAmmPreview, type AmmTransactionIntent } from '@tari-ootle/wallet-adapter';
 import { useApp } from '../state/AppContext.js';
@@ -42,6 +42,14 @@ export function LiquidityPanel({ pool }: { pool: PoolDescriptor }) {
     | undefined
   >(undefined);
   const [busy, setBusy] = useState(false);
+  /**
+   * Synchronous submission guard. `busy` is React state, so it is still `false`
+   * for every click that lands before the re-render: two rapid clicks both read
+   * `busy === false` and both start a submission, creating two durable
+   * operations. A ref is updated in the same tick, so the second click is
+   * refused. State still drives the disabled attribute for the visual.
+   */
+  const submitGuard = useRef(false);
 
   const canRead = wallet.status === 'CONNECTED' && readback() !== undefined;
   const balanceA = balanceOf(pool.base.resourceAddress);
@@ -101,13 +109,15 @@ export function LiquidityPanel({ pool }: { pool: PoolDescriptor }) {
   }, [mode, resolveAdd, resolveRemove]);
 
   const submit = useCallback(async () => {
-    const wallets = executionWallets();
-    const bridge = walletBridge();
-    if (wallets === undefined || bridge === undefined) return;
-    if (busy) return; // double-submit guard
+    // Claimed before any await, and released in a finally block below.
+    if (submitGuard.current) return;
+    submitGuard.current = true;
     setBusy(true);
     setMessage(undefined);
     try {
+      const wallets = executionWallets();
+      const bridge = walletBridge();
+      if (wallets === undefined || bridge === undefined) return;
       const identity = liveExecutionIdentity();
       if (identity === undefined) {
         setMessage({ tone: 'danger', title: 'Not submitted', detail: 'No verified wallet identity is available for this operation.' });
@@ -183,9 +193,10 @@ export function LiquidityPanel({ pool }: { pool: PoolDescriptor }) {
         setMessage({ tone: 'danger', title: 'Not submitted', detail: normalizeError({ error }).message });
       }
     } finally {
+      submitGuard.current = false;
       setBusy(false);
     }
-  }, [executionWallets, walletBridge, liveExecutionIdentity, preview, mode, readback, pool, amountA, amountB, lpAmount, wallet.networkId, busy]);
+  }, [executionWallets, walletBridge, liveExecutionIdentity, preview, mode, readback, pool, amountA, amountB, lpAmount, wallet.networkId]);
 
   return (
     <Card className="stack">
@@ -288,4 +299,5 @@ export function LiquidityPanel({ pool }: { pool: PoolDescriptor }) {
     </Card>
   );
 }
+
 

@@ -1005,3 +1005,199 @@ test('persisted history: the live read path is the validating parser, not a raw 
 });
 
 
+
+// ===========================================================================
+// SHOWN == SIGNED: THE REVIEWED REQUEST IS WHAT REACHES THE SIGNER
+// ===========================================================================
+
+test('signing: the reviewed request is required and is sent verbatim, not re-derived', () => {
+  const service = fsx.readFileSync(pathx.join(srcRootX, 'services', 'walletService.ts'), 'utf8');
+  const start = service.indexOf('async signAndSubmitReviewed(');
+  assert.notEqual(start, -1, 'the bridge must expose a signing path that takes the reviewed request');
+  const body = service.slice(start, service.indexOf('\n  async ', start + 10));
+  // The payload sent to the provider is the reviewed request itself.
+  assert.match(body, /reviewedRequest/, 'the reviewed request must reach the provider call');
+  assert.equal(
+    /\{\s*method:\s*preview\.method,\s*args:\s*preview\.args/.test(body),
+    false,
+    'the signing path must not rebuild a {method,args,component} payload from the preview',
+  );
+  // And an absent reviewed request is a refusal, not a silent fallback.
+  assert.match(body, /Refusing to sign/, 'signing without a reviewed request must be refused');
+});
+
+test('signing: execution passes the reviewed request and requires it to be frozen', () => {
+  const execution = fsx.readFileSync(pathx.join(srcRootX, 'services', 'execution.ts'), 'utf8');
+  // The reviewed request reaches the wallet through a typed parameter.
+  assert.match(execution, /reviewedRequest: Readonly<Record<string, unknown>>/, 'the signing seam must require the reviewed request');
+  assert.match(execution, /wallets\.signAndSubmit\(envelope\.preview, input\.context, input\.review\.walletRequest\)/);
+  // The old cast smuggled an untyped field onto a preview and was dropped by
+  // every downstream consumer, so the reviewed request never reached the signer.
+  assert.equal(/request:\s*input\.review\.walletRequest\s*\}\s*as TransactionPreview/.test(execution), false, 'the reviewed request must not be smuggled onto a preview via a cast');
+  // Immutability of the review and its request is enforced, not assumed.
+  assert.match(execution, /Object\.isFrozen\(input\.review\)/, 'the review must be verified frozen at signing time');
+  assert.match(execution, /Object\.isFrozen\(input\.review\.walletRequest\)/, 'the reviewed request must be verified frozen at signing time');
+});
+
+test('signing: the removed tautology cannot come back', () => {
+  const execution = fsx.readFileSync(pathx.join(srcRootX, 'services', 'execution.ts'), 'utf8');
+  // A comparison of a value with itself can never be true, so this "gate" could
+  // never reject anything while reading as an instability check.
+  const tautologies = execution.match(/(\w+(?:\([^()]*\))?)\s*!==\s*\1/g) ?? [];
+  assert.deepEqual(tautologies, [], `found a self-comparison that can never fail: ${tautologies.join(', ')}`);
+});
+
+test('review: an NFT review is bound to the signer, not to the asset', () => {
+  const panel = fsx.readFileSync(pathx.join(srcRootX, 'components', 'NftDetailPanel.tsx'), 'utf8');
+  const start = panel.indexOf('const review = createReview(');
+  assert.notEqual(start, -1);
+  const block = panel.slice(start, start + 600);
+  // The account must be the connected wallet account.
+  assert.match(block, /account:\s*settlementAccount/, 'the review account must be the connected wallet account');
+  // The previous form had two identical ternary branches, so `account` was
+  // always the input asset's resource address and never the signer.
+  assert.equal(
+    /account:\s*[^,\n]*\?\s*outcome\.route\.inputAsset\.resourceAddress\s*:\s*outcome\.route\.inputAsset\.resourceAddress/.test(block),
+    false,
+    'the review account must not be the input asset resource address',
+  );
+  assert.match(panel, /settlementAccount === undefined/, 'a missing account must block submission rather than bind to the asset');
+});
+
+test('review: a marketplace intent is diffed with the marketplace rules', () => {
+  const review = require('../build-test/lib/review.js');
+  // The AMM comparison has no pool and no settlement account to read, so it
+  // cannot be used for a marketplace intent: it reported a mismatch on every
+  // NFT trade, which would have blocked the feature rather than secured it.
+  assert.equal(typeof review.isMarketplaceIntent, 'function');
+  assert.equal(typeof review.diffReviewAgainstMarketplaceIntent, 'function');
+  assert.equal(typeof review.diffReviewForIntent, 'function');
+
+  assert.equal(review.isMarketplaceIntent({ operation: 'buy_listing', target: { nftResource: 'r' } }), true);
+  assert.equal(review.isMarketplaceIntent({ operation: 'swap', poolComponent: 'p', settlement: {} }), false);
+  assert.equal(review.isMarketplaceIntent(undefined), false);
+  // An operation name that merely looks marketplace-ish, with no target, is not
+  // classified as one, so a malformed intent falls through to the AMM rules.
+  assert.equal(review.isMarketplaceIntent({ operation: 'buy_listing' }), false);
+});
+
+test('review: a marketplace differential rejects a review bound to the wrong account', () => {
+  const { createReview, diffReviewAgainstMarketplaceIntent, isMarketplaceIntent } = require('../build-test/lib/review.js');
+  const identity = { nonce: 'n1', providerRef: {}, providerFingerprint: 'p', expectedNetwork: 'esmeralda', providerNetwork: 'esmeralda', account: 'otl_account_A', capabilityFingerprint: 'c', capturedAtUnixMs: 0 };
+  const intent = {
+    operation: 'buy_listing',
+    target: { componentOrOrderId: 'component_listing_1', nftResource: 'otl_nft_1', nftId: 'series#7', quoteResource: 'otl_wstable_0001', amount: '1000' },
+    calls: [{ method: 'buy_listing', args: [], componentAddress: 'component_listing_1' }],
+    instructions: [
+      { kind: 'withdraw_non_fungible', accountAddress: 'otl_account_B', nftResource: 'otl_nft_1', nftId: 'series#7' },
+      { kind: 'withdraw_fungible', accountAddress: 'otl_account_B', resourceAddress: 'otl_wstable_0001', amount: '1000' },
+    ],
+  };
+  assert.equal(isMarketplaceIntent(intent), true);
+
+  const build = (account) =>
+    createReview({
+      operationId: 'nft-1',
+      network: 'esmeralda',
+      account,
+      identity,
+      legs: [
+        {
+          operation: 'buy_listing',
+          componentAddress: 'component_listing_1',
+          method: 'buy_listing',
+          amounts: [
+            { resourceAddress: 'otl_nft_1', amountRaw: '0', role: 'INPUT', nftId: 'series#7' },
+            { resourceAddress: 'otl_wstable_0001', amountRaw: '1000', role: 'OUTPUT' },
+          ],
+        },
+      ],
+    });
+
+  // The account the intent settles from is the buyer's, so a review bound to
+  // anyone else must be rejected.
+  const wrong = diffReviewAgainstMarketplaceIntent(build('otl_account_A'), intent);
+  assert.equal(wrong.ok, false);
+  assert.ok(wrong.mismatches.some((m) => m.includes('account')), 'a review bound to a different account must be rejected');
+
+  const right = diffReviewAgainstMarketplaceIntent(build('otl_account_B'), intent);
+  assert.equal(right.ok, true, `expected a matching review to pass, got: ${right.mismatches.join('; ')}`);
+});
+
+test('review: a marketplace differential rejects a tampered amount', () => {
+  const { createReview, diffReviewAgainstMarketplaceIntent } = require('../build-test/lib/review.js');
+  const identity = { nonce: 'n1', providerRef: {}, providerFingerprint: 'p', expectedNetwork: 'esmeralda', providerNetwork: 'esmeralda', account: 'otl_account_B', capabilityFingerprint: 'c', capturedAtUnixMs: 0 };
+  const intent = {
+    operation: 'buy_listing',
+    target: { componentOrOrderId: 'component_listing_1', nftResource: 'otl_nft_1', nftId: 'series#7', quoteResource: 'otl_wstable_0001', amount: '1000' },
+    calls: [{ method: 'buy_listing', args: [], componentAddress: 'component_listing_1' }],
+    instructions: [{ kind: 'withdraw_fungible', accountAddress: 'otl_account_B', resourceAddress: 'otl_wstable_0001', amount: '1000' }],
+  };
+  // The review shows a different amount than the intent moves.
+  const review = createReview({
+    operationId: 'nft-2',
+    network: 'esmeralda',
+    account: 'otl_account_B',
+    identity,
+    legs: [
+      {
+        operation: 'buy_listing',
+        componentAddress: 'component_listing_1',
+        method: 'buy_listing',
+        amounts: [{ resourceAddress: 'otl_wstable_0001', amountRaw: '1', role: 'OUTPUT' }],
+      },
+    ],
+  });
+  const diff = diffReviewAgainstMarketplaceIntent(review, intent);
+  assert.equal(diff.ok, false);
+  assert.ok(diff.mismatches.some((m) => m.includes('1000') || m.includes('does not state that amount')));
+});
+
+test('review: a marketplace differential rejects a review for a different order', () => {
+  const { createReview, diffReviewAgainstMarketplaceIntent } = require('../build-test/lib/review.js');
+  const identity = { nonce: 'n1', providerRef: {}, providerFingerprint: 'p', expectedNetwork: 'esmeralda', providerNetwork: 'esmeralda', account: 'otl_account_B', capabilityFingerprint: 'c', capturedAtUnixMs: 0 };
+  const intent = {
+    operation: 'buy_listing',
+    target: { componentOrOrderId: 'component_listing_1', nftResource: 'otl_nft_1', nftId: 'series#7', quoteResource: 'otl_wstable_0001', amount: '1000' },
+    calls: [{ method: 'buy_listing', args: [], componentAddress: 'component_listing_1' }],
+    instructions: [{ kind: 'withdraw_fungible', accountAddress: 'otl_account_B', resourceAddress: 'otl_wstable_0001', amount: '1000' }],
+  };
+  const review = createReview({
+    operationId: 'nft-3',
+    network: 'esmeralda',
+    account: 'otl_account_B',
+    identity,
+    legs: [
+      {
+        operation: 'buy_listing',
+        componentAddress: 'component_listing_ATTACKER',
+        method: 'buy_listing',
+        amounts: [{ resourceAddress: 'otl_wstable_0001', amountRaw: '1000', role: 'OUTPUT' }],
+      },
+    ],
+  });
+  const diff = diffReviewAgainstMarketplaceIntent(review, intent);
+  assert.equal(diff.ok, false);
+  assert.ok(diff.mismatches.some((m) => m.includes('target')), 'a different order must be rejected');
+});
+
+test('double submit: every submission path uses a synchronous in-flight guard', () => {
+  // `busy` state is asynchronous: two clicks in one tick both read false and
+  // both start a submission, creating two durable operations. A ref is claimed
+  // before the first await, so only the same pattern closes the window.
+  for (const file of ['SwapCard.tsx', 'LiquidityPanel.tsx', 'NftDetailPanel.tsx']) {
+    const source = fsx.readFileSync(pathx.join(srcRootX, 'components', file), 'utf8');
+    assert.match(source, /useRef\(false\)/, `${file} must hold a synchronous submission guard`);
+    // The refusal may be a bare return or a guarded block with a comment; what
+    // matters is that the claim is tested before it is set.
+    assert.match(source, /if \(submitGuard\.current\)/, `${file} must test the guard before claiming it`);
+    const claimed = source.indexOf('if (submitGuard.current)');
+    const set = source.indexOf('submitGuard.current = true;');
+    assert.ok(claimed !== -1 && set > claimed, `${file} must check the guard before claiming it`);
+    assert.match(source, /submitGuard\.current = false;/, `${file} must release the guard, or the panel locks forever`);
+  }
+  // The guard must be released in a finally block, so a thrown error does not
+  // leave the panel permanently disabled.
+  const liquidity = fsx.readFileSync(pathx.join(srcRootX, 'components', 'LiquidityPanel.tsx'), 'utf8');
+  assert.match(liquidity, /finally \{\s*submitGuard\.current = false;/, 'the guard must be released in a finally block');
+});

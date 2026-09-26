@@ -52,6 +52,16 @@ export interface WalletBridge extends WalletAdapter {
   providerObject(): object;
   /** A live identity snapshot, for TOCTOU verification before authorization. */
   liveIdentity(sessionNonce: string): Promise<LiveIdentityInput>;
+  /**
+   * Sign the exact request that was reviewed. Preferred over `signAndSubmit`
+   * for any financial operation, because it does not re-derive the payload from
+   * a preview and therefore cannot drift from what the user approved.
+   */
+  signAndSubmitReviewed(
+    preview: TransactionPreview,
+    reviewedRequest: Readonly<Record<string, unknown>>,
+    context: { assets: string[]; operation: string; network: string; poolOrDestination: string; privacyDisclosure: string },
+  ): Promise<TransactionResult>;
 }
 
 function toNetworkInfo(view: { network: string; epoch?: string }, previous?: NetworkInfo): NetworkInfo {
@@ -196,6 +206,41 @@ class TariBridgeWalletAdapter implements WalletBridge {
       networkName: (await this.getNetwork()).name,
     };
     return { ...preview, ...full };
+  }
+
+  /**
+   * Sign and submit the request the user actually reviewed.
+   *
+   * The reviewed request is sent VERBATIM. The older shape rebuilt a
+   * `{ method, args, component }` payload from the preview, which silently
+   * discarded the reviewed legs, the minimum output, and the per-resource
+   * amounts, leaving "shown == signed" to rest on two independent derivations
+   * of the same intent happening to agree. A reviewed request is now mandatory
+   * for a financial operation, and there is deliberately no fallback: a signer
+   * that cannot be handed the exact reviewed request must not be driven at all.
+   *
+   * The preview is still sent alongside for host wallets that display it, but it
+   * is derived from the same review, so the two cannot disagree.
+   */
+  async signAndSubmitReviewed(
+    preview: TransactionPreview,
+    reviewedRequest: Readonly<Record<string, unknown>>,
+    context: { assets: string[]; operation: string; network: string; poolOrDestination: string; privacyDisclosure: string },
+  ): Promise<TransactionResult> {
+    if (reviewedRequest === undefined || reviewedRequest === null || typeof reviewedRequest !== 'object') {
+      throw new TariProviderError('Refusing to sign: no reviewed transaction request was supplied.', 'REJECTED');
+    }
+    const result = await signAndSubmit(
+      this.provider,
+      { ...reviewedRequest, display: { ...(preview.privacyDisclosure === undefined ? {} : { disclosure: preview.privacyDisclosure }) } },
+      {
+        assets: context.assets,
+        operation: context.operation,
+        network: context.network,
+        poolOrDestination: context.poolOrDestination,
+      },
+    );
+    return { transactionId: result.transactionId, epoch: result.epoch === undefined ? 0 : Number(result.epoch), status: 'pending' };
   }
 
   async signAndSubmit(preview: TransactionPreview): Promise<TransactionResult> {

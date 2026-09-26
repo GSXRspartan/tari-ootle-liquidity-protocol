@@ -25,7 +25,17 @@ export default defineConfig({
   projects: [
     { name: 'chromium-desktop', use: { ...devices['Desktop Chrome'], viewport: { width: 1440, height: 900 } } },
     { name: 'chromium-mobile', use: { ...devices['Pixel 7'] } },
-    { name: 'firefox-desktop', use: { ...devices['Desktop Firefox'], viewport: { width: 1440, height: 900 } } },
+    {
+      // Firefox coverage is CI-only. The Playwright-managed Firefox build is not
+      // installed on every developer machine, and on a GPU-less host its
+      // software WebRender exhausts memory across a full suite run
+      // ("wr_renderer_render: OutOfMemory"), failing a different test each time
+      // by pure contention. Forcing the basic compositor does not fix it, so
+      // local runs use Chromium (see the `test:e2e` scripts) and CI installs
+      // and runs Firefox on a real runner.
+      name: 'firefox-desktop',
+      use: { ...devices['Desktop Firefox'], viewport: { width: 1440, height: 900 } },
+    },
   ],
   // The mock provider is installed per page, so tests must not share state.
   fullyParallel: true,

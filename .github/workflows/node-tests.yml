@@ -88,8 +88,11 @@ jobs:
       - name: Install Playwright browsers
         run: pnpm --filter @tari-ootle/web exec playwright install --with-deps chromium firefox
 
+      # `test:e2e:all` includes Firefox, which the local script omits: the
+      # Playwright Firefox build is not present on every developer machine.
+      # This runner has it, so cross-engine coverage is gated here.
       - name: Browser security flows
-        run: pnpm --filter @tari-ootle/web run test:e2e
+        run: pnpm --filter @tari-ootle/web run test:e2e:all
 
       - name: Upload failure artifacts
         if: failure()

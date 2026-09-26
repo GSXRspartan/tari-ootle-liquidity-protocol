@@ -74,6 +74,7 @@ export interface ExecutionWalletsLike {
   signAndSubmit(
     preview: import('@tari-ootle/wallet-adapter').TransactionPreview,
     context: { assets: string[]; operation: string; network: string; poolOrDestination: string; privacyDisclosure: string },
+    reviewedRequest: Readonly<Record<string, unknown>>,
   ): Promise<import('@tari-ootle/wallet-adapter').TransactionResult>;
   getTransactionStatus(txId: string): Promise<{ status: string; epoch?: number; error?: string }>;
 }
@@ -253,12 +254,18 @@ export function AppProvider({
     if (bridge === undefined || wallet.status !== 'CONNECTED') return undefined;
     return {
       preview: (preview) => bridge.previewTransaction(preview),
-      signAndSubmit: (preview, context) =>
-        bridge.signAndSubmit({
-          ...preview,
-          networkName: context.network,
-          privacyDisclosure: context.privacyDisclosure,
-        }),
+      signAndSubmit: (preview, context, reviewedRequest) =>
+        // The reviewed request is forwarded, not re-derived, so the payload the
+        // provider signs is the one the user approved.
+        bridge.signAndSubmitReviewed(
+          {
+            ...preview,
+            networkName: context.network,
+            privacyDisclosure: context.privacyDisclosure,
+          },
+          reviewedRequest,
+          context,
+        ),
       getTransactionStatus: (txId) => bridge.getTransactionStatus(txId),
     };
   }, [wallet.status]);

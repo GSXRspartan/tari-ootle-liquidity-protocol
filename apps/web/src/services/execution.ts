@@ -34,12 +34,23 @@ import { toAmmPreview, toMarketplacePreview } from '@tari-ootle/wallet-adapter';
 import { historyStore } from './history.js';
 import { asRawExecutionAmount, asResourceAddress } from '../lib/tradeBoundary.js';
 import { verifyIdentity, type ExecutionIdentity, type LiveIdentityInput, type IdentityCheck } from '../lib/executionIdentity.js';
-import { diffReviewAgainstIntent, reviewFingerprint, type TransactionReview } from '../lib/review.js';
+import { diffReviewForIntent, type TransactionReview } from '../lib/review.js';
 
 export interface ExecutionWallets {
   /** The generic wallet seam. */
   preview(preview: Partial<TransactionPreview>): Promise<TransactionPreview>;
-  signAndSubmit(preview: TransactionPreview, context: SigningContext): Promise<TransactionResult>;
+  /**
+   * `reviewedRequest` is the frozen request built from the review the user
+   * approved. It is REQUIRED and is what the provider is asked to sign, so the
+   * bytes that reach the signer are the bytes that were on screen. Re-deriving
+   * the payload from a preview at this point would leave "shown == signed"
+   * resting on two independent code paths happening to agree.
+   */
+  signAndSubmit(
+    preview: TransactionPreview,
+    context: SigningContext,
+    reviewedRequest: Readonly<Record<string, unknown>>,
+  ): Promise<TransactionResult>;
   getTransactionStatus(txId: string): Promise<{ status: string; epoch?: number; error?: string }>;
 }
 
@@ -152,17 +163,26 @@ export async function executeSwap<TIntent>(wallets: ExecutionWallets, input: Exe
   const check = verifyIdentity(input.identity, input.liveIdentity);
   if (!check.ok) throw new IdentityChangedError(check);
 
-  // Gate 2: the review must describe the intent.
-  const diff = diffReviewAgainstIntent(input.review, input.resolvedIntent as unknown as Parameters<typeof diffReviewAgainstIntent>[1]);
+  // Gate 2: the review must describe the intent, using the differential that
+  // matches the intent kind.
+  const diff = diffReviewForIntent(input.review, input.resolvedIntent);
   if (!diff.ok) throw new ReviewMismatchError(diff.mismatches);
-  if (reviewFingerprint(input.review) !== reviewFingerprint(input.review)) throw new ReviewMismatchError(['review fingerprint is unstable']);
+
+  // Gate 3: the request that will be signed must be derived from THIS review, and
+  // it must be immutable. A review that is not deeply frozen can be mutated
+  // between approval and signing, which would make every field checked above a
+  // statement about the past rather than about what is about to be sent.
+  if (!Object.isFrozen(input.review)) throw new ReviewMismatchError(['the review is not frozen and cannot be trusted at signing time']);
+  if (!Object.isFrozen(input.review.walletRequest)) {
+    throw new ReviewMismatchError(['the reviewed wallet request is not frozen and cannot be trusted at signing time']);
+  }
 
   const transport: SigningTransport<WalletEnvelope> = {
     construct: (resolvedIntent: unknown) => ({ preview: input.toPreview(resolvedIntent as TIntent) }),
     async sign(envelope: WalletEnvelope) {
       // The provider receives the request generated from the frozen review, so
       // the amounts it is asked to sign are the amounts the user was shown.
-      const result = await wallets.signAndSubmit({ ...envelope.preview, request: input.review.walletRequest } as TransactionPreview, input.context);
+      const result = await wallets.signAndSubmit(envelope.preview, input.context, input.review.walletRequest);
       return { ...envelope, transactionId: result.transactionId, epoch: result.epoch };
     },
     async submit(signed: WalletEnvelope) {
