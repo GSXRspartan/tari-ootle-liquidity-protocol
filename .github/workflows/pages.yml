@@ -2,7 +2,8 @@ name: Deploy to GitHub Pages
 
 # NOT A SUPPORTED PRODUCTION TARGET.
 #
-# The supported host is Cloudflare Pages (`wrangler.jsonc` + `apps/web/public/_headers`), because
+# The supported host is Cloudflare Pages (`wrangler.jsonc` + the generated
+# `dist/_headers`), because
 # GitHub Pages cannot serve custom response headers at all. Deploying this app to Pages therefore
 # publishes it WITHOUT:
 #
