@@ -3,26 +3,26 @@ export interface IndexerProvider {
   networkName: string;
 }
 
-export * from './marketplace';
-export * from './execution';
-export * from './ootle';
-export * from './amm';
-export * from './history';
-export * from './execution_flow';
-export * from './chains/minotari';
-export * from './chains/minotari_grpc';
-export * from './multihop/types';
-export * from './multihop/proof';
-export * from './multihop/route';
-export * from './multihop/hops';
-export * from './multihop/compose';
-export * from './multihop/frontend';
-export * from './marketdata/price';
-export * from './marketdata/types';
-export * from './marketdata/candle';
-export * from './marketdata/store';
-export * from './marketdata/indexer';
-export * from './marketdata/api';
+export * from './marketplace.js';
+export * from './execution.js';
+export * from './ootle.js';
+export * from './amm.js';
+export * from './history.js';
+export * from './execution_flow.js';
+export * from './chains/minotari.js';
+export * from './chains/minotari_grpc.js';
+export * from './multihop/types.js';
+export * from './multihop/proof.js';
+export * from './multihop/route.js';
+export * from './multihop/hops.js';
+export * from './multihop/compose.js';
+export * from './multihop/frontend.js';
+export * from './marketdata/price.js';
+export * from './marketdata/types.js';
+export * from './marketdata/candle.js';
+export * from './marketdata/store.js';
+export * from './marketdata/indexer.js';
+export * from './marketdata/api.js';
 
 export interface IndexerResponse<T> {
   data: T;
@@ -186,3 +186,4 @@ export class ProtocolClient {
     return Promise.resolve({ healthy: true, primary: true, fallback: false });
   }
 }
+

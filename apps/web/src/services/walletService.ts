@@ -13,7 +13,7 @@
 import type { WalletAdapter, WalletSession, NetworkInfo, AccountInfo, Balance, ResourceInfo, TransactionPreview, TransactionResult } from '@tari-ootle/wallet-adapter';
 import type { PoolState, OotleReadbackProvider, AuthoritativeSubstateReader } from '@tari-ootle/protocol-client';
 import { createOotleReadbackProvider, parsePoolState } from '@tari-ootle/protocol-client';
-import type { WalletLegCapabilities } from '@tari-ootle/protocol-client/dist/crosschain/provider.js';
+import type { WalletLegCapabilities } from '@tari-ootle/protocol-client/crosschain';
 import {
   TariProviderError,
   disconnectProvider,
@@ -276,3 +276,4 @@ export function createWalletService(allowedNetworkId: string): WalletService {
   }
   return { bridge: () => bridge, allowedNetworkId };
 }
+

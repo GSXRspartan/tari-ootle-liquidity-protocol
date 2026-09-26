@@ -6,8 +6,8 @@
  * protocol-client's own constant rather than from hand-written copy.
  */
 
-import { BROWSER_MINOTARI_PROVIDER, BROWSER_PROVIDER_BLOCKER, requiredCapabilitiesFor, NO_WALLET_LEG_CAPABILITIES, type WalletLegCapabilities } from '@tari-ootle/protocol-client/dist/crosschain/provider.js';
-import type { SwapDirectionKind } from '@tari-ootle/protocol-client/dist/crosschain/provider.js';
+import { BROWSER_MINOTARI_PROVIDER, BROWSER_PROVIDER_BLOCKER, requiredCapabilitiesFor, NO_WALLET_LEG_CAPABILITIES, type WalletLegCapabilities } from '@tari-ootle/protocol-client/crosschain';
+import type { SwapDirectionKind } from '@tari-ootle/protocol-client/crosschain';
 
 export type { WalletLegCapabilities, SwapDirectionKind };
 
@@ -141,3 +141,4 @@ export function capabilityRows(capabilities: WalletLegCapabilities | undefined):
   }
   return rows;
 }
+

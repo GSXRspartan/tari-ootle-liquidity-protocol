@@ -11,7 +11,7 @@
  * closed because the required capability handshake is mandatory.
  */
 
-import { NO_WALLET_LEG_CAPABILITIES, type WalletLegCapabilities } from '@tari-ootle/protocol-client/dist/crosschain/provider.js';
+import { NO_WALLET_LEG_CAPABILITIES, type WalletLegCapabilities } from '@tari-ootle/protocol-client/crosschain';
 
 /** Verified method surface of the Tari dApp provider (docs/TARI_BROWSER_ATOMIC_SWAP_PROVIDER_GAP.md). */
 export const TARI_METHODS = {
@@ -322,3 +322,4 @@ export async function signAndSubmit(
   if (typeof reply.epoch === 'string' || typeof reply.epoch === 'number') result.epoch = String(reply.epoch);
   return result;
 }
+

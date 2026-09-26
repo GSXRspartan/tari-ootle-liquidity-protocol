@@ -1,6 +1,6 @@
 import { TransactionPreview } from './interface.js';
 import { MarketplaceTransactionIntent, buyListing, fillCollectionBid, acceptItemOffer, toMarketplacePreview } from './marketplace.js';
-import type { Listing, ItemOffer, CollectionBid, MarketplaceRouteBuilder } from '@tari-ootle/protocol-client/dist/marketplace.js';
+import type { Listing, ItemOffer, CollectionBid, MarketplaceRouteBuilder } from '@tari-ootle/protocol-client';
 
 /**
  * Bridges the protocol-client marketplace resolvers to the signer-agnostic builder

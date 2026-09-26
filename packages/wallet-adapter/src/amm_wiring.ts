@@ -1,4 +1,4 @@
-import type { SwapIntentBuilder, SwapQuote, LiquidityIntentBuilder } from '@tari-ootle/protocol-client/dist/amm.js';
+import type { SwapIntentBuilder, SwapQuote, LiquidityIntentBuilder } from '@tari-ootle/protocol-client';
 import { AmmTransactionIntent, buildSwapIntent, buildAddLiquidityIntent, buildRemoveLiquidityIntent, SwapIntentEvidenceQuote } from './amm.js';
 
 /**

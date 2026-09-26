@@ -2,8 +2,6 @@ import { resolve } from 'path';
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 
-const protocolClientSrc = resolve(__dirname, '../../packages/protocol-client/src');
-
 /**
  * The complete set of build-time inputs the app is allowed to read. Anything not
  * listed here cannot influence the bundle, which keeps the mainnet / dev-provider
@@ -25,18 +23,17 @@ function envBag(mode: string): Record<string, string | boolean | undefined> {
 export default defineConfig(({ mode }) => ({
   plugins: [react()],
   resolve: {
-    alias: [
-      // The existing convention: workspace packages are aliased to source so the
-      // browser gets real ES modules. `packages/protocol-client` has no
-      // `"type": "module"`, so its tsc output is CommonJS and cannot be bundled
-      // for the browser.
-      { find: '@tari-ootle/wallet-adapter', replacement: resolve(__dirname, '../../packages/wallet-adapter/src/index.ts') },
-      // wallet-adapter imports protocol-client by deep `dist/*.js` path. Rewrite
-      // those to source too, so there is exactly ONE copy of the protocol client
-      // in the bundle (no duplicate module instances or divergent type values).
-      { find: /^@tari-ootle\/protocol-client\/dist\/(.*)\.js$/, replacement: `${protocolClientSrc}/$1.ts` },
-      { find: /^@tari-ootle\/protocol-client$/, replacement: `${protocolClientSrc}/index.ts` },
-    ],
+    // No workspace source aliases.
+    //
+    // These packages are consumed through their declared `exports` contract,
+    // which selects the ESM build for a browser bundle and the CommonJS build
+    // for a Node `require`. An earlier revision aliased them to `src`, which
+    // masked a broken package contract AND created a duplicate-module-instance
+    // hazard: `multihop/proof.ts` brands terminal settlement proofs with a
+    // module-private Symbol, so two copies of the package would mint and verify
+    // against different brands. `test/instance-identity.test.cjs` asserts a
+    // single instance in the built bundle.
+    alias: [],
   },
   base: process.env.BASE_PATH || '/',
   build: {
