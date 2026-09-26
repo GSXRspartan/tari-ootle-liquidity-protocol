@@ -151,37 +151,66 @@ blocked.
 
 | Suite | Command | Result |
 |---|---|---|
-| protocol-client | `pnpm --filter @tari-ootle/protocol-client run test` | **185/185** — includes the 15 fuzz cases (50k structured mutations, 20k proof-tamper attempts) |
+| protocol-client | `pnpm --filter @tari-ootle/protocol-client run test` | **185/185** |
+| — cross-layer hostile | `node --test test/hostile_crosschain.test.cjs` | **34/34** |
+| — multi-hop hostile / fuzz | `multihop_hostile` / `multihop_fuzz` | **33/33**, **4/4** |
+| — market-data hostile / fuzz | `marketdata_hostile` / `marketdata_fuzz` | **19/19**, **6/6** |
+| — hostile fuzz | `hostile_fuzz` | **5/5** (50k structured mutations, 20k proof-tamper attempts) |
+| — route immutability | `route_immutability` | **8/8** |
+| — packaging | `packaging` | **9/9** |
 | wallet-adapter | `pnpm --filter @tari-ootle/wallet-adapter run test` | **21/21** |
-| frontend, node | `pnpm --filter @tari-ootle/web run test` | **194/194** |
-| frontend, browser (local) | `pnpm --filter @tari-ootle/web run test:e2e` | **62/62** — 31 flows on `chromium-desktop` and `chromium-mobile` |
-| frontend, browser (CI) | `pnpm --filter @tari-ootle/web run test:e2e:all` | adds 31 on `firefox-desktop`; not observed green locally, see R-9 |
+| frontend, node | `pnpm --filter @tari-ootle/web run test` | **202/202** |
+| browser flows, Chromium | `playwright test --project=chromium-desktop --project=chromium-mobile` | **96/96** (48 flows × 2 projects) |
+| hosting flows | `playwright test --project=hosting` | **17/17** — headers, clickjacking, CSP enforcement, real Ootle outage |
 | typecheck | `pnpm --filter @tari-ootle/web run typecheck` | clean |
+| Security Engine Tests (Rust) | `cargo test` in `audit_engine_tests` | **BLOCKED_TOOLING** — `wasmer-compiler-cranelift` emits `compile_error!` on Windows. Pre-existing and platform-level, not a code defect |
+| Firefox | `playwright test --project=firefox-desktop` | **BLOCKED_TOOLING** — not installed locally; software WebRender exhausts memory on this GPU-less host. CI-only, **not claimed as passing** (R-9) |
 
-Dependency posture at base-to-head: `pnpm audit --prod --audit-level low`
-reports no known vulnerabilities. Production licences are MIT except
-`lightweight-charts` (Apache-2.0). A single React runtime is linked. The install
-is reproducible: `pnpm-lock.yaml` is committed and both workflows use
-`--frozen-lockfile`.
+Dependency posture: `pnpm audit --prod --audit-level low` reports no known
+vulnerabilities. Production licences are MIT except `lightweight-charts`
+(Apache-2.0). A single React runtime is linked. The install is reproducible:
+`pnpm-lock.yaml` is committed, both workflows use `--frozen-lockfile`, and the
+stale `package-lock.json` has been removed. Canonical toolchain in
+`docs/DEPENDENCY_POLICY.md`.
 
 ### Production bundle under audit
 
-`pnpm --filter @tari-ootle/web run build`, SHA-256 truncated to 16 hex characters:
+`pnpm --filter @tari-ootle/web run build` at commit `ab66114`, SHA-256 truncated
+to 16 hex characters:
 
 | Hash | Bytes | Artifact |
 |---|---|---|
-| `f682b96aec7e2964` | 419279 | `dist/assets/index-DCE65VZG.js` |
+| `90f28fc0e1965bdd` | 419437 | `dist/assets/index-ZXadPzV_.js` |
 | `3579e946f7cc8468` | 168876 | `dist/assets/charts-CqNP-JN7.js` |
 | `d6895feb04133bab` | 51104 | `dist/assets/vendor-B9TnhO9g.js` |
 | `49e9fdeb6d69cb27` | 9798 | `dist/assets/index-BBUcDMiZ.css` |
-| `6afe362bfd635455` | 3792 | `dist/index.html` |
-| `935819c586bfa4b3` | 1134 | `dist/SOURCE_MAP_POLICY.txt` |
-| `d476794752d76562` | 854 | `dist/_headers` |
-| `e63d6667d15af0cd` | 525 | `dist/icon.svg` |
-| `f2592a24c92a733d` | 420 | `dist/manifest.json` |
+| `40be28fcbb0d0bd8` | 1198 | `dist/_headers` |
+| `b6809b215a7e76a8` | 1130 | `dist/SOURCE_MAP_POLICY.txt` |
+| `2489a39350445ccf` | 3857 | `dist/index.html` |
+| `5a642700dfe3910b` | 532 | `dist/icon.svg` |
+| `971952168ef7bd4f` | 437 | `dist/manifest.json` |
 
 Source maps are omitted from the table because they are published deliberately
 (R-6) and change with every source edit.
+
+The emitted policy, served by the enforcing host and observed by the browser:
+
+```
+Content-Security-Policy: default-src 'self'; script-src 'self' https://universe.tari.mw;
+  style-src 'self' 'unsafe-inline'; img-src 'self' data: https:;
+  connect-src 'self' https://indexer.esmeralda.tari.com https://indexer-fallback.tari.com;
+  frame-src 'none'; object-src 'none'; base-uri 'self'; form-action 'none';
+  frame-ancestors 'self' https://universe.tari.mw; upgrade-insecure-requests
+X-Content-Type-Options: nosniff
+Referrer-Policy: no-referrer
+Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=(), bluetooth=()
+Cross-Origin-Opener-Policy: same-origin-allow-popups
+Cross-Origin-Resource-Policy: cross-origin
+```
+
+`X-Frame-Options` is deliberately absent and `Cross-Origin-Embedder-Policy` is
+deliberately not enabled; both omissions are recorded with reasons in
+`DELIBERATELY_OMITTED_HEADERS` and asserted by the suite.
 
 ---
 
@@ -189,19 +218,31 @@ Source maps are omitted from the table because they are published deliberately
 
 Stated plainly, because an audit that hides its gaps is worse than no audit.
 
-- **No live wallet, indexer, or chain.** Every provider interaction was an
-  injected double; the indexer was intercepted at its production origin. Nothing
-  here is evidence about a real Minotari build or real confirmation timing (R-4).
-- **No clickjacking exploit.** The control is a response header the app does not
-  itself deliver, and the app is currently served on a host that ignores the
-  file it writes (R-1, an open HIGH risk).
+- **No deployed URL was queried.** The hosting is configured for Cloudflare Pages
+  and the policy is proven in-browser, but no Cloudflare account is reachable
+  from this environment, so the headers have not been observed arriving from a
+  real host. This is R-1, and it is the one open HIGH.
+- **No clickjacking exploit against a deployed URL.** The same test run against
+  the local enforcing server proves the policy semantics; only a real host proves
+  delivery.
+- **No real wallet.** `window.tari` cannot exist outside the wallet's own dApp
+  frame. Connection, capabilities, account, network, disconnect, and account /
+  network switching were all exercised with an injected provider double.
+- **No real Ootle indexer.** `indexer.esmeralda.tari.com` and
+  `indexer-fallback.tari.com` do not resolve from this environment, verified by
+  DNS failure rather than assumed. Real pool discovery, pool state, candles,
+  trades, and liquidity activity were therefore unavailable. The *outage* path
+  was exercised for real, with nothing intercepted, and correctly shows
+  unavailable rather than zero with no fixture data.
+- **No real transaction of any kind.** No funded testnet wallet, no reachable
+  pool, no owned test NFTs. L2 swap, add/remove liquidity, NFT flows, and
+  `UNKNOWN` reconciliation are all `BLOCKED_EXTERNAL`.
 - **No adversarial network timing, reorg, or mempool behaviour.** `BLOCKED_TOOLING`.
-- **No atomicity claim across layers.** The browser SHA leg is upstream-blocked
-  (R-3); the multi-hop structure is audited separately in
-  `CROSS_LAYER_HOSTILE_AUDIT_REPORT.md` and `MULTIHOP_INVARIANTS.md`.
-- **No `UNKNOWN` reconciliation end to end.** Proven by unit test and by the
-  absence of a retry control, not by a real lost response (R-5).
-- **No WebKit, no real device, no screen reader, no axe pass** (R-10).
+- **No Rust engine tests.** `cargo` cannot build the host-side template harness
+  on Windows: `wasmer-compiler-cranelift` emits `compile_error!` for this
+  platform. Pre-existing and platform-level.
+- **No WebKit, no real device, no screen reader, no axe pass.** Firefox is
+  CI-only and not claimed as passing (R-9).
 - **No third-party review.** This is a self-audit.
 
 ---
@@ -212,26 +253,40 @@ Stated plainly, because an audit that hides its gaps is worse than no audit.
 FOUND UNDER TESTED MODEL**, for the model defined in §1 and the bundle hashed in
 §5. Two CRITICAL and eight HIGH defects were found during the audit and are fixed
 with retained regressions; none remain open in code. The browser suite
-(194 node tests, 62 browser flows locally) fails on each of them if reintroduced.
+(202 node tests, 113 browser flows) fails on each of them if reintroduced.
 
-This is **not** a claim of production readiness, and three things must not be
+This is **not** a claim of production readiness, and four things must not be
 read into it:
 
-1. **R-1 is an open HIGH risk.** The deployment does not deliver the security
-   headers the build generates, because GitHub Pages does not read `dist/_headers`.
-   The clickjacking control is authored and verified but not in effect. This is a
-   hosting decision, not a code defect, and it is unresolved.
-2. **R-2 is an assumption.** The `frame-ancestors` allow-list names
-   `https://universe.tari.mw`, which nothing in this repository verifies.
+1. **R-1 remains OPEN (one open HIGH).** The security response headers are
+   authored, emitted in valid Cloudflare Pages syntax, and proven to be
+   *enforced* by a real browser against a server that applies them. They have
+   **not** been observed arriving from a live deployment, because no Cloudflare
+   account is reachable from this environment. Three of four parts are done; the
+   fourth is deployment, and it is the only part that counts. See
+   `FRONTEND_RESIDUAL_RISKS.md` §"What closing R-1 requires".
+2. **R-13 is new and open.** The repository's own architecture documentation
+   establishes that this app runs in a cross-origin iframe inside the wallet and
+   loads a cross-origin connector script. That is why the wallet origin is
+   allowed in `frame-ancestors` *and* in `script-src` — and the exact injection
+   mechanism was not observable here, so the `script-src` allowance is a
+   documented requirement rather than an observed fact.
 3. **R-3 and R-4 bound the whole result.** The atomic cross-chain browser path
    does not exist upstream, and nothing here was executed against a real wallet
-   or chain.
+   or chain. The configured Esmeralda indexer hostnames do not resolve, so real
+   pool, candle, trade, and liquidity data were unavailable; the outage path was
+   exercised for real and is correct.
+4. **This is a self-audit.** No third party reviewed it.
 
 The route therefore remains **EXPERIMENTAL / TESTNET**. Mainnet stays disabled,
 the real cross-chain submit gate stays `OFF`, and the browser SHA blocker stays
 visible rather than papered over.
 
-**The most durable result of this audit is not a fix but a rule:** F-01 was a
+**The most durable result of this audit is not a fix but a rule.** F-01 was a
 correct, well-tested security control sitting one import away from the code that
-needed it, behind a fully green suite. Any future security module should be
-treated as unwired until an end-to-end flow exercises it.
+needed it, behind a fully green suite. R-1 was a security header authored,
+generated, and unit-tested — and delivered to nobody, because the test asserted
+on a file rather than on a response. Both are the same mistake: proving a
+*component* rather than proving a *delivery path*. Any future security control
+should be treated as absent until an end-to-end check observes it taking effect
+where it actually runs.
