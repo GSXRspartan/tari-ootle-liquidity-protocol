@@ -1,9 +1,33 @@
 name: Deploy to GitHub Pages
 
+# NOT A SUPPORTED PRODUCTION TARGET.
+#
+# The supported host is Cloudflare Pages (`wrangler.jsonc` + `apps/web/public/_headers`), because
+# GitHub Pages cannot serve custom response headers at all. Deploying this app to Pages therefore
+# publishes it WITHOUT:
+#
+#   - Content-Security-Policy (including `frame-ancestors`, the clickjacking control that also
+#     encodes the Tari Universe dApp framing allowlist)
+#   - Cross-Origin-Opener-Policy / Cross-Origin-Resource-Policy
+#   - X-Content-Type-Options: nosniff
+#   - Referrer-Policy: no-referrer
+#   - Permissions-Policy
+#
+# The `dist/_headers` file is still copied into the artifact, but Pages ignores it. Because the
+# application builds and signs financial transactions, an unprotected deployment is exactly the
+# kind of silent downgrade this project refuses to ship by accident: the workflow no longer runs on
+# push, and a manual dispatch must explicitly acknowledge the gap.
+#
+# The header policy itself is generated at build time by
+# `apps/web/scripts/write-deployment-headers.mjs` from `apps/web/src/lib/deploymentHeaders.ts`.
+
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
+    inputs:
+      acknowledge_no_security_headers:
+        description: 'I understand this publishes the app with NO CSP, nosniff, or frame-ancestors'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -18,8 +42,68 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      - name: Refuse to publish without the reviewed security policy
+        if: ${{ inputs.acknowledge_no_security_headers != true }}
+        run: |
+          echo "::error::GitHub Pages cannot serve apps/web/public/_headers, so this deployment would ship with no CSP, no nosniff, and no frame-ancestors. Use Cloudflare Pages, or re-run this workflow with acknowledge_no_security_headers=true and record the downgrade."
+          exit 1
+
+      - name: Record the acknowledged downgrade
+        if: ${{ inputs.acknowledge_no_security_headers == true }}
+        run: |
+          echo "::warning::Deploying to GitHub Pages with no security headers. R-1 (observed headers on the deployed origin) can never be closed from this host."
+          {
+            echo "### Security headers will NOT be served"
+            echo ""
+            echo "GitHub Pages ignores \`dist/_headers\`. This deployment has no Content-Security-Policy,"
+            echo "no \`frame-ancestors\`, no nosniff, and no COOP/CORP. It is a diagnostic/debug host only."
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Checkout
         uses: actions/checkout@v4
+      # pnpm MUST be installed before setup-node so any pnpm-aware step can find it. (Previously
+      # setup-node ran with `cache: 'pnpm'` before pnpm existed → "Unable to locate executable
+      # file: pnpm".)
+      #
+      # The pnpm major is pinned to 9 and MUST match the committed lockfile. pnpm-lock.yaml is
+      # lockfileVersion 9.0; a pnpm 10/11 install cannot consume it, so a silent major bump
+      # would fail the build rather than quietly re-resolving the dependency tree.
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'pnpm'
+      # `--frozen-lockfile` makes the install fail if package.json and pnpm-lock.yaml disagree.
+      # For a financial client that builds transaction-construction code, an unreviewed
+      # dependency bump reaching a deployment is a security event, not a convenience.
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build static web app
+        run: pnpm --filter @tari-ootle/web build
+      - name: Verify the deployment headers were emitted
+        run: |
+          test -f apps/web/dist/_headers || { echo "dist/_headers is missing: the clickjacking and CSP headers would not be served"; exit 1; }
+          grep -q 'frame-ancestors' apps/web/dist/_headers || { echo "frame-ancestors missing from the response policy"; exit 1; }
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: apps/web/dist
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
       # pnpm MUST be installed before setup-node so any pnpm-aware step can find it. (Previously
       # setup-node ran with `cache: 'pnpm'` before pnpm existed → "Unable to locate executable
       # file: pnpm".)

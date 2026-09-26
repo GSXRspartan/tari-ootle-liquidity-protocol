@@ -40,8 +40,38 @@ site rather than failing loudly.
 ## Source control stays on GitHub
 
 GitHub remains the source repository, the pull-request review surface, and CI.
-Only static hosting moved. The deploy workflow authenticates to Cloudflare with
-an API token supplied as a repository secret; no credential is committed.
+Only static hosting is intended to move.
+
+**Current state: there is no Cloudflare deploy workflow in this repository.**
+`.github/workflows/` contains `node-tests.yml`, `pages.yml`, and
+`security-engine-tests.yml` only — none of them authenticates to Cloudflare.
+Earlier wording in this document implied such a workflow existed; it did not, and
+the claim is withdrawn. Deployment therefore happens by whatever manual process
+the operator uses, and no credential is committed.
+
+This is why risk **R-1 is OPEN / BLOCKED_EXTERNAL**: the headers are authored,
+unit-tested, browser-tested against the local server, and written into
+`dist/_headers`, but has never been observed coming from a real HTTPS URL.
+
+### Exact minimal closure procedure for R-1
+
+1. Create a Cloudflare API token with `Account / Cloudflare Pages / Edit` only,
+   scoped to the Pages project `ootle-liquidity-testnet`. Store it as the
+   repository secret `CLOUDFLARE_API_TOKEN` (and `CLOUDFLARE_ACCOUNT_ID` if the
+   account is not otherwise inferable). Never commit it.
+2. Build exactly as CI does: `pnpm install --frozen-lockfile` then
+   `pnpm --filter @tari-ootle/web build`, and assert
+   `test -f apps/web/dist/_headers` and `grep -q frame-ancestors apps/web/dist/_headers`.
+3. Deploy `apps/web/dist` (the value of `pages_build_output_dir` in
+   `wrangler.jsonc`) with `npx wrangler pages deploy apps/web/dist --project-name=ootle-liquidity-testnet`,
+   or add a workflow that does the same. The build output directory in the
+   Cloudflare dashboard must agree with `wrangler.jsonc`.
+4. Observe the headers **over the network from the deployed URL**, on `/`, on a
+   client-side route such as `/pools`, and on an asset — using the curl commands
+   below. All six required headers must be present, including
+   `frame-ancestors 'self' https://universe.tari.mw`.
+5. Only then may R-1 be moved to CLOSED, recording the URL, timestamp, and the
+   observed header values as evidence.
 
 ## Verifying a deployment
 
