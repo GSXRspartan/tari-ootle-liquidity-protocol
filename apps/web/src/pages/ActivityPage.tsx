@@ -13,6 +13,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import type { OperationRecord, OperationState } from '@tari-ootle/protocol-client';
 import { listOperations, historyIntegrity } from '../services/history.js';
+import { trustLevel } from '../lib/storage.js';
 import { createTransactionLookup, reconcile } from '../services/execution.js';
 import { useApp } from '../state/AppContext.js';
 import { explorerUrl } from '../lib/sanitize.js';
@@ -34,6 +35,18 @@ const STATE_EXPLANATION: Record<OperationState, string> = {
   FAILED: 'An authoritative lookup proved the transaction was rejected or does not exist.',
   UNKNOWN: 'The submission outcome is unknown. It is being reconciled by durable identifier and is deliberately not retried.',
 };
+
+/**
+ * Why a `CONFIRMED` badge read from this browser is a claim, not a fact.
+ *
+ * `localStorage` is fully editable by any script on this origin, so a persisted
+ * `CONFIRMED` proves only that something wrote it. The record is still shown —
+ * hiding it would lose the user's only pointer to a transaction they may need to
+ * reconcile — but the badge is qualified and the authoritative lookup stays
+ * available instead of being blocked.
+ */
+const CLAIMED_EXPLANATION =
+  'Stored in this browser as CONFIRMED. Local storage can be edited by any script on this origin, so this is a claim. Reconcile it against the chain before treating it as settled.';
 
 export function ActivityPage() {
   const { executionWallets } = useApp();
@@ -151,6 +164,8 @@ function OperationCard({
   canReconcile: boolean;
 }) {
   const link = record.transactionId === undefined ? undefined : explorerUrl(record.transactionId);
+  const claimed = trustLevel(record) === 'CLAIMED_BY_STORAGE';
+  const stateExplanation = claimed ? CLAIMED_EXPLANATION : STATE_EXPLANATION[record.state];
   return (
     <Card className="stack">
       <div className="spread" style={{ flexWrap: 'wrap' }}>
@@ -160,9 +175,16 @@ function OperationCard({
             {record.operationId}
           </span>
         </div>
-        <Badge tone={STATE_TONE[record.state]} title={STATE_EXPLANATION[record.state]}>
-          {record.state}
-        </Badge>
+        <div className="row" style={{ gap: 'var(--s-2)', flexWrap: 'wrap' }}>
+          <Badge tone={STATE_TONE[record.state]} title={stateExplanation}>
+            {record.state}
+          </Badge>
+          {claimed && (
+            <Badge tone="warn" title={CLAIMED_EXPLANATION}>
+              Unverified claim
+            </Badge>
+          )}
+        </div>
       </div>
 
       <div className="grid-2">
@@ -253,9 +275,15 @@ function OperationCard({
         </Notice>
       )}
 
+      {claimed && (
+        <Notice tone="warn" title="Local claim, not chain proof">
+          {CLAIMED_EXPLANATION}
+        </Notice>
+      )}
+
       <div className="row" style={{ gap: 'var(--s-2)', flexWrap: 'wrap' }}>
-        <button type="button" className="btn btn--sm" disabled={!canReconcile || reconciling || record.state === 'CONFIRMED'} onClick={onReconcile}>
-          {reconciling ? 'Reconciling…' : 'Reconcile now'}
+        <button type="button" className="btn btn--sm" disabled={!canReconcile || reconciling} onClick={onReconcile}>
+          {reconciling ? 'Reconciling…' : claimed ? 'Verify against the chain' : 'Reconcile now'}
         </button>
         {!canReconcile && <span className="hint">Reconciliation needs a connected wallet that can look the transaction up.</span>}
       </div>

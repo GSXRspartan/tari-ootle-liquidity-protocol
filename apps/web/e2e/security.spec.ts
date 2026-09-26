@@ -394,6 +394,12 @@ test('a tampered confirmation is shown as a claim, not as settled', async ({ pag
   // The record loads, but nothing may present it as final without a lookup.
   await expect(badge(page, 'forged-confirm')).toBeVisible();
   await expect(page.getByRole('button', { name: /^Retry$/ })).toHaveCount(0);
+  // The claim must be visibly qualified, not just stored: a persisted CONFIRMED
+  // is editable by any script on this origin and can never be rendered as proof.
+  await expect(page.getByText('Local claim, not chain proof')).toBeVisible();
+  await expect(page.getByText(/Local storage can be edited by any script on this origin/)).toBeVisible();
+  // Verification stays reachable instead of being blocked by the bogus state.
+  await expect(page.getByRole('button', { name: 'Verify against the chain' })).toBeVisible();
 });
 
 test('no secret is ever written to storage', async ({ page }) => {
