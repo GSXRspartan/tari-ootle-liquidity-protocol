@@ -1,0 +1,9 @@
+{
+  "name": "Ootle Liquidity (testnet)",
+  "short_name": "Ootle LQ",
+  "description": "Non-custodial liquidity protocol for Tari Ootle. Experimental software on a test network.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#080a0e",
+  "theme_color": "#080a0e"
+}

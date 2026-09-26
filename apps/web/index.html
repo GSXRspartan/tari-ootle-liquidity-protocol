@@ -1,17 +1,31 @@
 <!DOCTYPE html>
 <html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Tari Ootle Liquidity Protocol</title>
-  <meta name="description" content="Non-custodial liquidity protocol for Tari Ootle. Public fungible pools, native Tari support, permissionless." />
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link rel="manifest" href="/manifest.json" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' https://indexer.esmeralda.tari.com https://indexer-fallback.tari.com; object-src 'none'; base-uri 'self'; frame-ancestors 'none';" />
-</head>
-<body>
-  <div id="root"></div>
-  <script type="module" src="/src/main.tsx"></script>
-</body>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content="#080a0e" />
+    <title>Ootle Liquidity — testnet</title>
+    <meta
+      name="description"
+      content="Non-custodial liquidity protocol for Tari Ootle. Experimental software on a test network. Not audited for mainnet."
+    />
+    <link rel="manifest" href="/manifest.json" />
+    <!--
+      Defence in depth for untrusted metadata. `img-src https:` is required for NFT
+      media, which is attacker-controlled; every URL is validated before it reaches
+      an attribute and no HTML is ever injected. `frame-ancestors` is intentionally
+      absent: it is ignored in a meta CSP, and the Tari wallet embeds dApps in its
+      own cross-origin frame, so it must be set by a real response header.
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' https://indexer.esmeralda.tari.com https://indexer-fallback.tari.com; object-src 'none'; base-uri 'self'; form-action 'none';"
+    />
+  </head>
+  <body>
+    <div id="root"></div>
+    <noscript>This application requires JavaScript.</noscript>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
 </html>
