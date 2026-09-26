@@ -222,7 +222,18 @@ export function AppProvider({
       });
       return;
     }
-    const result = await discovery.discover();
+    let result: PoolDiscoveryResult;
+    try {
+      result = await discovery.discover();
+    } catch (error) {
+      // A discovery source that throws must never leave the UI in its loading
+      // state: an honest "unavailable" is always better than an endless spinner.
+      result = {
+        pools: [],
+        source: discovery.name,
+        unavailableReason: `Pool discovery failed unexpectedly: ${(error as Error).message}`,
+      };
+    }
     const health =
       result.unavailableReason !== undefined
         ? presentHealth({ status: 'UNAVAILABLE', source: result.source, reason: result.unavailableReason })

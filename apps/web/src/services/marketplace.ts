@@ -23,6 +23,7 @@ import {
   type AuthoritativeRead,
   type RecentSale,
 } from '@tari-ootle/protocol-client';
+import { discoveryList, postJson } from './net.js';
 import type { AppConfig } from './config.js';
 
 export interface NftDescriptor {
@@ -73,16 +74,6 @@ export class UnavailableMarketplaceSource implements MarketplaceSource {
   get unavailableReason(): string {
     return this.reason;
   }
-}
-
-interface StrictJson {
-  data?: unknown;
-}
-
-function asList(payload: unknown): unknown[] | undefined {
-  if (Array.isArray(payload)) return payload;
-  if (typeof payload === 'object' && payload !== null && Array.isArray((payload as StrictJson).data)) return (payload as StrictJson).data as unknown[];
-  return undefined;
 }
 
 function str(value: unknown): string | undefined {
@@ -181,28 +172,56 @@ export function parseRecentSale(rawSale: unknown): RecentSale | undefined {
 /** Indexer-backed discovery. Malformed records are dropped, never coerced. */
 export class IndexerMarketplaceSource implements MarketplaceSource {
   readonly name: string;
+  private failureReason: string | undefined;
+  /** Set when the configured URL is unusable. Discovery then fails closed. */
+  private readonly invalid: string | undefined;
 
   constructor(private readonly url: string) {
-    this.name = `indexer:${new URL(url).host}`;
+    let host: string | undefined;
+    try {
+      host = new URL(url).host;
+    } catch {
+      host = undefined;
+    }
+    this.invalid = host === undefined ? `The configured NFT discovery endpoint is not a valid URL: ${url}` : undefined;
+    this.name = host === undefined ? 'indexer:invalid' : `indexer:${host}`;
+  }
+
+  /**
+   * Why the most recent query produced nothing, when the cause was a transport
+   * or shape failure rather than a legitimately empty result. `undefined` means
+   * the endpoint answered. The page uses this only to choose its wording.
+   */
+  get unavailableReason(): string | undefined {
+    return this.failureReason;
   }
 
   private async query<T>(name: string, params: Record<string, unknown>, parse: (raw: unknown) => T | undefined): Promise<T[]> {
-    let response: Response;
-    try {
-      response = await fetch(this.url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query: name, params }) });
-    } catch {
+    if (this.invalid !== undefined) {
+      this.failureReason = this.invalid;
       return [];
     }
-    if (!response.ok) return [];
-    let payload: unknown;
-    try {
-      payload = await response.json();
-    } catch {
+    // Bounded transport: always terminates, always caps the body, and always
+    // states a reason, so "the endpoint is down" can never be rendered as
+    // "there are no collections".
+    const result = await postJson(this.url, { query: name, params });
+    if (!result.ok) {
+      this.failureReason = result.reason;
       return [];
     }
-    const list = asList(payload);
-    if (list === undefined) return [];
-    return list.map(parse).filter((entry): entry is T => entry !== undefined);
+    const list = discoveryList(result.payload);
+    if (!list.ok) {
+      this.failureReason = list.reason;
+      return [];
+    }
+    const parsed = list.list.map(parse).filter((entry): entry is T => entry !== undefined);
+    // Every record being dropped is a shape mismatch, not an empty result: say so
+    // rather than letting the page report a clean zero.
+    this.failureReason =
+      parsed.length === 0 && list.list.length > 0
+        ? `The discovery endpoint returned ${list.list.length} record(s), none of which this build could read.`
+        : undefined;
+    return parsed;
   }
 
   async listCollections(): Promise<string[] | undefined> {

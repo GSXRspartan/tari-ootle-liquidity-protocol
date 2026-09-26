@@ -11,6 +11,7 @@
 
 import type { PoolPair, AssetSafetyClass, ResourceRoutingClass } from '@tari-ootle/protocol-client';
 import { safetyFromPairClass, weakestClassification, toAssetChip, type AssetChip } from '../lib/assetIdentity.js';
+import { discoveryList, postJson } from './net.js';
 import type { AppConfig } from './config.js';
 
 export interface PoolDescriptor {
@@ -120,36 +121,38 @@ export interface PoolDiscoverySource {
  */
 export class IndexerPoolDiscovery implements PoolDiscoverySource {
   readonly name: string;
+  /** Set when the configured URL is unusable. Discovery then fails closed. */
+  private readonly invalid: string | undefined;
 
   constructor(private readonly indexerUrl: string) {
-    this.name = `indexer:${new URL(indexerUrl).host}`;
+    let host: string | undefined;
+    try {
+      host = new URL(indexerUrl).host;
+    } catch {
+      // A malformed VITE_INDEXER_URL must not throw during render: that would
+      // take the whole application down with a blank page instead of showing a
+      // configuration error the operator can act on.
+      host = undefined;
+    }
+    this.invalid = host === undefined ? `The configured pool discovery endpoint is not a valid URL: ${indexerUrl}` : undefined;
+    this.name = host === undefined ? 'indexer:invalid' : `indexer:${host}`;
   }
 
   async discover(): Promise<PoolDiscoveryResult> {
-    let response: Response;
-    try {
-      response = await fetch(this.indexerUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query: 'pool_discovery' }),
-      });
-    } catch (error) {
-      return { pools: [], source: this.name, unavailableReason: `Pool discovery request failed: ${(error as Error).message}` };
+    if (this.invalid !== undefined) {
+      return { pools: [], source: this.name, unavailableReason: this.invalid };
     }
-    if (!response.ok) {
-      return { pools: [], source: this.name, unavailableReason: `Pool discovery endpoint returned HTTP ${response.status}.` };
+    // Bounded transport: a hung or oversized endpoint produces an unavailable
+    // result within a fixed deadline instead of a permanently loading list.
+    const result = await postJson(this.indexerUrl, { query: 'pool_discovery' });
+    if (!result.ok) {
+      return { pools: [], source: this.name, unavailableReason: `Pool discovery is unavailable. ${result.reason}` };
     }
-    let payload: unknown;
-    try {
-      payload = await response.json();
-    } catch {
-      return { pools: [], source: this.name, unavailableReason: 'Pool discovery endpoint returned a non-JSON body.' };
+    const list = discoveryList(result.payload);
+    if (!list.ok) {
+      return { pools: [], source: this.name, unavailableReason: list.reason };
     }
-    const list = Array.isArray(payload) ? payload : Array.isArray((payload as { data?: unknown[] })?.data) ? (payload as { data: unknown[] }).data : undefined;
-    if (list === undefined) {
-      return { pools: [], source: this.name, unavailableReason: 'Pool discovery response did not contain a pool list.' };
-    }
-    const pools = list.map(parsePoolDescriptor).filter((pool): pool is PoolDescriptor => pool !== undefined);
+    const pools = list.list.map(parsePoolDescriptor).filter((pool): pool is PoolDescriptor => pool !== undefined);
     return { pools, source: this.name };
   }
 }
