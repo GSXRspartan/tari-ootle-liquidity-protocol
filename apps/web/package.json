@@ -9,10 +9,13 @@
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "lint": "echo 'No lint'",
-    "test": "echo 'No tests'"
+    "build:test": "tsc -p tsconfig.test.json && node ./test/write-cjs-marker.mjs",
+    "test": "npm run build:test && node --test test/*.test.cjs"
   },
   "dependencies": {
+    "@tari-ootle/protocol-client": "workspace:*",
     "@tari-ootle/wallet-adapter": "workspace:*",
+    "lightweight-charts": "5.2.1",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "react-router-dom": "^7.0.0"
