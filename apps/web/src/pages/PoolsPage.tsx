@@ -114,6 +114,13 @@ export function PoolsPage() {
 
   const health = presentHealth(market.discovery.pools.length > 0 ? { status: 'SYNCED', source: market.discovery.source } : { status: 'UNAVAILABLE', source: market.discovery.source, reason: market.discovery.unavailableReason });
 
+  /**
+   * True when discovery did not produce an answer. The UI must not turn a
+   * transport or parsing failure into "this deployment has no pools".
+   */
+  const discoveryFailed = market.discovery.unavailableReason !== undefined;
+
+
   return (
     <div className="stack" style={{ gap: 'var(--s-4)' }}>
       <div className="spread" style={{ flexWrap: 'wrap' }}>
@@ -136,7 +143,14 @@ export function PoolsPage() {
 
       <Card className="card--flush">
         <CardHeader
-          title={`${filtered.length} pool${filtered.length === 1 ? '' : 's'}`}
+          title={
+            // A failed discovery is NOT a zero. Rendering "0 pools" when the
+            // request failed tells a user their money has no market, which is a
+            // different and much stronger claim than "we could not find out".
+            discoveryFailed && market.pools.length === 0
+              ? 'Pool list unavailable'
+              : `${filtered.length} pool${filtered.length === 1 ? '' : 's'}`
+          }
           actions={
             <div className="field" style={{ maxWidth: 280 }}>
               <label className="sr-only" htmlFor="pool-search">
@@ -159,8 +173,11 @@ export function PoolsPage() {
           </div>
         ) : market.pools.length === 0 ? (
           <EmptyState
-            title="No pools to show"
-            detail={market.discovery.unavailableReason ?? 'Discovery returned no pools for this deployment. No pool list is fabricated.'}
+            title={discoveryFailed ? 'Pool list unavailable' : 'No pools to show'}
+            detail={
+              market.discovery.unavailableReason ??
+              'Discovery returned no pools for this deployment. No pool list is fabricated.'
+            }
           />
         ) : (
           <div className="table-wrap">

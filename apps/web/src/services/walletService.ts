@@ -264,21 +264,43 @@ class TariBridgeWalletAdapter implements WalletBridge {
   }
 
   /**
-   * Re-derive the live identity from the provider RIGHT NOW.
+   * Re-derive the live identity from the page RIGHT NOW.
    *
-   * Called immediately before every financial authorization. It re-reads the
-   * network and the selected account from the provider rather than trusting the
-   * session captured at connect, so a wallet that changed account, network, or
-   * capabilities in the meantime is caught.
+   * Called immediately before every financial authorization. Nothing here may
+   * come from the connect-time snapshot:
+   *
+   *  - the provider object is re-resolved from `window`, so a page script that
+   *    replaced `window.tari` is caught by reference comparison. Returning the
+   *    cached `this.provider` would make a replaced provider compare EQUAL to
+   *    the pinned review and defeat the check entirely;
+   *  - capabilities are re-fetched, so a provider that downgrades its
+   *    advertisement after the handshake is caught;
+   *  - network and account are read from the current provider.
+   *
+   * A provider that has been removed or that stops answering is a failure, not
+   * an empty identity: it must never authorize anything.
    */
   async liveIdentity(sessionNonce: string): Promise<LiveIdentityInput> {
-    const network = await this.getNetwork();
-    const account = await this.getSelectedAccount();
+    // `getTariProvider` throws when the provider is absent or malformed. A
+    // provider that has gone away is a failure, and it must never reach an
+    // authorization path — so the throw is the correct outcome, not a fallback.
+    const provider = getTariProvider();
+    const network = await fetchNetwork(provider);
+    const guard = checkNetwork(network.network);
+    if (!guard.ok) {
+      throw new TariProviderError(guard.reason ?? `Network "${network.network}" is not allowed.`, 'WRONG_NETWORK');
+    }
+    const [accounts, capabilities] = await Promise.all([requestAccounts(provider), fetchCapabilities(provider)]);
+    const account = accounts[0];
+    if (account === undefined) {
+      throw new TariProviderError('The wallet reported no account, so this review cannot be authorized.', 'MALFORMED_REPLY');
+    }
     return {
-      provider: this.provider,
-      providerNetwork: network.name,
-      account: account.address,
-      capabilities: this.capabilities === undefined ? undefined : ({ ...this.capabilities } as Readonly<Record<string, boolean>>),
+      // Deliberately the CURRENT object, not the connect-time reference.
+      provider,
+      providerNetwork: network.network,
+      account: account.componentAddress,
+      capabilities: capabilities === undefined ? undefined : ({ ...capabilities } as Readonly<Record<string, boolean>>),
       nonce: sessionNonce,
     };
   }

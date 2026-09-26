@@ -857,3 +857,151 @@ test('explorer: no explorer URL is ever constructed', () => {
   }
 });
 
+
+// ===========================================================================
+// LIVE IDENTITY MUST RE-DERIVE, NOT REPLAY THE CONNECT-TIME SNAPSHOT
+// ===========================================================================
+
+const fsx = require('node:fs');
+const pathx = require('node:path');
+const srcRootX = pathx.join(__dirname, '..', 'src');
+
+
+/**
+ * Build a provider whose object identity, implementation, network, account, and
+ * capabilities can each be changed independently, so one assertion can prove
+ * which signal the verifier actually uses.
+ */
+function mutableProvider() {
+  const state = {
+    network: 'esmeralda',
+    account: 'otl_account_A',
+    caps: { l2HtlcFund: true, l2HtlcClaim: true },
+  };
+  const provider = {
+    __state: state,
+    async request(envelope) {
+      switch (envelope.method) {
+        case 'tari_getNetwork':
+          return { network: state.network, epoch: '900' };
+        case 'tari_getCapabilities':
+          return { ...state.caps };
+        case 'tari_requestAccounts':
+        case 'tari_getAccounts':
+          return [{ componentAddress: state.account }];
+        default:
+          throw new Error('unsupported');
+      }
+    },
+  };
+  return provider;
+}
+
+test('identity: a replaced provider object is detected by reference', () => {
+  const { captureIdentity, verifyIdentity } = require('../build-test/lib/executionIdentity.js');
+  const original = mutableProvider();
+  const pinned = captureIdentity({
+    provider: original,
+    expectedNetwork: 'esmeralda',
+    providerNetwork: 'esmeralda',
+    account: 'otl_account_A',
+    capabilities: { l2HtlcFund: true, l2HtlcClaim: true },
+  });
+
+  // A different object that advertises exactly the same thing must NOT pass.
+  // Comparing names or shapes would accept this; comparing references will not.
+  const impostor = mutableProvider();
+  const check = verifyIdentity(pinned, {
+    provider: impostor,
+    providerNetwork: 'esmeralda',
+    account: 'otl_account_A',
+    capabilities: { l2HtlcFund: true, l2HtlcClaim: true },
+    nonce: pinned.nonce,
+  });
+  assert.equal(check.ok, false);
+  assert.equal(check.changed, 'provider');
+});
+
+test('identity: a capability downgrade after approval is detected', () => {
+  const { captureIdentity, verifyIdentity } = require('../build-test/lib/executionIdentity.js');
+  const provider = mutableProvider();
+  const pinned = captureIdentity({
+    provider,
+    expectedNetwork: 'esmeralda',
+    providerNetwork: 'esmeralda',
+    account: 'otl_account_A',
+    capabilities: { l2HtlcFund: true, l2HtlcClaim: true },
+  });
+  // Live capabilities are re-read and differ from the approved snapshot.
+  const check = verifyIdentity(pinned, {
+    provider,
+    providerNetwork: 'esmeralda',
+    account: 'otl_account_A',
+    capabilities: { l2HtlcFund: false, l2HtlcClaim: false },
+    nonce: pinned.nonce,
+  });
+  assert.equal(check.ok, false);
+  assert.equal(check.changed, 'capabilities');
+});
+
+test('identity: a stale review from a previous session cannot be re-authorized', () => {
+  const { captureIdentity, verifyIdentity, issueNonce } = require('../build-test/lib/executionIdentity.js');
+  const provider = mutableProvider();
+  const pinned = captureIdentity({
+    provider,
+    expectedNetwork: 'esmeralda',
+    providerNetwork: 'esmeralda',
+    account: 'otl_account_A',
+    capabilities: { l2HtlcFund: true },
+  });
+  const check = verifyIdentity(pinned, {
+    provider,
+    providerNetwork: 'esmeralda',
+    account: 'otl_account_A',
+    capabilities: { l2HtlcFund: true },
+    nonce: issueNonce(),
+  });
+  assert.equal(check.ok, false);
+  assert.equal(check.changed, 'nonce');
+});
+
+test('liveIdentity: the bridge reads the CURRENT provider and capabilities, not the connect-time cache', () => {
+  const source = fsx.readFileSync(pathx.join(srcRootX, 'services', 'walletService.ts'), 'utf8');
+  const start = source.indexOf('async liveIdentity(');
+  assert.notEqual(start, -1, 'liveIdentity must exist');
+  // Bounded window: the method body, up to the next class member.
+  const rest = source.slice(start, source.indexOf('\n  async ', start + 1) === -1 ? start + 2000 : source.indexOf('\n  async ', start + 1));
+  const body = /async liveIdentity\([^)]*\): Promise<LiveIdentityInput> \{([\s\S]*)/.exec(rest);
+  assert.ok(body, 'liveIdentity must have a readable body');
+
+  // The provider is re-resolved from the page inside liveIdentity, not read off
+  // `this`. Reading `this.provider` here would make a swapped window.tari
+  // compare equal to the pinned review.
+  assert.match(body[1], /getTariProvider\(\)/, 'liveIdentity must re-resolve the injected provider');
+  assert.equal(/\bprovider:\s*this\.provider\b/.test(body[1]), false, 'liveIdentity must not return the cached provider reference');
+
+  // Capabilities must be fetched again, not replayed from the connect snapshot.
+  assert.match(body[1], /fetchCapabilities\(/, 'liveIdentity must re-fetch capabilities');
+  assert.equal(/capabilities:\s*this\.capabilities/.test(body[1]), false, 'liveIdentity must not return the cached capabilities');
+
+  // Network and account come from the current provider, not from the session.
+  assert.match(body[1], /fetchNetwork\(provider\)/);
+  assert.match(body[1], /requestAccounts\(provider\)/);
+});
+
+test('persisted history: the live read path is the validating parser, not a raw JSON.parse', () => {
+  const history = fsx.readFileSync(pathx.join(srcRootX, 'services', 'history.ts'), 'utf8');
+  // Every displayed record must come from the strict validator. A bare
+  // `operationId` type check is what previously let a record with a tampered
+  // amount and a stray preimage field reach the screen.
+  assert.match(history, /loadHistoryPayload/, 'history must parse through the strict validator');
+  assert.equal(
+    /typeof \(entry as OperationRecord\)\.operationId === 'string'/.test(history),
+    false,
+    'history must not filter records by an operationId type check alone',
+  );
+  // Dropped records must be reported rather than silently vanishing.
+  assert.match(history, /rejected/, 'history must report how many records failed validation');
+});
+
+

@@ -161,7 +161,8 @@ function WalletDetails({ open, onClose }: { open: boolean; onClose: () => void }
 }
 
 export function AppShell({ children }: { children: ReactNode }) {
-  const { config } = useApp();
+  const { config, wallet } = useApp();
+  const walletError = wallet.status === 'ERROR' ? wallet.error : undefined;
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', minHeight: '100%' }}>
@@ -237,6 +238,20 @@ export function AppShell({ children }: { children: ReactNode }) {
           <Notice tone="warn" title="Development mode">
             Running with {config.developmentReason}. Anything shown as data in this build is not real chain data and must not be treated as settlement
             evidence.
+          </Notice>
+        </div>
+      )}
+
+      {/*
+        A refused connection must explain itself in the page, not only inside the
+        wallet-details dialog. Silently refusing a mainnet provider looks like a
+        broken button, and invites the user to switch networks without ever
+        learning why the request was rejected.
+      */}
+      {walletError !== undefined && (
+        <div style={{ maxWidth: 'var(--shell-max)', margin: '0 auto', padding: 'var(--s-4) var(--s-4) 0', width: '100%' }}>
+          <Notice tone="danger" title="Wallet connection refused">
+            {walletError}
           </Notice>
         </div>
       )}

@@ -10,6 +10,7 @@
  */
 
 import { JsonHistoryStore, type ProtocolHistoryStore, type OperationRecord } from '@tari-ootle/protocol-client';
+import { loadHistoryPayload, type HistoryLoadResult } from '../lib/storage';
 
 const STORAGE_KEY = 'ootle.operations.v1';
 
@@ -48,6 +49,20 @@ const io = {
 export const historyStore: ProtocolHistoryStore = new JsonHistoryStore(io);
 
 /**
+ * The single parse point for persisted history.
+ *
+ * Everything the UI displays must come from here. The raw path — `JSON.parse`
+ * plus an `operationId` type check — is deliberately not used: it accepts a
+ * record whose amounts were tampered with, carries unrecognised fields (a
+ * preimage written by an older build) into app state, and parses an unbounded
+ * payload. `loadHistoryPayload` bounds the input, validates every record, and
+ * rebuilds each one from an allowlist so unknown fields cannot survive.
+ */
+function parseHistory(text: string | undefined | null): HistoryLoadResult {
+  return loadHistoryPayload(text);
+}
+
+/**
  * `JsonHistoryStore` degrades a corrupt payload to an empty map, which would
  * silently look like "no history yet". This surfaces that possibility so the UI
  * can warn instead of implying a clean slate.
@@ -55,13 +70,18 @@ export const historyStore: ProtocolHistoryStore = new JsonHistoryStore(io);
 export async function historyIntegrity(): Promise<{ ok: boolean; reason?: string; count: number }> {
   const text = await io.read();
   if (text === undefined || text.trim() === '') return { ok: true, count: 0 };
-  try {
-    const parsed: unknown = JSON.parse(text);
-    if (!Array.isArray(parsed)) return { ok: false, reason: 'Persisted history is not a list of operation records.', count: 0 };
-    return { ok: true, count: parsed.length };
-  } catch {
-    return { ok: false, reason: 'Persisted operation history could not be parsed and is being treated as empty. Operations may be missing from this browser.', count: 0 };
+  const result = parseHistory(text);
+  if (result.corrupt) return { ok: false, reason: result.reason, count: 0 };
+  if (result.rejected > 0) {
+    return {
+      ok: false,
+      reason: `${result.rejected} stored operation record${result.rejected === 1 ? '' : 's'} failed validation and ${
+        result.rejected === 1 ? 'was' : 'were'
+      } discarded. Anything this page shows below is unverified local data.`,
+      count: result.records.length,
+    };
   }
+  return { ok: true, count: result.records.length };
 }
 
 /** List newest-first, bounded. History is never rendered unbounded. */
@@ -73,11 +93,5 @@ export async function listOperations(limit = 100): Promise<OperationRecord[]> {
 async function listAllOperations(): Promise<OperationRecord[]> {
   const text = await io.read();
   if (text === undefined || text.trim() === '') return [];
-  try {
-    const parsed: unknown = JSON.parse(text);
-    if (!Array.isArray(parsed)) return [];
-    return parsed.filter((entry): entry is OperationRecord => typeof entry === 'object' && entry !== null && typeof (entry as OperationRecord).operationId === 'string');
-  } catch {
-    return [];
-  }
+  return parseHistory(text).records;
 }
