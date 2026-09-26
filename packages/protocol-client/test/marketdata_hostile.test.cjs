@@ -90,6 +90,9 @@ test('26.1 malformed and hostile observations are rejected without contaminating
     ['non-integer index', { instructionIndex: 'x' }, /instructionIndex must be/],
     ['impossible reserves (zero)', { reserveABefore: '0' }, /reserves must be positive/],
     ['impossible reserve growth', { reserveBAfter: '99999999' }, /impossible reserves/],
+    // A price the pool could not have executed at: k must never shrink on a swap.
+    ['k-reducing trade', { reserveBAfter: '1' }, /reduce the pool constant product/],
+    ['k-reducing trade (reverse direction)', { inputResource: PAIR.resourceB, outputResource: PAIR.resourceA, reserveABefore: '25000000', reserveBBefore: '10000000', reserveAAfter: '1', reserveBAfter: '11000000', inputAmountRaw: '2500000', outputAmountRaw: '1000000' }, /reduce the pool constant product/],
     ['missing epoch and time', { epoch: undefined, time: { bucketKey: '0', source: 'LOCAL_RECEIPT' } }, /requires either an epoch or a consensus timestamp/],
     ['empty time bucket', { time: { bucketKey: '', source: 'EPOCH_BOUNDARY' } }, /time bucket key/],
     ['stale/mismatched state version', { substateIdentity: 'pool_1@DIFFERENT' }, /state identity mismatch/],

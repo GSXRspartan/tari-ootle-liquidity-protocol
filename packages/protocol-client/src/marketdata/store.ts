@@ -70,6 +70,23 @@ export function validateObservation(observation: TradeObservation, pair: PoolPai
   const outAmount = isAB ? output : input;
   const gain = reserveDelta > 0n ? reserveDelta : 0n;
   if (gain > outAmount) throw new Error('impossible reserves: the output reserve grew by more than the traded amount');
+  // CONSTANT-PRODUCT INVARIANT (independently derived, not copied from the swap maths).
+  //
+  // For a swap the pool deposits the FULL input and withdraws exactly `output`, so
+  //   k_after = (rA + in) * (rB - out)  >=  rA * rB = k_before
+  // holds for every real trade, and strictly holds whenever a fee is retained. An
+  // observation that violates it describes a price the pool could not have executed
+  // at, which is exactly what a hostile or broken indexer would publish to paint a
+  // chart. This is display-layer defence: it costs one exact integer comparison and
+  // it keeps a fabricated price out of the candle series and the volume ranking.
+  //
+  // Deliberately NOT asserted: that the input reserve grew by exactly `input`. The
+  // repository does not fix whether "before/after" brackets the swap instruction or
+  // the whole transaction, and inventing that rule here would silently drop real
+  // trades. The invariant above is true either way.
+  if (rAAfter * rBAfter < rABefore * rBBefore) {
+    throw new Error('impossible reserves: the trade would reduce the pool constant product');
+  }
   const direction: TradeDirection = isAB ? 'BASE_TO_QUOTE' : 'QUOTE_TO_BASE';
   const baseIn = direction === 'BASE_TO_QUOTE' ? input : output;
   const quoteOut = direction === 'BASE_TO_QUOTE' ? output : input;
