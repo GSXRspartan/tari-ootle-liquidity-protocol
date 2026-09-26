@@ -5,12 +5,14 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
+    "build": "npm run build:test && vite build && node ./scripts/write-deployment-headers.mjs",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "lint": "echo 'No lint'",
     "build:test": "tsc -p tsconfig.test.json && node ./test/write-cjs-marker.mjs",
-    "test": "npm run build:test && node --test test/*.test.cjs"
+    "test": "npm run build:test && node --test test/*.test.cjs",
+    "test:e2e": "npm run build && playwright test",
+    "test:e2e:install": "playwright install --with-deps chromium firefox"
   },
   "dependencies": {
     "@tari-ootle/protocol-client": "workspace:*",
@@ -21,6 +23,8 @@
     "react-router-dom": "^7.0.0"
   },
   "devDependencies": {
+    "@playwright/test": "1.56.1",
+    "@types/node": "22.10.5",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^4.3.0",
