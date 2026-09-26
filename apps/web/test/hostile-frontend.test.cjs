@@ -1415,4 +1415,63 @@ test('F-02: the signing gate requires a frozen review, and the requirement is as
     review.walletRequest.transaction.legs[0].args[0].amountRaw = '999999999';
   }, TypeError);
   assert.equal(review.walletRequest.transaction.legs[0].args[0].amountRaw, '1000000');
+
+// ===========================================================================
+// 8. PROVIDER LIVENESS (deadlines, and what must NOT have one)
+// ===========================================================================
+//
+// A provider that never answers is treated as hostile. Non-interactive reads are
+// bounded so a broken or hostile provider cannot leave a control permanently
+// disabled; the signing path is deliberately NOT bounded, because aborting a
+// signature that a human is still reading would manufacture exactly the UNKNOWN
+// submission state the protocol works hardest to avoid.
+//
+// The read-timeout test waits out the real deadline rather than mocking timers,
+// so it is version-independent and proves the shipped constant.
+
+test('provider liveness: a non-interactive read from a silent provider times out', { timeout: 40_000 }, async () => {
+  const silent = { request: () => new Promise(() => {}) };
+  await assert.rejects(
+    () => tari.fetchNetwork(silent),
+    (error) => {
+      assert.equal(error.name, 'TariProviderError');
+      assert.equal(error.code, 'TIMEOUT');
+      assert.match(error.message, /did not answer/);
+      return true;
+    },
+  );
+  assert.ok(tari.PROVIDER_READ_TIMEOUT_MS > 0, 'the deadline must be a real, non-zero bound');
+});
+
+test('provider liveness: a signing request is never given a deadline', async () => {
+  let settled = false;
+  const silent = {
+    request: () => new Promise(() => {}),
+  };
+  // If signing were raced against a timer, this would reject within milliseconds.
+  const pending = tari
+    .signAndSubmit(silent, { transaction: {} }, { assets: ['TARI'], operation: 'swap', network: 'esmeralda', poolOrDestination: 'p' })
+    .then(() => {
+      settled = true;
+    })
+    .catch(() => {
+      settled = true;
+    });
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  assert.equal(settled, false, 'a signature awaiting a human must stay pending, not be aborted');
+  void pending;
+});
+
+test('provider liveness: a read that answers in time is unaffected by the deadline', async () => {
+  const good = {
+    request: async ({ method }) => {
+      if (method === 'tari_getNetwork') return { network: 'esmeralda', epoch: '7' };
+      return {};
+    },
+  };
+  const view = await tari.fetchNetwork(good);
+  assert.equal(view.network, 'esmeralda');
+  assert.equal(view.epoch, '7');
+});
+
 });

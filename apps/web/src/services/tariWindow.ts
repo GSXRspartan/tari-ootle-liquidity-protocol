@@ -54,7 +54,7 @@ declare global {
 export class TariProviderError extends Error {
   constructor(
     message: string,
-    readonly code: 'NOT_INJECTED' | 'UNSUPPORTED_METHOD' | 'REJECTED' | 'MALFORMED_REPLY' | 'WRONG_NETWORK' | 'ACCOUNT_CHANGED' | 'UNKNOWN',
+    readonly code: 'NOT_INJECTED' | 'UNSUPPORTED_METHOD' | 'REJECTED' | 'MALFORMED_REPLY' | 'WRONG_NETWORK' | 'ACCOUNT_CHANGED' | 'TIMEOUT' | 'UNKNOWN',
   ) {
     super(message);
     this.name = 'TariProviderError';
@@ -99,14 +99,49 @@ export function getTariProvider(scope: unknown = globalThis): TariProvider {
   return provider;
 }
 
+/**
+ * Methods that wait on a human, and must therefore NEVER be given a deadline.
+ *
+ * A signing request can legitimately sit unanswered for minutes while the user
+ * reads it. Aborting one on a timer would manufacture an `UNKNOWN` submission
+ * for a transaction the wallet may still be about to sign — the exact state the
+ * protocol is most careful to avoid. Only non-interactive reads are bounded.
+ */
+const INTERACTIVE_METHODS: ReadonlySet<string> = new Set<string>([
+  TARI_METHODS.signAndSubmit,
+  TARI_METHODS.createTransactionRequest,
+  TARI_METHODS.getTransactionRequest,
+  TARI_METHODS.submitTransactionRequest,
+]);
+
+/** Deadline for a non-interactive provider read. */
+export const PROVIDER_READ_TIMEOUT_MS = 15_000;
+
 async function call<T>(provider: TariProvider, method: TariMethod, params?: unknown): Promise<T> {
   if (!ALLOWED_METHODS.has(method)) {
     throw new TariProviderError(`Refusing to call unlisted Tari method "${method}".`, 'UNSUPPORTED_METHOD');
   }
   let reply: unknown;
   try {
-    reply = await provider.request<T>(params === undefined ? { method } : { method, params });
+    const request = provider.request<T>(params === undefined ? { method } : { method, params });
+    reply = INTERACTIVE_METHODS.has(method)
+      ? await request
+      : await Promise.race([
+          request,
+          new Promise<never>((_resolve, reject) => {
+            const timer = setTimeout(
+              () => reject(new TariProviderError(`Tari provider did not answer ${method} within ${PROVIDER_READ_TIMEOUT_MS}ms.`, 'TIMEOUT')),
+              PROVIDER_READ_TIMEOUT_MS,
+            );
+            // Never hold the event loop open for a timer whose request already settled.
+            void request.then(
+              () => clearTimeout(timer),
+              () => clearTimeout(timer),
+            );
+          }),
+        ]);
   } catch (error) {
+    if (error instanceof TariProviderError) throw error;
     const message = error instanceof Error ? error.message : String(error);
     const code: TariProviderError['code'] = /reject|denied|declined|user/i.test(message) ? 'REJECTED' : 'UNKNOWN';
     throw new TariProviderError(`Tari provider rejected ${method}: ${message}`, code);
