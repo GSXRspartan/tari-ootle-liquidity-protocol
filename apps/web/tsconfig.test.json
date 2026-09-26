@@ -14,7 +14,10 @@
     "allowImportingTsExtensions": false,
     "types": ["react", "react-dom"],
     "paths": {
-      "lightweight-charts": ["../test/stubs/lightweight-charts.ts"]
+      "lightweight-charts": ["../test/stubs/lightweight-charts.ts"],
+      "@tari-ootle/protocol-client": ["../../packages/protocol-client/dist/index.d.ts"],
+      "@tari-ootle/protocol-client/crosschain": ["../../packages/protocol-client/dist/crosschain/index.d.ts"],
+      "@tari-ootle/wallet-adapter": ["../../packages/wallet-adapter/dist/index.d.ts"]
     }
   },
   "include": [
@@ -40,3 +43,4 @@
   ],
   "exclude": ["src/services/envSource.ts"]
 }
+

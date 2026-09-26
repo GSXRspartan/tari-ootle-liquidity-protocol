@@ -16,6 +16,7 @@ import type { OotleReadbackProvider } from '@tari-ootle/protocol-client';
 import { resolveConfig, realSubmitGate, type AppConfig, type RealSubmitGate } from '../services/config.js';
 import { readBrowserEnv } from '../services/envSource.js';
 import { createWalletService, type WalletBridge } from '../services/walletService.js';
+import { captureIdentity, type ExecutionIdentity, type ProviderCapabilities } from '../lib/executionIdentity.js';
 import { createPoolDiscovery, type PoolDescriptor, type PoolDiscoveryResult } from '../services/pools.js';
 import { MarketDataService, type MarketDataBundle } from '../services/marketData.js';
 import type { WalletLegCapabilities } from '../lib/capabilities.js';
@@ -57,6 +58,13 @@ interface AppContextValue {
   balanceOf(resourceAddress: string): string | undefined;
   /** Authoritative pool readback from the wallet. Undefined until connected. */
   readback(): OotleReadbackProvider | undefined;
+  /** The wallet bridge, for identity pinning. Undefined until injected. */
+  walletBridge(): WalletBridge | undefined;
+  /**
+   * The execution identity for the current session, or undefined when no
+   * verified identity exists. Callers must fail closed when it is undefined.
+   */
+  liveExecutionIdentity(): ExecutionIdentity | undefined;
   /** Wallets seam for the execution service. Undefined until connected. */
   executionWallets(): ExecutionWalletsLike | undefined;
 }
@@ -99,6 +107,8 @@ export function AppProvider({
 
   const walletService = useMemo(() => createWalletService(config.network), [config.network]);
   const bridgeRef = useRef<WalletBridge | undefined>(undefined);
+  /** The identity bound to the current session. Re-issued on any change. */
+  const identityRef = useRef<ExecutionIdentity | null>(null);
 
   const [wallet, setWallet] = useState<WalletState>(() => {
     const bridge = walletService.bridge();
@@ -260,9 +270,43 @@ export function AppProvider({
     return bridge.readbackProvider();
   }, [wallet.status]);
 
+  const walletBridge = useCallback((): WalletBridge | undefined => {
+    const bridge = bridgeRef.current;
+    if (bridge === undefined || wallet.status !== 'CONNECTED') return undefined;
+    return bridge;
+  }, [wallet.status]);
+
+  /**
+   * The execution identity, captured when a session is established.
+   *
+   * A new identity is issued on connect, on disconnect, and whenever the
+   * network or account changes, which invalidates every review bound to the
+   * previous one. `verifyIdentity` re-derives the live state and compares, so a
+   * change the app did not observe is still caught at authorization time.
+   */
+  const liveExecutionIdentity = useCallback((): ExecutionIdentity | undefined => {
+    const bridge = bridgeRef.current;
+    if (bridge === undefined || wallet.status !== 'CONNECTED' || wallet.account === undefined || wallet.networkId === undefined) return undefined;
+    if (identityRef.current === null) {
+      identityRef.current = captureIdentity({
+        provider: bridge.providerObject(),
+        expectedNetwork: config.network,
+        providerNetwork: wallet.networkId,
+        account: wallet.account,
+        capabilities: wallet.capabilities as ProviderCapabilities | undefined,
+      });
+    }
+    return identityRef.current;
+  }, [wallet.status, wallet.account, wallet.networkId, wallet.capabilities, config.network]);
+
+  // Any identity change must invalidate outstanding reviews.
+  useEffect(() => {
+    identityRef.current = null;
+  }, [wallet.account, wallet.networkId, wallet.status]);
+
   const value = useMemo<AppContextValue>(
-    () => ({ config, realSubmit, wallet, market, connect, disconnect, refreshPools, bundleFor, balanceOf, readback, executionWallets }),
-    [config, realSubmit, wallet, market, connect, disconnect, refreshPools, bundleFor, balanceOf, readback, executionWallets],
+    () => ({ config, realSubmit, wallet, market, connect, disconnect, refreshPools, bundleFor, balanceOf, readback, walletBridge, liveExecutionIdentity, executionWallets }),
+    [config, realSubmit, wallet, market, connect, disconnect, refreshPools, bundleFor, balanceOf, readback, walletBridge, liveExecutionIdentity, executionWallets],
   );
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;

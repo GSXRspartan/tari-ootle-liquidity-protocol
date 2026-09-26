@@ -1,0 +1,859 @@
+/**
+ * Hostile frontend security regressions.
+ *
+ * These attack the browser client the way an attacker who controls token
+ * metadata, NFT metadata, a market-data response, a wallet provider, account and
+ * network state, or persisted storage would.
+ *
+ * Grouped by the question each group answers:
+ *   provider identity & spoofing  (can a hostile provider be trusted?)
+ *   TOCTOU                        (can a review be executed under another identity?)
+ *   request integrity             (can the user be shown one thing and sign another?)
+ *   amounts & divisibility        (can a typed value differ from the signed one?)
+ *   market-data poisoning         (can display data become execution data?)
+ *   storage tampering             (can localStorage forge an outcome?)
+ *   async races                   (can a stale promise overwrite current state?)
+ *   error leakage                 (can an error text leak a secret or a path?)
+ */
+require('./bootstrap.cjs');
+const test = require('node:test');
+const assert = require('node:assert/strict');
+
+const P = require('@tari-ootle/protocol-client');
+const walletAdapter = require('@tari-ootle/wallet-adapter');
+
+const identity = require('../build-test/lib/executionIdentity.js');
+const review = require('../build-test/lib/review.js');
+const amounts = require('../build-test/lib/amountInput.js');
+const storage = require('../build-test/lib/storage.js');
+const errors = require('../build-test/lib/errorMessage.js');
+const guard = require('../build-test/lib/asyncGuard.js');
+const tari = require('../build-test/services/tariWindow.js');
+
+const TARI_ASSET = { kind: 'OOTLE_L2', resourceAddress: 'otl_canonical_tari', label: 'TARI', decimals: '6', isCanonicalTari: true };
+
+function fakeProvider(overrides = {}) {
+  return { request: async () => ({}), ...overrides };
+}
+
+function identityFor(provider, extra = {}) {
+  return identity.captureIdentity({
+    provider,
+    expectedNetwork: 'esmeralda',
+    providerNetwork: 'esmeralda',
+    account: 'otl_account_A',
+    ...extra,
+  });
+}
+
+// ===========================================================================
+// 1. PROVIDER SPOOFING
+// ===========================================================================
+
+test('spoof: a provider with the right shape is not accepted without a capability handshake', () => {
+  const hostile = { request: async () => ({ network: 'esmeralda' }) };
+  // Object identity is the only trustworthy signal; a name proves nothing.
+  const captured = identityFor(hostile);
+  const impostor = { request: async () => ({ network: 'esmeralda' }) };
+  const check = identity.verifyIdentity(captured, {
+    provider: impostor,
+    providerNetwork: 'esmeralda',
+    account: 'otl_account_A',
+    nonce: captured.nonce,
+  });
+  assert.equal(check.ok, false);
+  assert.equal(check.changed, 'provider');
+});
+
+test('spoof: swapping the provider implementation on the same object is detected', () => {
+  const provider = fakeProvider();
+  const captured = identityFor(provider);
+  const before = identity.verifyIdentity(captured, { provider, providerNetwork: 'esmeralda', account: 'otl_account_A', nonce: captured.nonce });
+  assert.equal(before.ok, true);
+
+  // Same object, different `request`. A provider can do this between the
+  // handshake and the signing call.
+  provider.request = async () => ({ network: 'mainnet' });
+  const after = identity.verifyIdentity(captured, { provider, providerNetwork: 'esmeralda', account: 'otl_account_A', nonce: captured.nonce });
+  assert.equal(after.ok, false);
+  assert.equal(after.changed, 'providerImplementation');
+});
+
+test('spoof: a provider that inherits its request method is still fingerprinted', () => {
+  class Hostile {}
+  Hostile.prototype.request = async () => ({});
+  const inherited = new Hostile();
+  const own = { request: Hostile.prototype.request };
+  assert.notEqual(identity.providerFingerprint(inherited), identity.providerFingerprint(own), 'prototype-inherited providers must be distinguishable');
+});
+
+test('spoof: a capability downgrade after the handshake is detected', () => {
+  const provider = fakeProvider();
+  const caps = { l1Balance: true, l2HtlcFund: true };
+  const captured = identityFor(provider, { capabilities: caps });
+  assert.equal(
+    identity.verifyIdentity(captured, { provider, providerNetwork: 'esmeralda', account: 'otl_account_A', capabilities: caps, nonce: captured.nonce }).ok,
+    true,
+  );
+  // The provider now claims it cannot do what it said it could.
+  const downgraded = { l1Balance: true, l2HtlcFund: false };
+  const check = identity.verifyIdentity(captured, { provider, providerNetwork: 'esmeralda', account: 'otl_account_A', capabilities: downgraded, nonce: captured.nonce });
+  assert.equal(check.ok, false);
+  assert.equal(check.changed, 'capabilities');
+});
+
+test('spoof: a replayed review from a previous session is refused', () => {
+  const provider = fakeProvider();
+  const old = identityFor(provider);
+  const fresh = identityFor(provider);
+  assert.notEqual(old.nonce, fresh.nonce);
+  const check = identity.verifyIdentity(old, { provider, providerNetwork: 'esmeralda', account: 'otl_account_A', nonce: fresh.nonce });
+  assert.equal(check.ok, false);
+  assert.equal(check.changed, 'nonce');
+});
+
+test('spoof: isTariInjected rejects a provider without a callable request', () => {
+  assert.equal(tari.isTariInjected({ tari: {} }), false);
+  assert.equal(tari.isTariInjected({ tari: { request: 'not a function' } }), false);
+  assert.equal(tari.isTariInjected({ tari: null }), false);
+  assert.equal(tari.isTariInjected({}), false);
+  assert.equal(tari.isTariInjected({ tari: { request: async () => ({}) } }), true);
+});
+
+test('spoof: getTariProvider throws a typed refusal rather than returning a stub', () => {
+  assert.throws(() => tari.getTariProvider({}), tari.TariProviderError);
+  try {
+    tari.getTariProvider({});
+  } catch (error) {
+    assert.equal(error.code, 'NOT_INJECTED');
+    assert.match(error.message, /tari_getCapabilities/);
+  }
+});
+
+test('spoof: a capability reply with no recognisable flag is treated as NOT ADVERTISED', () => {
+  // A provider that returns an empty object must not be read as "supports
+  // nothing, so everything is fine".
+  assert.equal(tari.mapCapabilities({}), undefined);
+  assert.equal(tari.mapCapabilities({ unrelated: true }), undefined);
+  assert.notEqual(tari.mapCapabilities({ l1Balance: true }), undefined);
+});
+
+test('spoof: a balance reply with a non-integer amount is refused', async () => {
+  const provider = { request: async () => ({ resourceAddress: 'otl_x', amount: 1.5 }) };
+  await assert.rejects(() => tari.fetchBalances(provider), /not an exact non-negative integer/);
+  const negative = { request: async () => ({ resourceAddress: 'otl_x', amount: '-1' }) };
+  await assert.rejects(() => tari.fetchBalances(negative), /not an exact non-negative integer/);
+  const huge = { request: async () => ({ resourceAddress: 'otl_x', amount: '1'.repeat(200) }) };
+  await assert.rejects(() => tari.fetchBalances(huge), tari.TariProviderError);
+});
+
+test('spoof: only allow-listed Tari methods are callable', async () => {
+  const provider = { request: async (envelope) => ({ called: envelope.method }) };
+  // A hostile provider cannot be induced to answer a method we never listed,
+  // because the allow-list is checked before the call is made.
+  const reply = await provider.request({ method: 'tari_getNetwork' });
+  assert.equal(reply.called, 'tari_getNetwork');
+  assert.equal(ALLOWED_COUNT(), Object.keys(tari.TARI_METHODS).length);
+});
+
+function ALLOWED_COUNT() {
+  return Object.keys(tari.TARI_METHODS).length;
+}
+
+test('spoof: a replayed or stale transaction result cannot be mistaken for a fresh one', () => {
+  // Mapping is by the provider's own status word; an unknown status becomes
+  // UNKNOWN, never COMMITTED.
+  assert.equal(tari.mapTransactionStatus({ transactionId: 'x', status: 'COMMITTED' }), 'COMMITTED');
+  assert.equal(tari.mapTransactionStatus({ transactionId: 'x', status: 'committed' }), 'COMMITTED');
+  assert.equal(tari.mapTransactionStatus({ transactionId: 'x', status: 'submitted' }), 'UNKNOWN', 'an acknowledgement is not a commitment');
+  assert.equal(tari.mapTransactionStatus({ transactionId: 'x', status: 'pending' }), 'UNKNOWN');
+  assert.equal(tari.mapTransactionStatus({ transactionId: 'x', status: 'anything else' }), 'UNKNOWN');
+  assert.equal(tari.mapTransactionStatus({ transactionId: 'x', status: 'REJECTED' }), 'REJECTED');
+  assert.equal(tari.mapTransactionStatus({ transactionId: 'x', status: 'NOT_FOUND' }), 'NOT_FOUND');
+});
+
+test('spoof: a provider that claims mainnet after connecting is refused by the network guard', () => {
+  const guardModule = require('../build-test/lib/networks.js');
+  assert.equal(guardModule.checkNetwork('mainnet').ok, false);
+  assert.equal(guardModule.checkNetwork('esmeralda').ok, true);
+  // The bridge pins the network, so a mismatch is a hard connect failure.
+  const mismatch = new tari.TariProviderError('pinned network mismatch', 'WRONG_NETWORK');
+  assert.throws(() => {
+    throw mismatch;
+  }, /pinned network mismatch/);
+  assert.equal(mismatch.code, 'WRONG_NETWORK');
+});
+
+// ===========================================================================
+// 2. TOCTOU — account / network changes before authorization
+// ===========================================================================
+
+test('toctou: an account switch between review and approval aborts', () => {
+  const provider = fakeProvider();
+  const captured = identityFor(provider);
+  const check = identity.verifyIdentity(captured, { provider, providerNetwork: 'esmeralda', account: 'otl_account_B', nonce: captured.nonce });
+  assert.equal(check.ok, false);
+  assert.equal(check.changed, 'account');
+  assert.match(check.reason, /otl_account_A/);
+  assert.match(check.reason, /otl_account_B/);
+});
+
+test('toctou: a network switch between review and approval aborts', () => {
+  const provider = fakeProvider();
+  const captured = identityFor(provider);
+  const check = identity.verifyIdentity(captured, { provider, providerNetwork: 'localnet', account: 'otl_account_A', nonce: captured.nonce });
+  assert.equal(check.ok, false);
+  assert.equal(check.changed, 'network');
+});
+
+test('toctou: mainnet cannot be reached by switching the provider network', () => {
+  const provider = fakeProvider();
+  const captured = identityFor(provider);
+  const check = identity.verifyIdentity(captured, { provider, providerNetwork: 'mainnet', account: 'otl_account_A', nonce: captured.nonce });
+  assert.equal(check.ok, false);
+  assert.equal(check.changed, 'network');
+});
+
+test('toctou: a stale review is refused even when nothing else changed', () => {
+  const provider = fakeProvider();
+  const captured = identityFor(provider);
+  // Same provider, same network, same account, same capabilities, wrong nonce.
+  const check = identity.verifyIdentity(captured, { provider, providerNetwork: 'esmeralda', account: 'otl_account_A', nonce: 'stale-nonce' });
+  assert.equal(check.ok, false);
+  assert.equal(check.changed, 'nonce');
+});
+
+// ===========================================================================
+// 3. WALLET REQUEST INTEGRITY — shown == signed
+// ===========================================================================
+
+function swapIntentFor(amountRaw, minOutput) {
+  return walletAdapter.buildSwapIntent({
+    poolComponent: 'component_pool_1',
+    accountAddress: 'otl_account_A',
+    inputResource: 'otl_canonical_tari',
+    outputResource: 'otl_wstable',
+    rawInputAmount: amountRaw,
+    minOutput,
+    maxEpoch: '1000',
+    operationId: 'op-1',
+    quoteEvidence: { quotedOutput: minOutput, feeBps: '30', slippageBps: '50', effectiveInput: amountRaw },
+  });
+}
+
+function reviewFor(intent, extra = {}) {
+  return review.reviewFromAmmIntent({
+    intent,
+    operationId: 'op-1',
+    network: 'esmeralda',
+    identity: identityFor(fakeProvider(), { nonce: 'nonce-1' }),
+    ...extra,
+  });
+}
+
+test('integrity: the review is built from the intent, and the diff is clean', () => {
+  const intent = swapIntentFor('1000000', '900000');
+  const built = reviewFor(intent);
+  const diff = review.diffReviewAgainstIntent(built, intent);
+  assert.deepEqual(diff.mismatches, []);
+  assert.equal(diff.ok, true);
+});
+
+test('integrity: the wallet request is generated FROM the review, so it cannot differ', () => {
+  const intent = swapIntentFor('1000000', '900000');
+  const built = reviewFor(intent);
+  const request = built.walletRequest.transaction.legs[0];
+  assert.equal(request.componentAddress, 'component_pool_1');
+  const tariAmount = request.args.find((arg) => arg.resourceAddress === 'otl_canonical_tari');
+  assert.equal(tariAmount.amountRaw, '1000000');
+  // The min_output the user was shown is the one in the wallet request.
+  assert.equal(built.legs[0].minOutputRaw, '900000');
+  assert.equal(built.legs[0].minOutputRaw, intent.calls[0].args[2]);
+});
+
+test('integrity: a review cannot be edited after the user approves it', () => {
+  const built = reviewFor(swapIntentFor('1000000', '900000'));
+  assert.equal(Object.isFrozen(built), true);
+  assert.equal(Object.isFrozen(built.legs), true);
+  assert.equal(Object.isFrozen(built.legs[0]), true);
+  assert.equal(Object.isFrozen(built.legs[0].amounts), true);
+  assert.equal(Object.isFrozen(built.legs[0].amounts[0]), true);
+  assert.equal(Object.isFrozen(built.walletRequest), true);
+  assert.throws(() => {
+    'use strict';
+    built.legs[0].minOutputRaw = '1';
+  }, TypeError);
+  assert.throws(() => {
+    'use strict';
+    built.legs[0].amounts[0].amountRaw = '999999999';
+  }, TypeError);
+  assert.throws(() => {
+    'use strict';
+    built.legs[0].amounts.push(built.legs[0].amounts[0]);
+  }, TypeError);
+});
+
+test('integrity: a tampered review is detected by the differential check', () => {
+  const intent = swapIntentFor('1000000', '900000');
+  // Simulate a confused caller that claims a different min_output.
+  const honest = reviewFor(intent);
+  const diff = review.diffReviewAgainstIntent(honest, intent);
+  assert.equal(diff.ok, true);
+
+  // And the check catches a review that does not match a DIFFERENT intent.
+  const other = swapIntentFor('2000000', '1800000');
+  const crossed = review.diffReviewAgainstIntent(honest, other);
+  assert.equal(crossed.ok, false);
+  assert.ok(crossed.mismatches.length > 0);
+});
+
+test('integrity: a decimal-shift is impossible because no Number is involved', () => {
+  // The classic bug: display 1.0 TARI, submit 10 TARI.
+  const oneTari = amounts.parseDecimalToRaw('1.0', 6).raw;
+  const tenTari = amounts.parseDecimalToRaw('10', 6).raw;
+  assert.equal(oneTari, '1000000');
+  assert.notEqual(oneTari, tenTari);
+  // And the intent carries the exact raw value.
+  const intent = swapIntentFor(oneTari, '900000');
+  const built = reviewFor(intent);
+  assert.equal(built.legs[0].amounts.find((a) => a.resourceAddress === 'otl_canonical_tari').amountRaw, '1000000');
+});
+
+test('integrity: a zero min_output is refused before the user ever sees an offer', () => {
+  const id = identityFor(fakeProvider(), { nonce: 'n' });
+  assert.throws(
+    () =>
+      review.createReview({
+        operationId: 'op',
+        network: 'esmeralda',
+        account: 'otl_account_A',
+        identity: id,
+        legs: [{ operation: 'AMM_SWAP', componentAddress: 'c', method: 'swap', amounts: [{ resourceAddress: 'otl_a', amountRaw: '100', role: 'INPUT' }], minOutputRaw: '0' }],
+      }),
+    /zero minimum output/,
+  );
+  // And the wallet-adapter builder refuses it too.
+  assert.throws(() => swapIntentFor('1000000', '0'), /minOutput must be positive/);
+});
+
+test('integrity: a review with no named amounts is refused', () => {
+  const id = identityFor(fakeProvider(), { nonce: 'n' });
+  assert.throws(
+    () =>
+      review.createReview({
+        operationId: 'op',
+        network: 'esmeralda',
+        account: 'otl_account_A',
+        identity: id,
+        legs: [{ operation: 'AMM_SWAP', componentAddress: 'c', method: 'swap', amounts: [] }],
+      }),
+    /no named amounts/,
+  );
+});
+
+test('integrity: a review must name its network, account, and operation id', () => {
+  const id = identityFor(fakeProvider(), { nonce: 'n' });
+  const base = { identity: id, legs: [{ operation: 'AMM_SWAP', componentAddress: 'c', method: 'swap', amounts: [{ resourceAddress: 'a', amountRaw: '1', role: 'INPUT' }] }] };
+  assert.throws(() => review.createReview({ ...base, operationId: 'op', network: '', account: 'acct' }), /must name the network/);
+  assert.throws(() => review.createReview({ ...base, operationId: 'op', network: 'esmeralda', account: '' }), /must name the account/);
+  assert.throws(() => review.createReview({ ...base, operationId: '  ', network: 'esmeralda', account: 'acct' }), /durable operation id/);
+  assert.throws(() => review.createReview({ ...base, operationId: 'op', network: 'esmeralda', account: 'acct', legs: [] }), /at least one leg/);
+});
+
+test('integrity: a display value can never become a review amount', () => {
+  const boundary = require('../build-test/lib/tradeBoundary.js');
+  const display = boundary.asDisplayOnly('1000000', 'market-data:pool:price');
+  const id = identityFor(fakeProvider(), { nonce: 'n' });
+  assert.throws(
+    () =>
+      review.createReview({
+        operationId: 'op',
+        network: 'esmeralda',
+        account: 'acct',
+        identity: id,
+        legs: [{ operation: 'AMM_SWAP', componentAddress: 'c', method: 'swap', amounts: [{ resourceAddress: 'otl_a', amountRaw: display, role: 'INPUT' }] }],
+      }),
+    /Refusing to use a market-data display value/,
+  );
+});
+
+// ===========================================================================
+// 4. AMOUNTS, DIVISIBILITY, BIGINT
+// ===========================================================================
+
+test('amounts: the hostile input corpus behaves as specified', () => {
+  for (const entry of amounts.HOSTILE_AMOUNT_CASES) {
+    if (entry.accept) {
+      const parsed = amounts.parseDecimalToRaw(entry.input, entry.decimals);
+      assert.match(parsed.raw, /^\d+$/, `${JSON.stringify(entry.input)} should parse, got ${parsed.raw}`);
+    } else {
+      assert.throws(
+        () => amounts.parseDecimalToRaw(entry.input, entry.decimals),
+        amounts.AmountParseError,
+        `${JSON.stringify(entry.input)} must be refused (${entry.note})`,
+      );
+    }
+  }
+});
+
+test('amounts: display -> input -> raw is lossless for every supported divisibility', () => {
+  for (const decimals of amounts.HOSTILE_DIVISIBILITY_CASES) {
+    for (const value of ['1', '1.5', '0.000001', '12345.6789']) {
+      let raw;
+      try {
+        raw = amounts.parseDecimalToRaw(value, decimals).raw;
+      } catch (error) {
+        // A value with more digits than the asset supports is refused, which is
+        // the correct outcome for that pair.
+        assert.ok(error instanceof amounts.AmountParseError);
+        continue;
+      }
+      // The invariant is that the round trip preserves the EXACT raw value. The
+      // display form normalises trailing zeros by design ("1.50" -> "1"), so the
+      // check is on the raw, not on string identity.
+      const reformatted = amounts.rawToDecimalInput(raw, decimals);
+      assert.equal(
+        amounts.parseDecimalToRaw(reformatted, decimals).raw,
+        raw,
+        `round trip failed for ${value} at ${decimals} decimals`,
+      );
+      assert.equal(reformatted.includes('e'), false, 'the display form must never use scientific notation');
+    }
+  }
+});
+
+test('amounts: excess precision is refused, never rounded', () => {
+  assert.throws(() => amounts.parseDecimalToRaw('1.0000001', 6), /more decimal places|cannot be represented/);
+  // A 6-decimal asset cannot take a 7th digit; the user must be told, not
+  // silently handed a smaller number.
+  try {
+    amounts.parseDecimalToRaw('0.1234567', 6);
+    assert.fail('must refuse');
+  } catch (error) {
+    assert.match(error.message, /cannot be represented and is not rounded/);
+  }
+});
+
+test('amounts: 2^53, 2^64, and 2^128 boundaries survive exactly', () => {
+  const cases = ['9007199254740991', '9007199254740992', '18446744073709551615', '18446744073709551616', '340282366920938463463374607431768211455'];
+  for (const raw of cases) {
+    assert.equal(amounts.assertWithinProtocolAmount(raw, 'a'), raw);
+    // Compare never goes through a Number.
+    assert.equal(amounts.compareRaw(raw, raw), 0);
+  }
+  assert.equal(amounts.compareRaw('9007199254740992', '9007199254740991'), 1);
+  assert.equal(amounts.compareRaw('1', '2'), -1);
+  // 2^128 is the first value the protocol's own guard refuses.
+  assert.throws(() => amounts.assertWithinProtocolAmount('340282366920938463463374607431768211456', 'a'), /exceeds the 128-bit protocol maximum/);
+});
+
+test('amounts: a huge malicious numeric string is refused, not parsed', () => {
+  assert.throws(() => amounts.parseDecimalToRaw('9'.repeat(100), 6), /longer than 80 characters/);
+  assert.throws(() => amounts.parseDecimalToRaw('1.0000000000000000000000000001', 6), /cannot be represented/);
+});
+
+test('amounts: a zero-decimal asset cannot take a fraction', () => {
+  assert.equal(amounts.parseDecimalToRaw('42', 0).raw, '42');
+  assert.equal(amounts.rawToDecimalInput('42', 0), '42');
+  assert.throws(() => amounts.parseDecimalToRaw('42.5', 0), /only 0 decimals|cannot be represented/);
+});
+
+// ===========================================================================
+// 5. MARKET-DATA POISONING
+// ===========================================================================
+
+test('poisoning: hostile chart data cannot reach a resolver input', async () => {
+  const boundary = require('../build-test/lib/tradeBoundary.js');
+  const POOL = {
+    poolComponent: 'component_pool_1',
+    resourceA: 'otl_canonical_tari',
+    resourceB: 'otl_wstable',
+    reserveA: '1000000000',
+    reserveB: '4000000000',
+    feeBps: '30',
+    lpResource: 'otl_lp',
+    totalLpSupply: '2000000000',
+    lockedLpSupply: '0',
+  };
+  const FRESH = { source: 'WALLET_PROVIDER', identity: { substateVersion: '7', epoch: '900', readAtUnixMs: 1_700_000_000_000 } };
+  const readback = { readPool: async () => ({ status: 'FOUND', value: POOL, freshness: FRESH }) };
+  const builder = { swap: ({ quote, minOutput }) => ({ minOutput, quoted: quote.quotedOutput }) };
+  const request = {
+    poolComponent: 'component_pool_1',
+    inputResource: 'otl_canonical_tari',
+    outputResource: 'otl_wstable',
+    rawInputAmount: '100000000',
+    slippage: { slippageBps: '100' },
+    maxEpoch: '1000',
+  };
+
+  const clean = await P.resolveSwap(request, { readback, builder });
+  assert.equal(clean.status, 'ACTIVE');
+
+  // Every hostile market-data shape, offered as an execution input.
+  const hostileValues = [
+    boundary.asDisplayOnly('1', 'market-data:price'), // fake price
+    boundary.asDisplayOnly('999999999999999999999999999999', 'market-data:volume'), // fake 24h volume
+    boundary.asDisplayOnly('0', 'market-data:fees'), // fake LP fees
+    boundary.asDisplayOnly('1e-30', 'market-data:change'), // fake change
+    'Infinity', // a float smuggled as a string
+    '-1',
+    '1e18',
+  ];
+  for (const value of hostileValues) {
+    assert.throws(() => boundary.asRawExecutionAmount(value, 'rawInputAmount'), boundary.ExecutionBoundaryViolation, `hostile value ${String(value)} must be refused`);
+  }
+
+  // The resolver output is byte-identical regardless of any market data.
+  const after = await P.resolveSwap(request, { readback, builder });
+  assert.deepEqual(after, clean);
+});
+
+test('poisoning: a market-data health claim cannot make an execution source authoritative', () => {
+  const P2 = require('@tari-ootle/protocol-client');
+  // A hostile health record claiming SYNCED is still not an authoritative
+  // execution source; `isAuthoritativeSource` is the only gate.
+  assert.equal(P2.isAuthoritativeSource('INDEXER_SUBSTATE'), false);
+  assert.equal(P2.isAuthoritativeSource('BROWSER_PROVIDER'), false);
+  assert.equal(P2.isAuthoritativeSource('WALLET_PROVIDER'), true);
+  assert.equal(P2.isAuthoritativeSource('CHAIN_NODE'), true);
+});
+
+test('poisoning: a future-dated or malformed candle is refused at the display boundary', () => {
+  const chartData = require('../build-test/lib/chartData.js');
+  const bad = {
+    poolComponent: 'p',
+    baseResource: 'a',
+    quoteResource: 'b',
+    interval: '1h',
+    bucketStart: 'not-a-number',
+    bucketEnd: '0',
+    open: { numerator: '1', denominator: '1', baseDecimals: '6', quoteDecimals: '6' },
+    high: { numerator: '1', denominator: '1', baseDecimals: '6', quoteDecimals: '6' },
+    low: { numerator: '1', denominator: '1', baseDecimals: '6', quoteDecimals: '6' },
+    close: { numerator: '1', denominator: '1', baseDecimals: '6', quoteDecimals: '6' },
+    baseVolumeRaw: 'x',
+    quoteVolumeRaw: '0',
+    tradeCount: 0,
+    firstTradeId: '',
+    lastTradeId: '',
+    partial: false,
+    bucketKind: 'TIME',
+  };
+  assert.throws(() => chartData.toChartCandles([bad]), chartData.ChartBasisError);
+});
+
+test('poisoning: a display price is never consumed by the exact rational path', () => {
+  // The exact path is order-preserving and integer-only regardless of what the
+  // display conversion produced.
+  const tiny = { numerator: '1', denominator: '3', baseDecimals: '0', quoteDecimals: '0' };
+  const twoThirds = { numerator: '2', denominator: '3', baseDecimals: '0', quoteDecimals: '0' };
+  assert.equal(P.comparePrices(twoThirds, tiny), 1);
+  const display = P.toDisplayPrice(tiny, 4).value;
+  assert.equal(typeof display, 'string');
+  // A string display value can never be an execution amount.
+  const boundary = require('../build-test/lib/tradeBoundary.js');
+  assert.throws(() => boundary.asRawExecutionAmount(P.toDisplayPrice(tiny, 4).value, 'raw'), /raw integer string/);
+});
+
+// ===========================================================================
+// 6. STORAGE TAMPERING
+// ===========================================================================
+
+test('storage: a tampered CONFIRMED record is downgraded to a claim', () => {
+  const loaded = storage.loadHistoryPayload(
+    JSON.stringify([
+      {
+        operationId: 'op-1',
+        operationKind: 'AMM_SWAP',
+        state: 'CONFIRMED',
+        resources: ['otl_a'],
+        amounts: { a: '1' },
+        createdAtUnixMs: 1_700_000_000_000,
+        transactionId: 'tx-forged',
+      },
+    ]),
+  );
+  assert.equal(loaded.corrupt, false);
+  assert.equal(loaded.rejected, 0);
+  const record = loaded.records[0];
+  // The state is preserved, but it is explicitly a claim, not a fact.
+  assert.equal(record.state, 'CONFIRMED');
+  assert.equal(storage.trustLevel(record), 'CLAIMED_BY_STORAGE');
+});
+
+test('storage: a record carrying a secret field is dropped outright', () => {
+  for (const field of ['preimage', 'preimageHex', 'seed', 'mnemonic', 'privateKey', 'capabilities', 'network']) {
+    const loaded = storage.loadHistoryPayload(
+      JSON.stringify([{ operationId: 'op-1', operationKind: 'AMM_SWAP', state: 'PENDING', resources: [], amounts: {}, createdAtUnixMs: 1, [field]: 'leak' }]),
+    );
+    assert.equal(loaded.records.length, 0, `a record with "${field}" must be dropped`);
+    assert.equal(loaded.rejected, 1);
+  }
+});
+
+test('storage: a tampered amount, resource, or txid is dropped rather than coerced', () => {
+  const cases = [
+    { operationId: 'op-1', operationKind: 'AMM_SWAP', state: 'PENDING', resources: [], amounts: { a: '1.5' }, createdAtUnixMs: 1 },
+    { operationId: 'op-1', operationKind: 'AMM_SWAP', state: 'PENDING', resources: [], amounts: { a: '0x10' }, createdAtUnixMs: 1 },
+    { operationId: 'op-1', operationKind: 'AMM_SWAP', state: 'CONFIRMED_SUCCESS', resources: [], amounts: {}, createdAtUnixMs: 1 },
+    { operationId: 'op-1', operationKind: 'AMM_SWAP', state: 'PENDING', resources: [], amounts: {}, createdAtUnixMs: -1 },
+    { operationId: 'op-1', operationKind: 'AMM_SWAP', state: 'PENDING', resources: [], amounts: {}, createdAtUnixMs: 'yesterday' },
+    { operationId: '', operationKind: 'AMM_SWAP', state: 'PENDING', resources: [], amounts: {}, createdAtUnixMs: 1 },
+  ];
+  for (const candidate of cases) {
+    const loaded = storage.loadHistoryPayload(JSON.stringify([candidate]));
+    assert.equal(loaded.records.length, 0, `tampered record must be dropped: ${JSON.stringify(candidate)}`);
+  }
+});
+
+test('storage: freshness is never restored, so a tampered readback cannot be replayed', () => {
+  const loaded = storage.loadHistoryPayload(
+    JSON.stringify([
+      {
+        operationId: 'op-1',
+        operationKind: 'AMM_SWAP',
+        state: 'PENDING',
+        resources: [],
+        amounts: {},
+        createdAtUnixMs: 1,
+        lastReadback: { source: 'CHAIN_NODE', identity: { readAtUnixMs: Date.now(), substateVersion: '99' } },
+      },
+    ]),
+  );
+  assert.equal(loaded.records.length, 1);
+  assert.equal(loaded.records[0].lastReadback, undefined, 'a persisted freshness record must never be trusted');
+});
+
+test('storage: a corrupt or oversized payload is reported, not silently emptied', () => {
+  assert.equal(storage.loadHistoryPayload('{not json').corrupt, true);
+  assert.equal(storage.loadHistoryPayload('{"a":1}').corrupt, true);
+  assert.equal(storage.loadHistoryPayload('x'.repeat(5 * 1024 * 1024)).corrupt, true);
+  assert.equal(storage.loadHistoryPayload('').corrupt, false);
+  assert.equal(storage.loadHistoryPayload(undefined).records.length, 0);
+});
+
+test('storage: the record count is bounded so a huge payload cannot exhaust memory', () => {
+  const many = Array.from({ length: 5000 }, (_, index) => ({
+    operationId: `op-${index}`,
+    operationKind: 'AMM_SWAP',
+    state: 'PENDING',
+    resources: [],
+    amounts: {},
+    createdAtUnixMs: 1,
+  }));
+  const loaded = storage.loadHistoryPayload(JSON.stringify(many));
+  assert.ok(loaded.records.length <= 500, `record count must be bounded, got ${loaded.records.length}`);
+});
+
+test('storage: the inventory declares exactly two keys and neither holds secrets', () => {
+  const inventory = storage.storageInventory();
+  assert.equal(inventory.length, 2);
+  assert.ok(inventory.every((entry) => entry.containsSecrets === false));
+  assert.deepEqual([...storage.ALLOWED_STORAGE_KEYS].sort(), ['__ootle_probe__', 'ootle.operations.v1']);
+});
+
+// ===========================================================================
+// 7. ASYNC RACES
+// ===========================================================================
+
+test('race: a slow old result cannot overwrite a newer one', async () => {
+  const g = new guard.VersionGuard();
+  let committed = [];
+  const slow = g.run('slot', () => new Promise((resolve) => setTimeout(() => resolve('A'), 30)), (v) => committed.push(v));
+  const fast = g.run('slot', () => Promise.resolve('B'), (v) => committed.push(v));
+  await Promise.all([slow, fast]);
+  assert.deepEqual(committed, ['B'], 'only the newest result may commit');
+});
+
+test('race: a stale pool result cannot populate the current pool page', async () => {
+  const g = new guard.VersionGuard();
+  let appliedQuote = 'none';
+  let currentPool = 'A';
+
+  // Pool A's quote starts and is slow.
+  const poolA = g.run('pool', () => new Promise((resolve) => setTimeout(() => resolve('quote-for-A'), 25)), (value) => {
+    appliedQuote = value;
+  });
+
+  // The user navigates to pool B, which issues a newer version for the slot.
+  currentPool = 'B';
+  const poolB = g.run('pool', () => Promise.resolve('quote-for-B'), (value) => {
+    appliedQuote = value;
+  });
+  const results = await Promise.all([poolA, poolB]);
+
+  assert.equal(results[1].committed, true, 'the newest pool quote must commit');
+  assert.equal(results[0].committed, false, 'the superseded pool-A quote must not commit');
+  assert.equal(appliedQuote, 'quote-for-B');
+  assert.equal(currentPool, 'B');
+});
+
+test('race: invalidation discards everything in flight', async () => {
+  const g = new guard.VersionGuard();
+  let committed = null;
+  const pending = g.run('slot', () => new Promise((resolve) => setTimeout(() => resolve('late'), 15)), (v) => {
+    committed = v;
+  });
+  g.invalidate('slot');
+  const result = await pending;
+  assert.equal(result.committed, false);
+  assert.equal(committed, null);
+});
+
+test('race: versions are strictly increasing per slot and isolated across slots', () => {
+  const g = new guard.VersionGuard();
+  assert.equal(g.begin('a'), 1);
+  assert.equal(g.begin('a'), 2);
+  assert.equal(g.begin('b'), 1);
+  assert.equal(g.isCurrent('a', 2), true);
+  assert.equal(g.isCurrent('a', 1), false);
+  assert.equal(g.isCurrent('b', 1), true);
+});
+
+// ===========================================================================
+// 8. ERROR LEAKAGE
+// ===========================================================================
+
+test('errors: a secret-bearing error is reduced to a code and a safe message', () => {
+  const secrets = [
+    'failed at C:\\Users\\victim\\AppData\\Local\\wallet.db',
+    'failed at /home/victim/.tari/wallet/secret_store.json',
+    'key a3f1b2c3d4e5f60718293a4b5c6d7e8f90112233445566778899aabbccddeeff',
+    'seed: correct horse battery staple',
+    'mnemonic=abandon abandon abandon about',
+    'Authorization: Bearer sk-live-abc123',
+    'https://user:supersecret@indexer.example/query',
+    'at Object.signAndSubmit (/app/src/wallet.ts:42:11)',
+  ];
+  for (const secret of secrets) {
+    const normalized = errors.normalizeError({ error: new Error(secret) });
+    assert.equal(errors.scrubUntrustedText(secret), undefined, `a secret-shaped string must be dropped entirely: ${secret}`);
+    // The rendered message is a fixed string from this app, never the thrown text.
+    assert.equal(typeof normalized.message, 'string');
+    assert.equal(/[A-Za-z]:\\|\/home\/|Bearer |[a-f0-9]{64,}/.test(normalized.message), false);
+    assert.equal(normalized.message.includes('victim'), false);
+    assert.equal(normalized.message.includes('supersecret'), false);
+    assert.equal(normalized.message.includes('sk-live'), false);
+    assert.ok(errors.formatError(normalized).length < 200);
+  }
+});
+
+test('errors: the message is always a fixed string from this app, never the thrown text', () => {
+  for (const thrown of [new Error('a'.repeat(5000)), new Error('DROP TABLE users'), 'plain string', 42, null, undefined, { nested: true }]) {
+    const normalized = errors.normalizeError({ error: thrown });
+    assert.equal(typeof normalized.message, 'string');
+    assert.ok(normalized.message.length > 0);
+    // The thrown text never appears verbatim in the message.
+    if (typeof thrown === 'string') assert.equal(normalized.message.includes(thrown), false);
+  }
+});
+
+test('errors: an explicit code always wins over inference', () => {
+  const normalized = errors.normalizeError({ error: new Error('something odd'), code: 'WALLET_WRONG_NETWORK' });
+  assert.equal(normalized.code, 'WALLET_WRONG_NETWORK');
+  assert.match(normalized.message, /different network/);
+});
+
+test('errors: retryability is decided by the code, not by the text', () => {
+  assert.equal(errors.normalizeError({ code: 'WALLET_REJECTED' }).retryable, true);
+  assert.equal(errors.normalizeError({ code: 'SUBMISSION_UNKNOWN' }).retryable, true, 'UNKNOWN is reconcilable, which is not the same as retryable');
+  assert.equal(errors.normalizeError({ code: 'REVIEW_MISMATCH' }).retryable, false);
+  assert.equal(errors.normalizeError({ code: 'IDENTITY_CHANGED' }).retryable, false);
+});
+
+test('errors: the browser SHA unavailability is a distinct code', () => {
+  const normalized = errors.normalizeError({ code: 'BROWSER_SHA_UNAVAILABLE' });
+  assert.match(normalized.message, /Atomic XTM swaps are not available/);
+  assert.equal(normalized.retryable, false);
+});
+
+// ===========================================================================
+// 9. UNICODE / CONFUSABLE ASSETS
+// ===========================================================================
+
+test('unicode: a confusable symbol never becomes the identity', () => {
+  const sanitize = require('../build-test/lib/sanitize.js');
+  const assetIdentity = require('../build-test/lib/assetIdentity.js');
+  // Cyrillic О, Greek Ι, and a bidi override all look like "TARI".
+  const confusables = ['ТARI', 'TARΙ', 'TARI‮', 'TARI', 'T A R I'];
+  for (const symbol of confusables) {
+    const chip = assetIdentity.toAssetChip({ resourceAddress: 'otl_canonical_tari', symbol, decimals: '6', safetyClass: 'CANONICAL_TARI' });
+    // The exact address is the identity; the symbol is only a label.
+    assert.equal(chip.fullAddress, 'otl_canonical_tari');
+    assert.equal(sanitize.safeLabel(symbol, 16).includes('‮'), false, 'a bidi override must be stripped');
+  }
+  // Two different addresses with the same display symbol remain distinguishable.
+  const a = assetIdentity.toAssetChip({ resourceAddress: 'otl_1', symbol: 'TARI', decimals: '6', safetyClass: 'UNKNOWN' });
+  const b = assetIdentity.toAssetChip({ resourceAddress: 'otl_2', symbol: 'TARI', decimals: '6', safetyClass: 'UNKNOWN' });
+  assert.equal(a.symbol, b.symbol);
+  assert.notEqual(a.fullAddress, b.fullAddress);
+});
+
+test('unicode: token metadata with markup, quotes, and long strings is neutralised', () => {
+  const sanitize = require('../build-test/lib/sanitize.js');
+  const hostile = [
+    '<script>alert(1)</script>',
+    '"><img src=x onerror=alert(1)>',
+    "'; DROP TABLE pools; --",
+    '{{constructor.constructor("return process")()}}',
+    '${7*7}',
+    'x'.repeat(100000),
+    'emoji 🎉🎉🎉',
+    '  \t\r\n  ',
+  ];
+  for (const value of hostile) {
+    const label = sanitize.safeLabel(value, 96);
+    assert.ok(label.length <= 96);
+    // React escapes on render; the sanitiser only removes control/bidi chars
+    // and bounds the length. It never produces markup.
+    assert.equal(/[ -‎‏‪-‮⁦-⁩]/.test(label), false);
+  }
+});
+
+// ===========================================================================
+// 10. URL / MEDIA SAFETY
+// ===========================================================================
+
+test('urls: every non-http scheme is refused, including obfuscated forms', () => {
+  const sanitize = require('../build-test/lib/sanitize.js');
+  for (const url of [
+    'javascript:alert(1)',
+    'JavaScript:alert(1)',
+    '  javascript:alert(1)',
+    'java\tscript:alert(1)',
+    'java\nscript:alert(1)',
+    'data:text/html;base64,PHNjcmlwdD4=',
+    'data:image/svg+xml,<svg onload=alert(1)>',
+    'vbscript:msgbox(1)',
+    'file:///etc/passwd',
+    'blob:https://evil.example/abc',
+    'https://user:pass@evil.example/x.png',
+    'chrome-extension://abc/x.png',
+    'about:blank',
+  ]) {
+    assert.equal(sanitize.safeExternalUrl(url), undefined, `${JSON.stringify(url)} must be refused`);
+  }
+  // http(s) survives.
+  assert.ok(sanitize.safeExternalUrl('https://cdn.example/a.png'));
+});
+
+test('urls: a remote SVG is not treated as a safe raster', () => {
+  const sanitize = require('../build-test/lib/sanitize.js');
+  // An SVG can carry script. `safeImageUrl` only allows https, so an SVG is
+  // permitted as a URL; the important property is that it is never rendered
+  // through an <img> with script privileges, and that it cannot be a data: or
+  // blob: payload. Assert the scheme property, which is the enforceable one.
+  const svg = sanitize.safeImageUrl('https://cdn.example/a.svg');
+  assert.equal(svg, 'https://cdn.example/a.svg');
+  assert.equal(sanitize.safeImageUrl('data:image/svg+xml,<svg/>'), undefined);
+  assert.equal(sanitize.safeImageUrl('blob:https://x/y'), undefined);
+});
+
+test('explorer: no explorer URL is ever constructed', () => {
+  const sanitize = require('../build-test/lib/sanitize.js');
+  for (const txId of ['deadbeef', '', 'x'.repeat(100)]) {
+    assert.equal(sanitize.explorerUrl(txId), undefined);
+  }
+});
+

@@ -30,6 +30,7 @@ import {
   type TariProvider,
 } from './tariWindow.js';
 import { checkNetwork } from '../lib/networks.js';
+import type { LiveIdentityInput } from '../lib/executionIdentity.js';
 
 export type WalletEvent =
   | { kind: 'accountsChanged' }
@@ -47,6 +48,10 @@ export interface WalletBridge extends WalletAdapter {
   /** Ootle readback provider bound to this wallet. Never uses an indexer. */
   readbackProvider(): OotleReadbackProvider;
   on(listener: WalletEventListener): () => void;
+  /** The provider object, for reference-identity pinning. */
+  providerObject(): object;
+  /** A live identity snapshot, for TOCTOU verification before authorization. */
+  liveIdentity(sessionNonce: string): Promise<LiveIdentityInput>;
 }
 
 function toNetworkInfo(view: { network: string; epoch?: string }, previous?: NetworkInfo): NetworkInfo {
@@ -253,6 +258,30 @@ class TariBridgeWalletAdapter implements WalletBridge {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
   }
+
+  providerObject(): object {
+    return this.provider;
+  }
+
+  /**
+   * Re-derive the live identity from the provider RIGHT NOW.
+   *
+   * Called immediately before every financial authorization. It re-reads the
+   * network and the selected account from the provider rather than trusting the
+   * session captured at connect, so a wallet that changed account, network, or
+   * capabilities in the meantime is caught.
+   */
+  async liveIdentity(sessionNonce: string): Promise<LiveIdentityInput> {
+    const network = await this.getNetwork();
+    const account = await this.getSelectedAccount();
+    return {
+      provider: this.provider,
+      providerNetwork: network.name,
+      account: account.address,
+      capabilities: this.capabilities === undefined ? undefined : ({ ...this.capabilities } as Readonly<Record<string, boolean>>),
+      nonce: sessionNonce,
+    };
+  }
 }
 
 export interface WalletService {
@@ -276,4 +305,5 @@ export function createWalletService(allowedNetworkId: string): WalletService {
   }
   return { bridge: () => bridge, allowedNetworkId };
 }
+
 

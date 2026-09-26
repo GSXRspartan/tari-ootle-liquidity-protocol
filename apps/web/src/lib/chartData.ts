@@ -77,12 +77,22 @@ export function toChartCandles(candles: readonly OhlcvCandle[], maxSignificantDi
   const points = toChartSeries([...candles], { maxSignificantDigits });
   return points.map((point, index) => {
     const candle = candles[index];
-    const ms = BigInt(point.time);
-    if (ms <= 0n) throw new ChartBasisError(`Candle ${index} has a non-positive bucket key.`);
-    const seconds = ms / MS_PER_SECOND;
-    if (seconds > BigInt(Number.MAX_SAFE_INTEGER)) throw new ChartBasisError(`Candle ${index} bucket key exceeds the chart time range.`);
+    // A malformed bucket key is a hostile-input condition, not a crash. Report
+    // it as a chart-basis failure so the caller shows a structured state rather
+    // than an unhandled SyntaxError from BigInt().
+    let seconds: number;
+    try {
+      const ms = BigInt(point.time);
+      if (ms <= 0n) throw new Error('non-positive');
+      seconds = Number(ms / MS_PER_SECOND);
+    } catch {
+      throw new ChartBasisError(`Candle ${index} has a malformed bucket key (${String(point.time)}); the series cannot be placed on a time axis.`);
+    }
+    if (!Number.isSafeInteger(seconds)) {
+      throw new ChartBasisError(`Candle ${index} bucket key exceeds the chart time range.`);
+    }
     return {
-      time: Number(seconds),
+      time: seconds,
       open: point.open,
       high: point.high,
       low: point.low,

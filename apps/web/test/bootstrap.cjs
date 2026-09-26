@@ -25,9 +25,14 @@ const STUB = require.resolve('./stubs/lightweight-charts.cjs');
 const REDIRECTS = [
   [/^lightweight-charts$/, STUB],
   [/^@tari-ootle\/wallet-adapter$/, path.join(repo, 'packages', 'wallet-adapter', 'dist', 'index.js')],
-  [/^@tari-ootle\/wallet-adapter\/(.*)$/, path.join(repo, 'packages', 'wallet-adapter', 'dist', '$1')],
+  // The declared `./crosschain` subpath resolves to the CommonJS build, exactly
+  // as it would for a real CommonJS consumer.
+  [/^@tari-ootle\/protocol-client\/crosschain$/, path.join(repo, 'packages', 'protocol-client', 'dist', 'crosschain', 'index.js')],
   [/^@tari-ootle\/protocol-client$/, path.join(repo, 'packages', 'protocol-client', 'dist', 'index.js')],
-  [/^@tari-ootle\/protocol-client\/(.*)$/, path.join(repo, 'packages', 'protocol-client', '$1')],
+  // Deep paths remain available for the pattern subpath, and are resolved
+  // relative to the package root exactly as Node would.
+  [/^@tari-ootle\/wallet-adapter\/dist\/(.*)$/, path.join(repo, 'packages', 'wallet-adapter', 'dist', '$1')],
+  [/^@tari-ootle\/protocol-client\/dist\/(.*)$/, path.join(repo, 'packages', 'protocol-client', 'dist', '$1')],
 ];
 
 const original = Module._resolveFilename;

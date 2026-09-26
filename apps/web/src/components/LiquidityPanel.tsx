@@ -17,7 +17,9 @@ import { resolveAddLiquidity, resolveRemoveLiquidity } from '@tari-ootle/protoco
 import { ammLiquidityIntentBuilder, toAmmPreview, type AmmTransactionIntent } from '@tari-ootle/wallet-adapter';
 import { useApp } from '../state/AppContext.js';
 import type { PoolDescriptor } from '../services/pools.js';
-import { executeSwap, newOperationId, type ExecutionWallets } from '../services/execution.js';
+import { executeSwap, newOperationId, IdentityChangedError, ReviewMismatchError, type ExecutionWallets } from '../services/execution.js';
+import { reviewFromAmmIntent } from '../lib/review.js';
+import { normalizeError } from '../lib/errorMessage.js';
 import { formatUnits, UNAVAILABLE } from '../lib/format.js';
 import { asRawExecutionAmount } from '../lib/tradeBoundary.js';
 import { Badge, Card, CardHeader, DataRow, Field, Notice } from './primitives.js';
@@ -27,7 +29,7 @@ const MAX_EPOCH = '1000000000';
 type Mode = 'add' | 'remove';
 
 export function LiquidityPanel({ pool }: { pool: PoolDescriptor }) {
-  const { wallet, balanceOf, readback, executionWallets } = useApp();
+  const { wallet, balanceOf, readback, executionWallets, walletBridge, liveExecutionIdentity } = useApp();
   const [mode, setMode] = useState<Mode>('add');
   const [amountA, setAmountA] = useState('');
   const [amountB, setAmountB] = useState('');
@@ -100,10 +102,17 @@ export function LiquidityPanel({ pool }: { pool: PoolDescriptor }) {
 
   const submit = useCallback(async () => {
     const wallets = executionWallets();
-    if (wallets === undefined || preview === undefined) return;
+    const bridge = walletBridge();
+    if (wallets === undefined || bridge === undefined) return;
+    if (busy) return; // double-submit guard
     setBusy(true);
     setMessage(undefined);
     try {
+      const identity = liveExecutionIdentity();
+      if (identity === undefined) {
+        setMessage({ tone: 'danger', title: 'Not submitted', detail: 'No verified wallet identity is available for this operation.' });
+        return;
+      }
       const provider = readback();
       if (provider === undefined) throw new Error('The wallet disconnected.');
       const resolved =
@@ -120,10 +129,19 @@ export function LiquidityPanel({ pool }: { pool: PoolDescriptor }) {
         setMessage({ tone: 'warn', title: `Not submitted (${resolved.status.toLowerCase()})`, detail: resolved.reason });
         return;
       }
+      // The review is built from the resolver's intent, so the amounts the user
+      // sees are the amounts the wallet is asked to sign.
+      const review = reviewFromAmmIntent({
+        intent: resolved.resolved.builderIntent,
+        operationId: newOperationId(mode === 'add' ? 'lp-add' : 'lp-remove'),
+        network: wallet.networkId ?? 'unknown',
+        identity,
+        maxEpochRaw: MAX_EPOCH,
+      });
       const result = await executeSwap<AmmTransactionIntent>(wallets as ExecutionWallets, {
         resolvedIntent: resolved.resolved.builderIntent,
         recordInput: {
-          operationId: newOperationId(mode === 'add' ? 'lp-add' : 'lp-remove'),
+          operationId: review.operationId,
           operationKind: mode === 'add' ? 'AMM_ADD_LIQUIDITY' : 'AMM_REMOVE_LIQUIDITY',
           componentOrOrderId: pool.poolComponent,
           resources:
@@ -141,6 +159,9 @@ export function LiquidityPanel({ pool }: { pool: PoolDescriptor }) {
           poolOrDestination: pool.poolComponent,
           privacyDisclosure: 'Pool reserves and amounts are revealed at the AMM boundary.',
         },
+        identity,
+        liveIdentity: await bridge.liveIdentity(identity.nonce),
+        review,
       });
       if (result.outcome === 'SUBMITTED') {
         setMessage({ tone: 'info', title: 'Submitted', detail: `Transaction ${result.transactionId}. Track it on the Activity page.` });
@@ -154,11 +175,17 @@ export function LiquidityPanel({ pool }: { pool: PoolDescriptor }) {
         setMessage({ tone: 'danger', title: 'Failed', detail: result.reason });
       }
     } catch (error) {
-      setMessage({ tone: 'danger', title: 'Not submitted', detail: (error as Error).message });
+      if (error instanceof IdentityChangedError) {
+        setMessage({ tone: 'warn', title: 'Not submitted — wallet changed', detail: `${error.message} Nothing was signed.` });
+      } else if (error instanceof ReviewMismatchError) {
+        setMessage({ tone: 'danger', title: 'Not submitted — review mismatch', detail: error.message });
+      } else {
+        setMessage({ tone: 'danger', title: 'Not submitted', detail: normalizeError({ error }).message });
+      }
     } finally {
       setBusy(false);
     }
-  }, [executionWallets, preview, mode, readback, pool, amountA, amountB, lpAmount, wallet.networkId]);
+  }, [executionWallets, walletBridge, liveExecutionIdentity, preview, mode, readback, pool, amountA, amountB, lpAmount, wallet.networkId, busy]);
 
   return (
     <Card className="stack">
@@ -261,3 +288,4 @@ export function LiquidityPanel({ pool }: { pool: PoolDescriptor }) {
     </Card>
   );
 }
+

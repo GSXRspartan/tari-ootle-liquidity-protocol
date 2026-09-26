@@ -68,6 +68,19 @@ export function isTariInjected(scope: unknown = globalThis): boolean {
 }
 
 /**
+ * The provider object currently injected, for identity comparison.
+ *
+ * Returned by reference: the caller compares it with the object it captured at
+ * connect, which is the only comparison that cannot be spoofed by a provider
+ * that merely claims the right name.
+ */
+export function currentProviderObject(scope: unknown = globalThis): object | undefined {
+  if (typeof scope !== 'object' || scope === null) return undefined;
+  const candidate = (scope as { tari?: unknown }).tari;
+  return typeof candidate === 'object' && candidate !== null ? (candidate as object) : undefined;
+}
+
+/**
  * Returns the injected provider or throws a typed refusal. There is no
  * placeholder/no-op provider: without a real provider the app is disconnected.
  */
@@ -223,6 +236,8 @@ export async function disconnectProvider(provider: TariProvider): Promise<void> 
 }
 
 const BALANCE_RESOURCE_TYPES = new Set(['fungible', 'confidential', 'stealth', 'non_fungible']);
+/** A balance above the protocol's 128-bit amount bound is malformed, not large. */
+const MAX_AMOUNT = (1n << 128n) - 1n;
 
 export async function fetchBalances(provider: TariProvider): Promise<TariBalanceView[]> {
   const reply = await call<unknown>(provider, TARI_METHODS.getBalances);
@@ -234,6 +249,11 @@ export async function fetchBalances(provider: TariProvider): Promise<TariBalance
     const amountText = typeof amount === 'bigint' ? amount.toString() : typeof amount === 'string' ? amount : typeof amount === 'number' ? String(amount) : undefined;
     if (amountText === undefined || !/^\d+$/.test(amountText)) {
       throw new TariProviderError(`Balance for ${resourceAddress} is not an exact non-negative integer.`, 'MALFORMED_REPLY');
+    }
+    // Bound the magnitude as well as the shape: an unbounded integer string from
+    // a provider is either a bug or an attempt to make the UI do unbounded work.
+    if (amountText.length > 39 || BigInt(amountText) > MAX_AMOUNT) {
+      throw new TariProviderError(`Balance for ${resourceAddress} exceeds the 128-bit protocol amount bound.`, 'MALFORMED_REPLY');
     }
     const resourceType = typeof bag.resourceType === 'string' && BALANCE_RESOURCE_TYPES.has(bag.resourceType) ? bag.resourceType : 'fungible';
     return { resourceAddress, amount: amountText, resourceType };
@@ -287,9 +307,14 @@ export async function fetchTransactionResult(provider: TariProvider, transaction
 }
 
 export function mapTransactionStatus(view: TariTransactionView): 'COMMITTED' | 'REJECTED' | 'NOT_FOUND' | 'UNKNOWN' {
-  if (/^(COMMITTED|SUCCESS|CONFIRMED|APPLIED|EXECUTED)$/.test(view.status)) return 'COMMITTED';
-  if (/^(REJECTED|FAILED|ABORTED|REVERTED)$/.test(view.status)) return 'REJECTED';
-  if (/^(NOT_FOUND|UNKNOWN_TX|UNKNOWN_TXID)$/.test(view.status)) return 'NOT_FOUND';
+  // Case-insensitive, because providers are inconsistent about casing and a
+  // lowercase "committed" must not be silently downgraded to UNKNOWN.
+  const status = view.status.toUpperCase();
+  if (/^(COMMITTED|SUCCESS|CONFIRMED|APPLIED|EXECUTED)$/.test(status)) return 'COMMITTED';
+  if (/^(REJECTED|FAILED|ABORTED|REVERTED)$/.test(status)) return 'REJECTED';
+  if (/^(NOT_FOUND|UNKNOWN_TX|UNKNOWN_TXID)$/.test(status)) return 'NOT_FOUND';
+  // Anything else — including an acknowledgement such as "submitted" or
+  // "pending" — is UNKNOWN, because a submission ACK is never finality.
   return 'UNKNOWN';
 }
 

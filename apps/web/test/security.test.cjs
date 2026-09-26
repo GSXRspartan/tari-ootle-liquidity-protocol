@@ -74,16 +74,43 @@ test('secrets: no secret-bearing protocol field is read, logged, or rendered by 
   ];
   for (const file of sourceFiles) {
     const text = fs.readFileSync(file, 'utf8');
-    const relative = path.relative(appRoot, file);
+    // A DETECTOR is not a USE. `errorMessage.ts` names secret-shaped patterns in
+    // order to strip them, and `storage.ts` names forbidden persisted fields in
+    // order to reject them. Both are the defence, not a leak.
+    const relative = path.relative(appRoot, file).split(path.sep).join('/');
+    const isDetector = /^src\/lib\/(errorMessage|storage)\.ts$/.test(relative);
+    const codeLines = text
+      .split('\n')
+      .filter((line) => !line.trim().startsWith('*') && !line.trim().startsWith('//') && !line.trim().startsWith('/*'))
+      .join('\n');
     for (const field of forbidden) {
-      // `tariWindow.ts` documents the provider parameter name in a comment only.
-      const codeLines = text
-        .split('\n')
-        .filter((line) => !line.trim().startsWith('*') && !line.trim().startsWith('//') && !line.trim().startsWith('/*'));
-      const hit = codeLines.find((line) => line.includes(field));
+      if (isDetector) {
+        // Permitted only on a regex-literal line or a quoted list entry, i.e.
+        // inside a detection pattern.
+        const offenders = codeLines
+          .split('\n')
+          .filter((line) => line.includes(field))
+          .filter((line) => !/^\s*\/.*\/[gimsuy]*\s*[,;]?\s*$/.test(line))
+          .filter((line) => !/^\s*['"][A-Za-z0-9_.-]+['"]\s*[,;]?\s*$/.test(line));
+        assert.deepEqual(offenders, [], `${relative} must only reference ${field} inside a detection pattern`);
+        continue;
+      }
+      const hit = codeLines.split('\n').find((line) => line.includes(field));
       assert.equal(hit, undefined, `${relative} must not reference ${field} in code: ${hit ?? ''}`);
     }
   }
+});
+
+test('secrets: the secret scrubber and storage validator exist and are strict', () => {
+  // The two modules that are ALLOWED to name secret-shaped strings must actually
+  // be doing the detecting.
+  const scrubber = fs.readFileSync(path.join(srcRoot, 'lib', 'errorMessage.ts'), 'utf8');
+  for (const shape of ['[A-Za-z]:\\', 'a-f0-9]{64,}', 'Authorization', 'Bearer', ':\\/\\/']) {
+    assert.ok(scrubber.includes(shape), `the scrubber must recognise the "${shape}" shape`);
+  }
+  const storage = fs.readFileSync(path.join(srcRoot, 'lib', 'storage.ts'), 'utf8');
+  assert.ok(storage.includes('FORBIDDEN_PERSISTED_FIELDS'), 'the storage validator must declare its forbidden field list');
+  assert.ok(storage.includes('lastReadback'), 'the storage validator must exclude freshness from a restored record');
 });
 
 test('secrets: the app never logs to the console', () => {
@@ -223,3 +250,4 @@ test('accessibility: focus is always visible and the skip link exists', () => {
   assert.match(shell, /skip-link/);
   assert.match(shell, /id="main"/);
 });
+

@@ -22,7 +22,9 @@ import {
 import { ammSwapIntentBuilder, toAmmPreview, type AmmTransactionIntent } from '@tari-ootle/wallet-adapter';
 import { useApp } from '../state/AppContext.js';
 import type { PoolDescriptor } from '../services/pools.js';
-import { executeSwap, newOperationId, type ExecutionWallets } from '../services/execution.js';
+import { executeSwap, newOperationId, IdentityChangedError, ReviewMismatchError, type ExecutionWallets } from '../services/execution.js';
+import { reviewFromAmmIntent } from '../lib/review.js';
+import { normalizeError, type NormalizedError } from '../lib/errorMessage.js';
 import { buildPoolIdentity, presentSafety, type AssetChip } from '../lib/assetIdentity.js';
 import { formatBps, formatUnits, UNAVAILABLE } from '../lib/format.js';
 import { DEFAULT_SLIPPAGE_BPS, SLIPPAGE_PRESETS, validateSlippageInput } from '../lib/slippage.js';
@@ -40,13 +42,31 @@ type QuoteState =
 const QUOTE_DEBOUNCE_MS = 350;
 
 /**
+ * Map a thrown value to a user-facing message without leaking internals.
+ *
+ * An identity change or a review mismatch is reported as such, because they are
+ * security-relevant and the user should understand that nothing was submitted
+ * for a reason other than a wallet rejection.
+ */
+function normalizeSubmissionFailure(error: unknown): { tone: 'warn' | 'danger' | 'info'; title: string; detail: string } {
+  if (error instanceof IdentityChangedError) {
+    return { tone: 'warn', title: 'Not submitted — wallet changed', detail: `${error.message} Nothing was signed.` };
+  }
+  if (error instanceof ReviewMismatchError) {
+    return { tone: 'danger', title: 'Not submitted — review mismatch', detail: `${error.message}` };
+  }
+  const normalized: NormalizedError = normalizeError({ error });
+  return { tone: 'danger', title: 'Swap not submitted', detail: normalized.message };
+}
+
+/**
  * Transaction validity bound. A generous but finite `with_max_epoch`: this
  * protocol has no infinite validity anywhere.
  */
 const MAX_EPOCH = '1000000000';
 
 export function SwapCard({ pool }: { pool: PoolDescriptor }) {
-  const { wallet, balanceOf, executionWallets, readback, realSubmit } = useApp();
+  const { wallet, balanceOf, executionWallets, readback, realSubmit, walletBridge, liveExecutionIdentity } = useApp();
 
   const identity = useMemo(
     () =>
@@ -63,9 +83,13 @@ export function SwapCard({ pool }: { pool: PoolDescriptor }) {
   const [slippageInput, setSlippageInput] = useState(DEFAULT_SLIPPAGE_BPS);
   const [quote, setQuote] = useState<QuoteState>({ kind: 'IDLE' });
   const [poolState, setPoolState] = useState<PoolState | undefined>(undefined);
-  const [executionMessage, setExecutionMessage] = useState<{ tone: 'warn' | 'danger'; title: string; detail: string } | undefined>(undefined);
+  const [executionMessage, setExecutionMessage] = useState<{ tone: 'warn' | 'danger' | 'info'; title: string; detail: string } | undefined>(undefined);
   const [submitting, setSubmitting] = useState(false);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  // Double-submit guard. The disabled button is a courtesy; this is the
+  // defence. A second invocation while a submission is in flight returns
+  // immediately, so only one durable operation is ever created.
+  const submitGuard = useRef(false);
 
   const from: AssetChip = inputResource === identity.base.resourceAddress ? identity.base : identity.quote;
   const to: AssetChip = from.resourceAddress === identity.base.resourceAddress ? identity.quote : identity.base;
@@ -123,17 +147,39 @@ export function SwapCard({ pool }: { pool: PoolDescriptor }) {
   const onSubmit = useCallback(async () => {
     if (resolved === undefined) return;
     const wallets = executionWallets();
-    if (wallets === undefined) {
+    const bridge = walletBridge();
+    if (wallets === undefined || bridge === undefined) {
       setExecutionMessage({ tone: 'danger', title: 'Swap not submitted', detail: 'The wallet disconnected before this swap could be submitted.' });
       return;
     }
+    if (submitGuard.current) {
+      // A second click while a submission is in flight must not create a second
+      // durable operation. The button is disabled too; this is the actual guard.
+      return;
+    }
+    submitGuard.current = true;
     setSubmitting(true);
     setExecutionMessage(undefined);
     try {
+      const identity = liveExecutionIdentity();
+      if (identity === undefined) {
+        setExecutionMessage({ tone: 'danger', title: 'Swap not submitted', detail: 'No verified wallet identity is available for this review.' });
+        return;
+      }
+      // Build the frozen review FROM the resolver's intent, so what the user
+      // approves and what the wallet is asked to sign are the same object graph.
+      const review = reviewFromAmmIntent({
+        intent: resolved.builderIntent,
+        operationId: newOperationId('swap'),
+        network: wallet.networkId ?? 'unknown',
+        identity,
+        minOutputRaw: resolved.quote.minOutput,
+        maxEpochRaw: MAX_EPOCH,
+      });
       const result = await executeSwap<AmmTransactionIntent>(wallets as ExecutionWallets, {
         resolvedIntent: resolved.builderIntent,
         recordInput: {
-          operationId: newOperationId('swap'),
+          operationId: review.operationId,
           operationKind: 'AMM_SWAP',
           componentOrOrderId: pool.poolComponent,
           resources: [from.resourceAddress, to.resourceAddress],
@@ -150,6 +196,9 @@ export function SwapCard({ pool }: { pool: PoolDescriptor }) {
           poolOrDestination: pool.poolComponent,
           privacyDisclosure: 'Pool reserves and amounts are revealed at the AMM boundary.',
         },
+        identity,
+        liveIdentity: await bridge.liveIdentity(identity.nonce),
+        review,
       });
       if (result.outcome === 'UNKNOWN') {
         setExecutionMessage({
@@ -160,13 +209,14 @@ export function SwapCard({ pool }: { pool: PoolDescriptor }) {
       } else if (result.outcome === 'FAILED') {
         setExecutionMessage({ tone: 'danger', title: 'Swap failed', detail: result.reason });
       } else {
-        setExecutionMessage({ tone: 'warn', title: 'Swap submitted', detail: `Transaction ${result.transactionId} submitted. Track it on the Activity page.` });
+        setExecutionMessage({ tone: 'info', title: 'Swap submitted', detail: `Transaction ${result.transactionId} submitted. Track it on the Activity page.` });
       }
       setQuote({ kind: 'IDLE' });
       setAmountRaw('');
     } catch (error) {
-      setExecutionMessage({ tone: 'danger', title: 'Swap not submitted', detail: (error as Error).message });
+      setExecutionMessage(normalizeSubmissionFailure(error));
     } finally {
+      submitGuard.current = false;
       setSubmitting(false);
     }
   }, [resolved, executionWallets, wallet.networkId, pool.poolComponent, from.resourceAddress, to.resourceAddress, amountRaw]);
@@ -321,3 +371,4 @@ export function SwapCard({ pool }: { pool: PoolDescriptor }) {
     </div>
   );
 }
+

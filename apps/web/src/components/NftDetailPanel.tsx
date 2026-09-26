@@ -15,11 +15,28 @@ import { resolveBuyNow, resolveSellNow, type MarketplaceResolution } from '@tari
 import { marketplaceReadbackFrom, type MarketplaceSource, type NftDescriptor } from '../services/marketplace.js';
 import { loadNftMetadata, type NftMetadata } from '../services/nftMetadata.js';
 import { useApp } from '../state/AppContext.js';
-import { executeSwap, newOperationId, type ExecutionWallets } from '../services/execution.js';
+import { executeSwap, newOperationId, IdentityChangedError, ReviewMismatchError, type ExecutionWallets } from '../services/execution.js';
+import { createReview } from '../lib/review.js';
+import { normalizeError } from '../lib/errorMessage.js';
 import { marketplaceRouteBuilder, toMarketplacePreview, type MarketplaceTransactionIntent } from '@tari-ootle/wallet-adapter';
 import { formatAddress, formatUnits, UNAVAILABLE } from '../lib/format.js';
 import { asRawExecutionAmount } from '../lib/tradeBoundary.js';
 import { Badge, Card, CardHeader, DataRow, EmptyState, Notice } from './primitives.js';
+
+/**
+ * Map a thrown value to a user-facing status without leaking internals. An
+ * identity change or a review mismatch is called out explicitly, because the
+ * user should understand that nothing was signed and why.
+ */
+function failureStatus(error: unknown, operation: string): { tone: 'warn' | 'danger'; title: string; detail: string } {
+  if (error instanceof IdentityChangedError) {
+    return { tone: 'warn', title: `Not submitted — wallet changed`, detail: `${error.message} Nothing was signed.` };
+  }
+  if (error instanceof ReviewMismatchError) {
+    return { tone: 'danger', title: 'Not submitted — review mismatch', detail: error.message };
+  }
+  return { tone: 'danger', title: `${operation} not submitted`, detail: normalizeError({ error }).message };
+}
 
 export function NftDetailPanel({
   source,
@@ -32,7 +49,7 @@ export function NftDetailPanel({
   nftId: string;
   onBack: () => void;
 }) {
-  const { wallet, readback, executionWallets } = useApp();
+  const { wallet, readback, executionWallets, walletBridge, liveExecutionIdentity } = useApp();
   const [metadata, setMetadata] = useState<NftMetadata | undefined>(undefined);
   const [imageBroken, setImageBroken] = useState(false);
   const [item, setItem] = useState<NftDescriptor | undefined>(undefined);
@@ -91,7 +108,7 @@ export function NftDetailPanel({
       }
       await submit(outcome, 'MARKET_BUY_NFT', wallets, readbackProvider);
     } catch (error) {
-      setStatus({ tone: 'danger', title: 'Buy now failed', detail: (error as Error).message });
+      setStatus(failureStatus(error, 'Buy now'));
     } finally {
       setBusy(false);
     }
@@ -125,7 +142,7 @@ export function NftDetailPanel({
       }
       await submit(outcome, 'MARKET_FILL_COLLECTION_BID', wallets, readbackProvider);
     } catch (error) {
-      setStatus({ tone: 'danger', title: 'Sell now failed', detail: (error as Error).message });
+      setStatus(failureStatus(error, 'Sell now'));
     } finally {
       setBusy(false);
     }
@@ -138,10 +155,43 @@ export function NftDetailPanel({
     provider: NonNullable<typeof readbackProvider>,
   ) => {
     if (outcome.status !== 'READY' || walletsAvailable === undefined) return;
+    const bridge = walletBridge();
+    const identity = liveExecutionIdentity();
+    if (bridge === undefined || identity === undefined) {
+      setStatus({ tone: 'danger', title: 'Not submitted', detail: 'No verified wallet identity is available for this operation.' });
+      return;
+    }
+    // The review is built from the READBACK values the resolver used, never from
+    // the discovery payload the user saw first. If they differ, the resolver has
+    // already returned STALE and execution never reaches this point.
+    const review = createReview({
+      operationId: newOperationId('nft'),
+      network: wallet.networkId ?? 'unknown',
+      account: outcome.route.inputAsset.nftId === undefined ? outcome.route.inputAsset.resourceAddress : outcome.route.inputAsset.resourceAddress,
+      identity,
+      legs: [
+        {
+          operation: outcome.route.routeKind,
+          componentAddress: outcome.route.componentOrOrderId,
+          method: outcome.route.builderOperation,
+          amounts: [
+            {
+              resourceAddress: outcome.route.inputAsset.resourceAddress,
+              amountRaw: asRawExecutionAmount(outcome.route.exactAmount, 'exactAmount'),
+              role: 'INPUT',
+              ...(outcome.route.inputAsset.nftId === undefined ? {} : { nftId: outcome.route.inputAsset.nftId }),
+            },
+            ...(outcome.route.outputAsset.nftId === undefined
+              ? [{ resourceAddress: outcome.route.outputAsset.resourceAddress, amountRaw: outcome.route.exactAmount, role: 'OUTPUT' as const }]
+              : [{ resourceAddress: outcome.route.outputAsset.resourceAddress, amountRaw: '0', role: 'OUTPUT' as const, nftId: outcome.route.outputAsset.nftId }]),
+          ],
+        },
+      ],
+    });
     const result = await executeSwap<MarketplaceTransactionIntent>(walletsAvailable as ExecutionWallets, {
       resolvedIntent: outcome.route.builderIntent,
       recordInput: {
-        operationId: newOperationId('nft'),
+        operationId: review.operationId,
         operationKind,
         componentOrOrderId: outcome.route.componentOrOrderId,
         resources: [outcome.route.outputAsset.resourceAddress, outcome.route.inputAsset.resourceAddress],
@@ -159,6 +209,9 @@ export function NftDetailPanel({
         poolOrDestination: outcome.route.componentOrOrderId,
         privacyDisclosure: 'Listing, offer, and bid terms are public on-chain.',
       },
+      identity,
+      liveIdentity: await bridge.liveIdentity(identity.nonce),
+      review,
     });
     void provider;
     if (result.outcome === 'SUBMITTED') setStatus({ tone: 'info', title: 'Submitted', detail: `Transaction ${result.transactionId}.` });
@@ -271,3 +324,5 @@ export function NftDetailPanel({
     </div>
   );
 }
+
+

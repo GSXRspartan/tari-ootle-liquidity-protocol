@@ -33,6 +33,8 @@ import type { TransactionPreview, TransactionResult } from '@tari-ootle/wallet-a
 import { toAmmPreview, toMarketplacePreview } from '@tari-ootle/wallet-adapter';
 import { historyStore } from './history.js';
 import { asRawExecutionAmount, asResourceAddress } from '../lib/tradeBoundary.js';
+import { verifyIdentity, type ExecutionIdentity, type LiveIdentityInput, type IdentityCheck } from '../lib/executionIdentity.js';
+import { diffReviewAgainstIntent, reviewFingerprint, type TransactionReview } from '../lib/review.js';
 
 export interface ExecutionWallets {
   /** The generic wallet seam. */
@@ -97,15 +99,46 @@ export interface ExecuteSwapInput<TIntent> {
   };
   toPreview: (intent: TIntent) => TransactionPreview;
   context: SigningContext;
+  /**
+   * The identity this review was built against, and the live identity re-derived
+   * from the provider immediately before signing. Both are required: a caller
+   * cannot skip the TOCTOU check.
+   */
+  identity: ExecutionIdentity;
+  liveIdentity: LiveIdentityInput;
+  /** The frozen review, so the wallet request is generated from it. */
+  review: TransactionReview;
+}
+
+export class IdentityChangedError extends Error {
+  constructor(readonly check: IdentityCheck) {
+    super(check.reason ?? 'The wallet identity changed after this review was created.');
+    this.name = 'IdentityChangedError';
+  }
+}
+
+export class ReviewMismatchError extends Error {
+  constructor(readonly mismatches: readonly string[]) {
+    super(`The transaction under review does not match what will be submitted: ${mismatches.join('; ')}`);
+    this.name = 'ReviewMismatchError';
+  }
 }
 
 /**
- * Construct → sign → submit → persist, via the protocol-client's own flow.
+ * Construct → verify identity → sign → submit → persist, via the
+ * protocol-client's own flow.
  *
- * Note the inputs are funnelled through `asRawExecutionAmount` /
- * `asResourceAddress`, which refuse branded market-data display values. That is
- * the runtime half of the market-data trust boundary; the type-level half lives
- * in `lib/tradeBoundary.ts`.
+ * Two gates run immediately before the signing call:
+ *
+ *   1. IDENTITY. The provider object, its implementation fingerprint, the
+ *      network, the account, and the advertised capabilities are all re-derived
+ *      live and compared against the snapshot the user reviewed. Any change
+ *      aborts, so an operation cannot be executed under a different identity
+ *      than the one on screen.
+ *   2. REVIEW. The review is re-diffed against the intent that will be signed.
+ *      A mismatch aborts. This is the machine check behind "shown == signed".
+ *
+ * Both run on every submission, not once per session.
  */
 export async function executeSwap<TIntent>(wallets: ExecutionWallets, input: ExecuteSwapInput<TIntent>): Promise<FlowResult> {
   input.recordInput.resources = input.recordInput.resources.map((resource, index) => asResourceAddress(resource, `resources[${index}]`));
@@ -115,12 +148,21 @@ export async function executeSwap<TIntent>(wallets: ExecutionWallets, input: Exe
     asRawExecutionAmount(input.recordInput.quote.minOutput, 'quote.minOutput');
   }
 
+  // Gate 1: time-of-check / time-of-use.
+  const check = verifyIdentity(input.identity, input.liveIdentity);
+  if (!check.ok) throw new IdentityChangedError(check);
+
+  // Gate 2: the review must describe the intent.
+  const diff = diffReviewAgainstIntent(input.review, input.resolvedIntent as unknown as Parameters<typeof diffReviewAgainstIntent>[1]);
+  if (!diff.ok) throw new ReviewMismatchError(diff.mismatches);
+  if (reviewFingerprint(input.review) !== reviewFingerprint(input.review)) throw new ReviewMismatchError(['review fingerprint is unstable']);
+
   const transport: SigningTransport<WalletEnvelope> = {
     construct: (resolvedIntent: unknown) => ({ preview: input.toPreview(resolvedIntent as TIntent) }),
     async sign(envelope: WalletEnvelope) {
-      // Layer 2/3 are a single wallet call; the protocol-client's transport
-      // contract is preserved by carrying the durable id back on the envelope.
-      const result = await wallets.signAndSubmit(envelope.preview, input.context);
+      // The provider receives the request generated from the frozen review, so
+      // the amounts it is asked to sign are the amounts the user was shown.
+      const result = await wallets.signAndSubmit({ ...envelope.preview, request: input.review.walletRequest } as TransactionPreview, input.context);
       return { ...envelope, transactionId: result.transactionId, epoch: result.epoch };
     },
     async submit(signed: WalletEnvelope) {
