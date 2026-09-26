@@ -14,6 +14,17 @@ import { PoolState, PoolReadbackProvider } from './ootle.js';
 export const FEE_DENOMINATOR = 10_000n;
 export const SLIPPAGE_DENOMINATOR = 10_000n;
 
+/**
+ * The maximum fee tier the on-chain template will accept at pool creation.
+ *
+ * `templates/fungible_pool/src/lib.rs` asserts `fee_bps > 0 && fee_bps <= MAX_FEE_BPS`
+ * with `MAX_FEE_BPS = 1_000` (10.00%). A pool reporting a larger fee is therefore an
+ * impossible state, and a quote built on one would be a quote for a pool that cannot
+ * exist. The client refuses anything outside the chain's own range instead of
+ * accepting the whole 1..=9999 space.
+ */
+export const MAX_FEE_BPS = 1_000n;
+
 /** Exact integer quote, independently derived (mirrors template + pool_ref_model). */
 export function quoteSwapOutput(reserveIn: string, reserveOut: string, input: string, feeBps: string): { output: string; effectiveInput: string } {
   const rIn = BigInt(reserveIn);
@@ -22,7 +33,9 @@ export function quoteSwapOutput(reserveIn: string, reserveOut: string, input: st
   const fee = BigInt(feeBps);
   if (rIn === 0n || rOut === 0n) throw new Error('Pool reserve is empty');
   if (amountIn === 0n) throw new Error('Swap input must be non-zero');
-  if (fee === 0n || fee >= FEE_DENOMINATOR) throw new Error(`Invalid fee tier: ${feeBps} bps`);
+  // The chain refuses to create a pool outside 1..=MAX_FEE_BPS, so a readback
+  // outside that range is impossible state and must not be quoted.
+  if (fee === 0n || fee > MAX_FEE_BPS) throw new Error(`Invalid fee tier: ${feeBps} bps (the pool template permits only 1..=${MAX_FEE_BPS} bps)`);
   const effective = (amountIn * (FEE_DENOMINATOR - fee)) / FEE_DENOMINATOR;
   if (effective === 0n) throw new Error('Swap input too small to yield any output after fee');
   const output = (rOut * effective) / (rIn + effective);
@@ -64,6 +77,22 @@ export function deriveMinOutput(quotedOutput: string, policy: SlippagePolicy): s
 function decimalAmount(value: string, field: string): bigint {
   if (!/^\d+$/.test(value)) throw new Error(`${field} must be a non-negative integer string, got ${value}`);
   return BigInt(value);
+}
+
+/**
+ * The first numeric field of a pool state that is not a raw integer string.
+ *
+ * `parsePoolState` already validates these at the readback boundary, but a
+ * resolver must not depend on that: an integration that supplies its own
+ * readback, or a test double, can hand over a state object directly. Without
+ * this check a malformed reserve reaches `BigInt()` and the resolver throws
+ * instead of returning the typed outcome its callers are written to handle.
+ */
+function malformedNumericField(pool: PoolState): string | undefined {
+  for (const name of ['reserveA', 'reserveB', 'feeBps', 'totalLpSupply', 'lockedLpSupply'] as const) {
+    if (!/^\d+$/.test(pool[name])) return name;
+  }
+  return undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -133,6 +162,10 @@ export async function resolveSwap<TIntent>(
   const read = await deps.readback.readPool(request.poolComponent);
   if (read.status === 'UNAVAILABLE') return { status: 'UNAVAILABLE', reason: read.reason };
   const pool = read.value;
+  const malformed = malformedNumericField(pool);
+  if (malformed !== undefined) {
+    return { status: 'UNAVAILABLE', reason: `Pool ${request.poolComponent} reports a malformed ${malformed}` };
+  }
   const freshness = read.freshness;
 
   if (request.expectedReserves && (pool.reserveA !== request.expectedReserves.a || pool.reserveB !== request.expectedReserves.b)) {
@@ -144,6 +177,17 @@ export async function resolveSwap<TIntent>(
 
   // Exact ResourceAddress identity — never symbol/name. Direction must be one of the two
   // canonical pool legs; anything else (including A/A) is refused.
+  //
+  // A/A is refused here as well as on-chain (`check_pool_resources` asserts
+  // `a != b`). The chain check alone is not enough: refusing before the user
+  // reviews a nonsense trade is the difference between a clear reason and a
+  // signed transaction that can only abort.
+  if (request.inputResource === request.outputResource) {
+    return { status: 'CONFLICTED', reason: `Refusing a swap of ${request.inputResource} into itself: a pool's two resources are always distinct` };
+  }
+  if (pool.resourceA === pool.resourceB) {
+    return { status: 'CONFLICTED', reason: `Pool ${request.poolComponent} reports the same resource on both legs (${pool.resourceA}); this state is impossible` };
+  }
   const isAToB = request.inputResource === pool.resourceA && request.outputResource === pool.resourceB;
   const isBToA = request.inputResource === pool.resourceB && request.outputResource === pool.resourceA;
   if (!isAToB && !isBToA) {
@@ -246,8 +290,21 @@ export async function resolveAddLiquidity<TIntent>(
   const read = await deps.readback.readPool(request.poolComponent);
   if (read.status === 'UNAVAILABLE') return { status: 'UNAVAILABLE', reason: read.reason };
   const pool = read.value;
+  const malformed = malformedNumericField(pool);
+  if (malformed !== undefined) {
+    return { status: 'UNAVAILABLE', reason: `Pool ${request.poolComponent} reports a malformed ${malformed}` };
+  }
   if (BigInt(pool.reserveA) === 0n && BigInt(pool.reserveB) === 0n) {
     return { status: 'UNAVAILABLE', reason: 'Pool is empty; first deposit is the on-chain bootstrap path (geometric mean + locked LP) and is deliberately not constructed by this resolver' };
+  }
+  // Either reserve being zero is an impossible half-initialised pool. Refusing it
+  // here also removes a BigInt division-by-zero from this path, so the resolver
+  // keeps returning a typed outcome instead of throwing into the caller.
+  if (BigInt(pool.reserveA) === 0n || BigInt(pool.reserveB) === 0n) {
+    return { status: 'UNAVAILABLE', reason: `Pool ${request.poolComponent} has an empty reserve (${pool.reserveA}/${pool.reserveB}); this state is impossible` };
+  }
+  if (BigInt(pool.totalLpSupply) === 0n) {
+    return { status: 'UNAVAILABLE', reason: `Pool ${request.poolComponent} has LP supply of zero while holding reserves; this state is impossible` };
   }
   // Proportional hint against PRE-deposit reserves (advisory display value only; the pool
   // enforces the min-side proportional mint authoritatively).
@@ -311,8 +368,18 @@ export async function resolveRemoveLiquidity<TIntent>(
   const read = await deps.readback.readPool(request.poolComponent);
   if (read.status === 'UNAVAILABLE') return { status: 'UNAVAILABLE', reason: read.reason };
   const pool = read.value;
+  const malformed = malformedNumericField(pool);
+  if (malformed !== undefined) {
+    return { status: 'UNAVAILABLE', reason: `Pool ${request.poolComponent} reports a malformed ${malformed}` };
+  }
   const total = BigInt(pool.totalLpSupply);
   if (total === 0n) return { status: 'UNAVAILABLE', reason: 'Pool LP supply is zero' };
+  // Burning more LP than exists is impossible, and the proportional amounts it
+  // would imply exceed the reserves themselves. Refusing it keeps the displayed
+  // redemption inside what the pool can actually pay.
+  if (lp > total) {
+    return { status: 'UNAVAILABLE', reason: `Cannot burn ${request.rawLpAmount} LP: the pool's total supply is ${pool.totalLpSupply}` };
+  }
   const expectedA = (lp * BigInt(pool.reserveA)) / total;
   const expectedB = (lp * BigInt(pool.reserveB)) / total;
   if (expectedA === 0n || expectedB === 0n) {

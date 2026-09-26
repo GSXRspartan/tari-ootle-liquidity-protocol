@@ -78,6 +78,24 @@ function field(envelope: EnvelopeInput, name: string): string {
   return String(raw);
 }
 
+/**
+ * A numeric field from the authoritative transport.
+ *
+ * The transport stringifies everything, so a field that should be a `u128` can
+ * arrive as `"abc"`, `"1.5"`, or `"-3"`. `parsePoolState` is the boundary every
+ * resolver reads from, so validating here removes a whole class of `BigInt(...)`
+ * throws (and BigInt division-by-zero) from the execution path instead of
+ * scattering guards through each resolver.
+ */
+function numericField(envelope: EnvelopeInput, name: string): string {
+  const raw = field(envelope, name);
+  if (!/^\d+$/.test(raw)) {
+    throw new Error(`Authoritative read of ${envelope.address} has a malformed ${name}: ${JSON.stringify(raw)} is not a non-negative integer string`);
+  }
+  return raw;
+}
+
+
 /** Readback provider interface for pools (separate from any pool discovery/search). */
 export interface PoolReadbackProvider {
   readPool(poolComponent: string): Promise<ExecutionAuthoritativeRead<PoolState>>;
@@ -88,12 +106,12 @@ export function parsePoolState(envelope: EnvelopeInput): PoolState {
     poolComponent: envelope.address,
     resourceA: field(envelope, 'resource_a'),
     resourceB: field(envelope, 'resource_b'),
-    reserveA: field(envelope, 'reserve_a'),
-    reserveB: field(envelope, 'reserve_b'),
-    feeBps: field(envelope, 'fee_bps'),
+    reserveA: numericField(envelope, 'reserve_a'),
+    reserveB: numericField(envelope, 'reserve_b'),
+    feeBps: numericField(envelope, 'fee_bps'),
     lpResource: field(envelope, 'lp_resource'),
-    totalLpSupply: field(envelope, 'total_lp_supply'),
-    lockedLpSupply: field(envelope, 'locked_lp_supply'),
+    totalLpSupply: numericField(envelope, 'total_lp_supply'),
+    lockedLpSupply: numericField(envelope, 'locked_lp_supply'),
   };
   return state;
 }
