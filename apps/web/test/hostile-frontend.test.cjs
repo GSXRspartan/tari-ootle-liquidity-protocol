@@ -1201,3 +1201,218 @@ test('double submit: every submission path uses a synchronous in-flight guard', 
   const liquidity = fsx.readFileSync(pathx.join(srcRootX, 'components', 'LiquidityPanel.tsx'), 'utf8');
   assert.match(liquidity, /finally \{\s*submitGuard\.current = false;/, 'the guard must be released in a finally block');
 });
+
+// ===========================================================================
+// F-02 AT THE ACTUAL PROVIDER BOUNDARY
+// ===========================================================================
+
+/**
+ * These tests close the loop that F-02 was about, at the only place the claim
+ * can be verified: the provider itself.
+ *
+ * F-02 was that the reviewed request and the submitted request were two
+ * independent derivations from the same intent, and their agreement was assumed
+ * rather than checked. A test that inspects an intermediate object cannot catch
+ * that class of bug, because the bug is precisely that the WRONG object arrives.
+ * So the provider here RECORDS the exact envelope it is handed, and the
+ * assertion is equality against the review the user approved.
+ */
+
+/**
+ * A provider that records every envelope it receives, verbatim.
+ *
+ * The recording is a deep clone taken at call time, so a later mutation of the
+ * caller's object cannot retroactively change the record. Without that, the
+ * comparison would prove nothing.
+ */
+function recordingProvider(reply) {
+  const seen = [];
+  return {
+    seen,
+    async request(envelope) {
+      seen.push(JSON.parse(JSON.stringify(envelope)));
+      return reply(envelope);
+    },
+  };
+}
+
+test('F-02: the provider receives the reviewed request itself, byte for byte', async () => {
+  const provider = recordingProvider(() => ({ transactionId: 'tx_provider_boundary_1', epoch: '900' }));
+
+  // The reviewed request, exactly as buildWalletRequest produces it from a
+  // review: nested legs, per-resource amounts, and a minimum output.
+  const reviewedRequest = Object.freeze({
+    transaction: Object.freeze({
+      operationId: 'nft-boundary-1',
+      network: 'esmeralda',
+      account: 'otl_account_A',
+      legs: Object.freeze([
+        Object.freeze({
+          operation: 'buy_listing',
+          componentAddress: 'component_listing_1',
+          method: 'buy_listing',
+          args: Object.freeze([
+            Object.freeze({ resourceAddress: 'otl_nft_1', amountRaw: '0', role: 'INPUT', nftId: 'series#7' }),
+            Object.freeze({ resourceAddress: 'otl_wstable_0001', amountRaw: '1000000', role: 'OUTPUT' }),
+          ]),
+          minOutputRaw: '1000000',
+          maxEpochRaw: '950',
+        }),
+      ]),
+    }),
+    display: Object.freeze({
+      operation: 'buy_listing',
+      network: 'esmeralda',
+      account: 'otl_account_A',
+      assets: ['1000000 of otl_wstable_0001'],
+    }),
+  });
+
+  await tari.signAndSubmit(provider, reviewedRequest.transaction, {
+    assets: reviewedRequest.display.assets,
+    operation: 'buy_listing',
+    network: 'esmeralda',
+    poolOrDestination: 'component_listing_1',
+  });
+
+  assert.equal(provider.seen.length, 1);
+  const envelope = provider.seen[0];
+  assert.equal(envelope.method, 'tari_signAndSubmitTransaction');
+
+  // The transaction the provider was asked to sign IS the reviewed transaction:
+  // nothing added, removed, or recomputed. `buildWalletRequest` produces
+  // `{ transaction, display }`, which is already the provider's envelope, so
+  // the signed body is `transaction` and the human context is `display`.
+  assert.deepEqual(envelope.params.transaction, reviewedRequest.transaction);
+
+  // There must be no double nesting: `transaction.transaction` is not a shape
+  // any wallet is documented to accept.
+  assert.equal(envelope.params.transaction.transaction, undefined, 'the signed transaction must not be wrapped twice');
+
+  // Specifically the fields the old {method, args, component} reconstruction
+  // lost: the component, the per-resource amounts, the NFT id, and the floor.
+  const leg = envelope.params.transaction.legs[0];
+  assert.equal(leg.componentAddress, 'component_listing_1');
+  assert.equal(leg.minOutputRaw, '1000000');
+  assert.deepEqual(leg.args, [
+    { resourceAddress: 'otl_nft_1', amountRaw: '0', role: 'INPUT', nftId: 'series#7' },
+    { resourceAddress: 'otl_wstable_0001', amountRaw: '1000000', role: 'OUTPUT' },
+  ]);
+  assert.ok(envelope.params.display.assets.includes('1000000 of otl_wstable_0001'));
+});
+
+test('F-02: the lossy preview reconstruction is measurably different at the boundary', async () => {
+  const provider = recordingProvider(() => ({ transactionId: 'tx_provider_boundary_2', epoch: '900' }));
+  // This is the shape the old code built: a method/args/component triple with no
+  // legs, no resource addresses, and no minimum output.
+  const lossy = { method: 'buy_listing', args: ['0', '1000000'], component: 'component_listing_1' };
+
+  await tari.signAndSubmit(provider, lossy, {
+    assets: ['otl_wstable_0001'],
+    operation: 'buy_listing',
+    network: 'esmeralda',
+    poolOrDestination: 'component_listing_1',
+  });
+
+  // The difference is observable at the provider, which is the point: had the
+  // old shape been signed, nothing in the envelope would have stated which
+  // resource moved, or the floor the user accepted.
+  const sent = provider.seen[0].params.transaction;
+  assert.equal(sent.legs, undefined);
+  assert.equal(sent.method, 'buy_listing');
+  assert.deepEqual(sent.args, ['0', '1000000']);
+  const serialised = JSON.stringify(sent);
+  assert.equal(/otl_wstable_0001/.test(serialised), false, 'the reconstruction names no resource address');
+  assert.equal(/minOutput/.test(serialised), false, 'the reconstruction states no minimum output');
+});
+
+test('F-02: the request is derived from the review, so the numbers have one source', () => {
+  const reviewLib = require('../build-test/lib/review.js');
+  const identity = {
+    nonce: 'n-boundary',
+    providerRef: {},
+    providerFingerprint: 'p',
+    expectedNetwork: 'esmeralda',
+    providerNetwork: 'esmeralda',
+    account: 'otl_account_A',
+    capabilityFingerprint: 'c',
+    capturedAtUnixMs: 0,
+  };
+  const review = reviewLib.createReview({
+    operationId: 'amm-boundary-1',
+    network: 'esmeralda',
+    account: 'otl_account_A',
+    identity,
+    legs: [
+      {
+        operation: 'swap',
+        componentAddress: 'component_pool_1',
+        method: 'swap',
+        amounts: [
+          { resourceAddress: 'otl_canonical_tari', amountRaw: '1000000', role: 'INPUT' },
+          { resourceAddress: 'otl_wstable_0001', amountRaw: '4000000', role: 'OUTPUT' },
+        ],
+        minOutputRaw: '3900000',
+      },
+    ],
+  });
+
+  const leg = review.walletRequest.transaction.legs[0];
+  assert.equal(leg.componentAddress, review.legs[0].componentAddress);
+  assert.equal(leg.method, review.legs[0].method);
+  assert.equal(leg.minOutputRaw, review.legs[0].minOutputRaw);
+  for (const arg of leg.args) {
+    const stated = review.legs[0].amounts.find((a) => a.resourceAddress === arg.resourceAddress);
+    assert.notEqual(stated, undefined, `the request names ${arg.resourceAddress} but the review does not`);
+    assert.equal(arg.amountRaw, stated.amountRaw);
+  }
+
+  // Frozen all the way down, so it cannot drift between approval and signing.
+  assert.equal(Object.isFrozen(review.walletRequest), true);
+  assert.equal(Object.isFrozen(review.walletRequest.transaction), true);
+  assert.equal(Object.isFrozen(review.walletRequest.transaction.legs[0]), true);
+  assert.equal(Object.isFrozen(review.walletRequest.transaction.legs[0].args[0]), true);
+});
+
+test('F-02: the signing gate requires a frozen review, and the requirement is asserted', () => {
+  // A mutable reviewed request could be edited between approval and signing,
+  // making every review check a statement about the past. The gate is in
+  // execution.ts; assert its predicate survives refactoring.
+  const executionSrc = fsx.readFileSync(pathx.join(srcRootX, 'services', 'execution.ts'), 'utf8');
+  assert.match(executionSrc, /Object\.isFrozen\(input\.review\)/);
+  assert.match(executionSrc, /Object\.isFrozen\(input\.review\.walletRequest\)/);
+
+  // And the freeze itself is real: mutation of a nested arg must throw in
+  // strict mode rather than silently succeeding.
+  const reviewLib = require('../build-test/lib/review.js');
+  const identity = {
+    nonce: 'n-frozen',
+    providerRef: {},
+    providerFingerprint: 'p',
+    expectedNetwork: 'esmeralda',
+    providerNetwork: 'esmeralda',
+    account: 'otl_account_A',
+    capabilityFingerprint: 'c',
+    capturedAtUnixMs: 0,
+  };
+  const review = reviewLib.createReview({
+    operationId: 'amm-frozen-1',
+    network: 'esmeralda',
+    account: 'otl_account_A',
+    identity,
+    legs: [
+      {
+        operation: 'swap',
+        componentAddress: 'component_pool_1',
+        method: 'swap',
+        amounts: [{ resourceAddress: 'otl_canonical_tari', amountRaw: '1000000', role: 'INPUT' }],
+        minOutputRaw: '3900000',
+      },
+    ],
+  });
+  assert.throws(() => {
+    'use strict';
+    review.walletRequest.transaction.legs[0].args[0].amountRaw = '999999999';
+  }, TypeError);
+  assert.equal(review.walletRequest.transaction.legs[0].args[0].amountRaw, '1000000');
+});

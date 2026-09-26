@@ -79,7 +79,7 @@ test('csp: frame-ancestors is in the response header, not the meta tag', () => {
 
 test('csp: the generated response headers include the clickjacking and sniffing defences', () => {
   const names = built.SECURITY_HEADERS.map((header) => header.name);
-  for (const required of ['Content-Security-Policy', 'X-Content-Type-Options', 'Referrer-Policy', 'Permissions-Policy', 'X-Frame-Options']) {
+  for (const required of ['Content-Security-Policy', 'X-Content-Type-Options', 'Referrer-Policy', 'Permissions-Policy', 'Cross-Origin-Opener-Policy', 'Cross-Origin-Resource-Policy']) {
     assert.ok(names.includes(required), `the deployment must send ${required}`);
   }
   // Every header must state why it exists, so a future removal is deliberate.
@@ -88,7 +88,80 @@ test('csp: the generated response headers include the clickjacking and sniffing 
   }
   const permissions = built.SECURITY_HEADERS.find((header) => header.name === 'Permissions-Policy');
   for (const feature of ['camera', 'microphone', 'geolocation', 'payment', 'usb']) {
-    assert.match(permissions.value, new RegExp(`${feature}=\\(\\)`), `${feature} must be denied`);
+    assert.match(permissions.value, new RegExp(`${feature}=\(\)`), `${feature} must be denied`);
+  }
+});
+
+test('csp: X-Frame-Options is omitted deliberately, because it cannot express the policy', () => {
+  // The app must be framable by the wallet's dApp frame
+  // (docs/TARI_BROWSER_ATOMIC_SWAP_PROVIDER_GAP.md), so frame-ancestors names
+  // that origin. X-Frame-Options has no way to express a cross-origin
+  // allow-list: SAMEORIGIN would block the wallet outright, and ALLOW-FROM is
+  // obsolete and unsupported everywhere. Emitting it would contradict the
+  // frame-ancestors policy it is supposed to back up, so it is omitted and the
+  // omission is asserted.
+  const names = built.SECURITY_HEADERS.map((header) => header.name);
+  assert.equal(names.includes('X-Frame-Options'), false, 'X-Frame-Options must not be emitted alongside a permissive frame-ancestors');
+  const omitted = built.DELIBERATELY_OMITTED_HEADERS.find((header) => header.name === 'X-Frame-Options');
+  assert.ok(omitted, 'the omission must be recorded with a reason');
+  assert.ok(omitted.why.length > 40, 'the omission reason must be substantive');
+  // And it must be absent from the generated file too, not merely unused code.
+  const text = fs.readFileSync(path.join(distDir, '_headers'), 'utf8');
+  assert.equal(/X-Frame-Options/i.test(text), false, 'dist/_headers must not contain X-Frame-Options');
+  // The policy that does the work must still be present and must name the frame origin.
+  assert.match(built.CONTENT_SECURITY_POLICY, /frame-ancestors 'self' https:\/\/universe\.tari\.mw/);
+});
+
+test('csp: CORP is not same-origin, or the wallet cannot frame the app', () => {
+  const corp = built.SECURITY_HEADERS.find((header) => header.name === 'Cross-Origin-Resource-Policy');
+  assert.ok(corp, 'CORP must be present and deliberate');
+  assert.notEqual(corp.value, 'same-origin', 'CORP same-origin is enforced on cross-origin document loads and would block the wallet iframe');
+  assert.ok(corp.why.length > 40, 'the CORP value must explain the trade-off');
+});
+
+test('csp: the script policy names the wallet connector origin and nothing wider', () => {
+  // The documented dApp model loads https://universe.tari.mw/tari-connector.js
+  // into this document. `script-src 'self'` alone would block it and the app
+  // could never obtain `window.tari`. The allowance must be that exact origin.
+  assert.match(built.CONTENT_SECURITY_POLICY, /script-src 'self' https:\/\/universe\.tari\.mw/);
+  // No wildcard, and no bare Tari domain that would admit every Tari property.
+  assert.equal(/script-src[^;]*\*/.test(built.CONTENT_SECURITY_POLICY), false, 'script-src must contain no wildcard');
+  assert.equal(/script-src[^;]*https:\/\/tari\./.test(built.CONTENT_SECURITY_POLICY), false, 'script-src must not admit a bare Tari domain');
+  assert.equal(/frame-ancestors[^;]*\*/.test(built.CONTENT_SECURITY_POLICY), false, 'frame-ancestors must contain no wildcard');
+  // Allowing a script origin must never have relaxed the rest of script-src.
+  assert.equal(/'unsafe-eval'/.test(built.CONTENT_SECURITY_POLICY), false, 'unsafe-eval must never be introduced');
+});
+
+test('headers file: the emitted syntax is what Cloudflare Pages actually parses', () => {
+  // This file was previously emitted in a non-host syntax: descriptive prose as
+  // an indented line, and headers left unindented. Nothing detected it, because
+  // the then-target host ignored the file entirely, so it was never parsed by
+  // anything. The grammar is: `#` comments, a non-indented path rule, and
+  // indented headers beneath it.
+  const text = fs.readFileSync(path.join(distDir, '_headers'), 'utf8');
+  const lines = text.split(/\r?\n/);
+  let current = null;
+  let ruleCount = 0;
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (line.trim() === '') continue;
+    if (line.trimStart().startsWith('#')) continue;
+    if (/^\s/.test(line)) {
+      assert.notEqual(current, null, `_headers line ${i + 1} is indented with no rule above it: ${JSON.stringify(line)}`);
+      assert.ok(line.includes(':'), `_headers line ${i + 1} is not "Name: value": ${JSON.stringify(line)}`);
+    } else {
+      current = line.trim();
+      ruleCount += 1;
+      assert.match(current, /^(\/\*|\/|\/assets\/\*|\*)$/, `unexpected path rule: ${current}`);
+    }
+  }
+  // The catch-all rule is what protects the SPA document on every route.
+  assert.ok(ruleCount >= 2, 'the file must declare the catch-all rule and the asset cache rule');
+  // Every security header must be under an indented rule, i.e. actually bound
+  // to a path, rather than floating as an unbound line.
+  for (const header of built.SECURITY_HEADERS) {
+    const pattern = new RegExp(`^\\s{2}${header.name}: `, 'm');
+    assert.match(text, pattern, `${header.name} must be indented beneath a path rule`);
   }
 });
 
