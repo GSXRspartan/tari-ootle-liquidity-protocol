@@ -41,6 +41,54 @@ export function allowedRouteTargets(record: RouteRecord, event: RouteEvent): Rou
 }
 
 /** Pure validated transition. */
+/**
+ * Deep-copy a route record.
+ *
+ * The previous implementation used `{ ...record }`, which shares the `hops`
+ * ARRAY and every hop OBJECT, plus `acceptance`, `fees`, `price`, and `pause`.
+ * Every `hop.execution = ...` assignment therefore also mutated the caller's
+ * previous record. Consequences, in order of severity:
+ *
+ *   - a UI snapshot of "quote ready" retroactively becomes "hop 1 executing",
+ *     so the review the user approved no longer matches the record;
+ *   - two consumers (UI and executor) holding the same record observe each
+ *     other's transitions, and a comparison that says "nothing changed" can be
+ *     wrong;
+ *   - a persisted record captured before an event changes after the fact, which
+ *     destroys the audit trail that recovery depends on;
+ *   - `next.price.settledTariRaw = ...` mutated the ORIGINAL record's price
+ *     model, so a pre-settlement snapshot reported a settled amount it had never
+ *     observed.
+ *
+ * Every nested object is copied, and the result is deep-frozen so that a holder
+ * of a snapshot cannot mutate it after the fact. Freezing turns a silent aliasing
+ * bug into a loud TypeError.
+ */
+export function cloneRouteRecord(record: RouteRecord): RouteRecord {
+  return {
+    ...record,
+    hops: record.hops.map((hop) => ({ ...hop, safety: { ...hop.safety }, inputAsset: { ...hop.inputAsset }, outputAsset: { ...hop.outputAsset } })),
+    acceptance: { ...record.acceptance, authorizedSourceAsset: { ...record.acceptance.authorizedSourceAsset }, allowedIntermediateAsset: { ...record.acceptance.allowedIntermediateAsset } },
+    fees: { ...record.fees },
+    price: { ...record.price },
+    sourceAsset: { ...record.sourceAsset },
+    destinationAsset: { ...record.destinationAsset },
+    recovery: { ...record.recovery },
+    ...(record.pause === undefined ? {} : { pause: { ...record.pause } }),
+    ...(record.settlementProof === undefined ? {} : { settlementProof: { ...record.settlementProof } }),
+  };
+}
+
+/** Recursively freeze a route record and everything reachable from it. */
+export function deepFreezeRouteRecord<T>(value: T): T {
+  if (value === null || typeof value !== 'object' || Object.isFrozen(value)) return value;
+  Object.freeze(value);
+  for (const key of Object.getOwnPropertyNames(value)) {
+    deepFreezeRouteRecord((value as Record<string, unknown>)[key]);
+  }
+  return value;
+}
+
 export function applyRouteEvent(record: RouteRecord, event: RouteEvent): RouteRecord {
   if (isTerminalRouteState(record.state)) {
     throw new IllegalTransitionError(`Illegal route transition: ${event.kind} from terminal state ${record.state}`);
@@ -49,15 +97,18 @@ export function applyRouteEvent(record: RouteRecord, event: RouteEvent): RouteRe
   if (target === undefined) {
     throw new IllegalTransitionError(`Illegal route transition: ${event.kind} from ${record.state}`);
   }
-  const next: RouteRecord = { ...record, state: target, updatedAtUnixMs: Date.now() };
+  // Deep copy, never a shallow spread: see `cloneRouteRecord`.
+  const next: RouteRecord = cloneRouteRecord(record);
+  next.state = target;
+  next.updatedAtUnixMs = Date.now();
   switch (event.kind) {
     case 'ACCEPT_ROUTE':
-      return next;
+      return deepFreezeRouteRecord(next);
     case 'BEGIN_HOP1': {
       const [hop1] = next.hops;
       if (!hop1) throw new IllegalTransitionError('route has no hop 1');
       hop1.execution = 'EXECUTING';
-      return next;
+      return deepFreezeRouteRecord(next);
     }
     case 'HOP1_SETTLED': {
       const [hop1] = next.hops;
@@ -76,13 +127,13 @@ export function applyRouteEvent(record: RouteRecord, event: RouteEvent): RouteRe
       hop1.settledAmountRaw = event.settledAmountRaw;
       next.settlementProof = event.proofRef;
       next.price.settledTariRaw = event.settledAmountRaw;
-      return next;
+      return deepFreezeRouteRecord(next);
     }
     case 'HOP1_UNKNOWN': {
       const [hop1] = next.hops;
       hop1.execution = 'UNKNOWN';
       hop1.failureReason = event.reason;
-      return next;
+      return deepFreezeRouteRecord(next);
     }
     case 'HOP1_FAILED': {
       const [hop1] = next.hops;
@@ -90,10 +141,10 @@ export function applyRouteEvent(record: RouteRecord, event: RouteEvent): RouteRe
       hop1.settlement = 'FAILED_TERMINAL';
       hop1.failureReason = event.reason;
       next.failureReason = event.reason;
-      return next;
+      return deepFreezeRouteRecord(next);
     }
     case 'BEGIN_HOP2_REQUOTE':
-      return next;
+      return deepFreezeRouteRecord(next);
     case 'HOP2_READY': {
       const hop2 = next.hops[1];
       if (!hop2) throw new IllegalTransitionError('route has no hop 2');
@@ -109,7 +160,7 @@ export function applyRouteEvent(record: RouteRecord, event: RouteEvent): RouteRe
         throw new IllegalTransitionError('hop-1 settlement proof has already been consumed by hop 2');
       }
       hop2.execution = 'NOT_STARTED';
-      return next;
+      return deepFreezeRouteRecord(next);
     }
     case 'BEGIN_HOP2': {
       const hop2 = next.hops[1];
@@ -121,7 +172,7 @@ export function applyRouteEvent(record: RouteRecord, event: RouteEvent): RouteRe
       hop2.execution = 'EXECUTING';
       hop2.operationId = event.operationId;
       next.proofConsumedByHop2 = true;
-      return next;
+      return deepFreezeRouteRecord(next);
     }
     case 'HOP2_SETTLED': {
       const hop2 = next.hops[1];
@@ -137,13 +188,13 @@ export function applyRouteEvent(record: RouteRecord, event: RouteEvent): RouteRe
       hop2.chainTxId = event.chainTxId;
       hop2.settledAmountRaw = event.settledAmountRaw;
       next.price.ammExpectedOutputRaw = event.settledAmountRaw;
-      return next;
+      return deepFreezeRouteRecord(next);
     }
     case 'HOP2_UNKNOWN': {
       const hop2 = next.hops[1];
       hop2.execution = 'UNKNOWN';
       hop2.failureReason = event.reason;
-      return next;
+      return deepFreezeRouteRecord(next);
     }
     case 'HOP2_FAILED': {
       const hop2 = next.hops[1];
@@ -154,30 +205,30 @@ export function applyRouteEvent(record: RouteRecord, event: RouteEvent): RouteRe
       // requote, retry deliberately, or simply keep the TARI. A terminal failure here
       // would misreport a completed cross-layer trade as a total loss.
       next.pause = { reason: 'AMM_EXECUTION_FAILED', detail: event.reason, atUnixMs: Date.now() };
-      return next;
+      return deepFreezeRouteRecord(next);
     }
     case 'SKIP_HOP2':
-      return next;
+      return deepFreezeRouteRecord(next);
     case 'SETTLE_PARTIAL':
-      return next;
+      return deepFreezeRouteRecord(next);
     case 'PAUSE':
       next.pause = { reason: event.reason, detail: event.detail, atUnixMs: Date.now() };
-      return next;
+      return deepFreezeRouteRecord(next);
     case 'REQUIRE_REQUOTE':
       next.pause = { reason: 'INTERMEDIATE_SETTLED_REQUOTE_REQUIRED', detail: event.detail, atUnixMs: Date.now() };
-      return next;
+      return deepFreezeRouteRecord(next);
     case 'HOP2_UNAVAILABLE':
       next.pause = { reason: event.reason, detail: event.detail, atUnixMs: Date.now() };
-      return next;
+      return deepFreezeRouteRecord(next);
     case 'RESUME_REQUOTE':
       next.pause = undefined;
-      return next;
+      return deepFreezeRouteRecord(next);
     case 'ENTER_RECOVERY':
       next.pause = { reason: 'AMM_QUOTE_EXPIRED', detail: event.reason, atUnixMs: Date.now() };
-      return next;
+      return deepFreezeRouteRecord(next);
     case 'RESOLVE_CONTINUE':
       next.pause = undefined;
-      return next;
+      return deepFreezeRouteRecord(next);
     case 'RESOLVE_SETTLED': {
       const hop2 = next.hops[1];
       // Recovery may only MARK a hop settled when durable evidence already proves what
@@ -202,15 +253,15 @@ export function applyRouteEvent(record: RouteRecord, event: RouteEvent): RouteRe
       }
       hop2.settlement = 'SETTLED';
       hop2.execution = 'CONFIRMED';
-      return next;
+      return deepFreezeRouteRecord(next);
     }
     case 'RESOLVE_SKIP':
-      return next;
+      return deepFreezeRouteRecord(next);
     case 'FAIL_TERMINAL':
       next.failureReason = event.reason;
-      return next;
+      return deepFreezeRouteRecord(next);
     default:
-      return next;
+      return deepFreezeRouteRecord(next);
   }
 }
 
@@ -252,3 +303,4 @@ export function validateRouteRecord(record: RouteRecord): void {
     throw new IllegalTransitionError('route minimum output is below the user-accepted minimum final output');
   }
 }
+
