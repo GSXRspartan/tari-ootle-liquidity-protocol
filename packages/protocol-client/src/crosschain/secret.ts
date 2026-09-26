@@ -56,6 +56,16 @@ export class InMemorySecretStore implements CrossChainSecretStore {
   async generateAndStore(sessionId: string): Promise<SecretPublicPart> {
     const bytes = new Uint8Array(32);
     crypto.getRandomValues(bytes);
+    // KNOWN LIMITATION (not a defect in this store, and deliberately not "fixed"
+    // here): the Minotari script engine's `handle_hash` requires the preimage to
+    // be a CANONICAL Ristretto255 point encoding, and roughly one random 32-byte
+    // string in eight is non-canonical. Detecting canonicity needs curve
+    // arithmetic, which this package deliberately does not implement (and pulling
+    // a curve library into a browser client to guard a development store would
+    // be a worse trade than the limitation). The reference/production path is
+    // therefore `ingestExternalSecret`, where the Minotari wallet itself
+    // generates S inside `send_sha_atomic_swap_transaction`. Do not treat this
+    // store as a source of claimable production secrets.
     this.secrets.set(sessionId, bytes);
     const hashH = bytesToHex(await sha256(bytes));
     this.hashes.set(sessionId, hashH);
