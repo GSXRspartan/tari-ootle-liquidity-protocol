@@ -14,7 +14,7 @@ const { renderToStaticMarkup } = require('react-dom/server');
 const { MemoryRouter, Route, Routes } = require('react-router-dom');
 
 const { AppProvider } = require('../build-test/state/AppContext.js');
-const { AppShell } = require('../build-test/components/AppShell.js');
+const { AppShell, OutageNotice } = require('../build-test/components/AppShell.js');
 const { PoolsPage } = require('../build-test/pages/PoolsPage.js');
 const { PoolPage } = require('../build-test/pages/PoolPage.js');
 const { ActivityPage } = require('../build-test/pages/ActivityPage.js');
@@ -204,7 +204,7 @@ test('render: pages never force a fixed width that would break a narrow viewport
   const bareWidths = html.match(/(?<!max-)width:\s*\d+px/g) ?? [];
   assert.deepEqual(bareWidths, [], 'no bare pixel width may be set on an element');
   assert.match(html, /class="table-wrap"/, 'wide tables scroll instead of overflowing the page');
-  // The narrow-viewport rules live in the stylesheet; see test/responsive.test.cjs.
+  // The narrow-viewport rules live in the stylesheet; see test/security.test.cjs.
 });
 
 test('accessibility: icon-only and status controls carry accessible names', () => {
@@ -217,4 +217,50 @@ test('accessibility: icon-only and status controls carry accessible names', () =
 });
 
 
+
+
+// ---------------------------------------------------------------------------
+// Outage surface (mission §35): the app must say it is degraded, globally,
+// rather than leaving the user to infer an outage from empty tables.
+// ---------------------------------------------------------------------------
+
+const { presentHealth } = require('../build-test/lib/health.js');
+
+function outageState(overrides = {}) {
+  return {
+    loading: false,
+    discovery: { pools: [], source: 'indexer:example.invalid', unavailableReason: 'Pool discovery is unavailable. The discovery endpoint did not answer within 12s.' },
+    pools: [],
+    health: presentHealth({ status: 'UNAVAILABLE', source: 'indexer:example.invalid', reason: 'The discovery endpoint did not answer within 12s.' }),
+    ...overrides,
+  };
+}
+
+test('outage: the shell states the outage globally instead of only showing empty tables', () => {
+  const html = renderToStaticMarkup(h(OutageNotice, { state: outageState() }));
+  assert.match(html, /Market data is unavailable/);
+  assert.match(html, /did not answer within 12s/);
+  // It must be honest about what is and is not affected.
+  assert.match(html, /Nothing is being fabricated/);
+  assert.match(html, /authoritative rereads.*are unaffected|Wallet signing and authoritative rereads/);
+});
+
+test('outage: no banner is rendered while discovery is still running', () => {
+  const html = renderToStaticMarkup(h(OutageNotice, { state: outageState({ loading: true }) }));
+  assert.equal(html, '', 'a loading state is not an outage yet');
+});
+
+test('outage: a healthy source never renders the outage banner', () => {
+  const html = renderToStaticMarkup(
+    h(OutageNotice, {
+      state: {
+        loading: false,
+        discovery: { pools: [], source: 'indexer:example.invalid' },
+        pools: [],
+        health: presentHealth({ status: 'SYNCED', source: 'indexer:example.invalid' }),
+      },
+    }),
+  );
+  assert.equal(html, '', 'an empty-but-healthy list is not an outage');
+});
 

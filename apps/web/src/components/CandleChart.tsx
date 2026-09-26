@@ -21,10 +21,17 @@ import { formatNumber, UNAVAILABLE } from '../lib/format.js';
 import { Badge, EmptyState, SegmentedControl } from './primitives.js';
 import type { CandleInterval } from '@tari-ootle/protocol-client';
 
-const UP = '#4ade80';
+/**
+ * Chart colours are declared as literals because lightweight-charts paints to a
+ * canvas and cannot read CSS custom properties. They are kept in step with
+ * `styles/tokens.css`: `UP`/`DOWN` mirror `--up`/`--down`, and the price line uses
+ * the lime brand accent.
+ */
+const UP = '#35d69a';
 const DOWN = '#fb7185';
-const VOL_UP = 'rgba(74, 222, 128, 0.45)';
-const VOL_DOWN = 'rgba(251, 113, 133, 0.45)';
+const VOL_UP = 'rgba(53, 214, 154, 0.42)';
+const VOL_DOWN = 'rgba(251, 113, 133, 0.42)';
+const ACCENT = '#b7f04a';
 
 const CHART_THEME = {
   layout: {
@@ -117,7 +124,7 @@ export function CandleChart({
       wickDownColor: DOWN,
       priceLineVisible: true,
       priceLineStyle: LineStyle.Dotted,
-      priceLineColor: '#4fd1c5',
+      priceLineColor: ACCENT,
       lastValueVisible: true,
     });
     candleSeriesRef.current = candleSeries;

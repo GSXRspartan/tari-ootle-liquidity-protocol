@@ -254,13 +254,14 @@ export function PoolsPage() {
 
 function PoolHealthBadge({ poolComponent }: { poolComponent: string }) {
   const { market } = useApp();
-  const pool = market.pools.find((entry) => entry.poolComponent === poolComponent);
-  void pool;
-  // Pool-level health is only available once a wallet-backed market-data bundle
-  // exists; otherwise the global source health applies to every row.
+  // Per-pool health is only available once a wallet-backed market-data bundle
+  // exists for that pool; until then the global source health is the honest
+  // answer for the row. The earlier version of this component looked the pool up
+  // and discarded it (`void pool`), which read as a resolved per-pool state and
+  // was not one.
   const presentation = presentHealth({ status: market.health.status, source: market.health.label, reason: market.health.detail });
   return (
-    <Badge tone={presentation.severity === 'ok' ? 'ok' : presentation.severity === 'info' ? 'info' : presentation.severity === 'warn' ? 'warn' : 'danger'} title={presentation.detail}>
+    <Badge tone={presentation.severity === 'ok' ? 'ok' : presentation.severity === 'info' ? 'info' : presentation.severity === 'warn' ? 'warn' : 'danger'} title={`${poolComponent}: ${presentation.detail}`}>
       {presentation.label}
     </Badge>
   );

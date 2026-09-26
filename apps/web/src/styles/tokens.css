@@ -30,15 +30,18 @@
   --text-3: #6f7b8f;
   --text-inverse: #0a0d12;
 
-  /* Accent — a single cool teal, used sparingly. */
-  --accent: #4fd1c5;
-  --accent-dim: #2b8f88;
-  --accent-wash: rgba(79, 209, 197, 0.12);
-  --accent-line: rgba(79, 209, 197, 0.34);
+  /* Accent — Tari-inspired acid lime, used sparingly and never as a surface.
+     It marks the active route, the selected control, the primary action and the
+     current-price line; everything else stays a dark neutral. */
+  --accent: #b7f04a;
+  --accent-dim: #6f9426;
+  --accent-wash: rgba(183, 240, 74, 0.13);
+  --accent-line: rgba(183, 240, 74, 0.36);
 
-  /* Status. */
-  --up: #4ade80;
-  --up-wash: rgba(74, 222, 128, 0.12);
+  /* Status. `--up` is deliberately a cooler emerald than the brand accent so a
+     price direction can never be confused with a brand/interaction highlight. */
+  --up: #35d69a;
+  --up-wash: rgba(53, 214, 154, 0.12);
   --down: #fb7185;
   --down-wash: rgba(251, 113, 133, 0.12);
   --warn: #fbbf24;

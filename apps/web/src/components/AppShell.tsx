@@ -5,7 +5,7 @@
 
 import { useState, type ReactNode } from 'react';
 import { NavLink, Link } from 'react-router-dom';
-import { useApp } from '../state/AppContext.js';
+import { useApp, type MarketDataState } from '../state/AppContext.js';
 import { Badge, Notice, Dialog, type BadgeTone } from './primitives.js';
 import { capabilityRows, atomicSwapAvailability, type SwapDirectionKind } from '../lib/capabilities.js';
 import { FRONTEND_NETWORKS } from '../lib/networks.js';
@@ -160,8 +160,35 @@ function WalletDetails({ open, onClose }: { open: boolean; onClose: () => void }
   );
 }
 
+/**
+ * Global outage surface (mission §35).
+ *
+ * Discovery and market-data health are global states. Without this banner a
+ * user has to infer an outage from every table being empty, which is exactly
+ * the failure mode where "the endpoint never answered" and "there are zero
+ * pools" are indistinguishable. The reason text comes from the discovery layer
+ * verbatim; nothing here is synthesised, and execution is unaffected because it
+ * always performs an authoritative reread.
+ *
+ * Exported as its own component so the state machine that decides *when* to say
+ * this is testable without running an effect.
+ */
+export function OutageNotice({ state }: { state: MarketDataState }) {
+  if (state.loading) return null;
+  if (state.health.status !== 'UNAVAILABLE') return null;
+  if (state.discovery.unavailableReason === undefined) return null;
+  return (
+    <div style={{ maxWidth: 'var(--shell-max)', margin: '0 auto', padding: 'var(--s-4) var(--s-4) 0', width: '100%' }}>
+      <Notice tone="warn" title="Market data is unavailable">
+        {state.discovery.unavailableReason} Nothing is being fabricated to fill the gap: no pools, trades, candles, or collections are shown unless they
+        were actually read. Wallet signing and authoritative rereads are separate from this discovery path and are unaffected.
+      </Notice>
+    </div>
+  );
+}
+
 export function AppShell({ children }: { children: ReactNode }) {
-  const { config, wallet } = useApp();
+  const { config, wallet, market } = useApp();
   const walletError = wallet.status === 'ERROR' ? wallet.error : undefined;
 
   return (
@@ -194,10 +221,12 @@ export function AppShell({ children }: { children: ReactNode }) {
               <NavLink
                 key={item.to}
                 to={item.to}
-                className={({ isActive }) =>
-                  `btn btn--sm ${isActive ? '' : 'btn--ghost'}`.trim()
+                className={({ isActive }) => `btn btn--sm ${isActive ? '' : 'btn--ghost'}`.trim()}
+                /* The active route is one of the few places the lime accent is
+                   used: it marks "where you are" and nothing else. */
+                style={({ isActive }) =>
+                  isActive ? { background: 'var(--surface-3)', color: 'var(--text-1)', boxShadow: 'inset 0 -2px 0 var(--accent)' } : undefined
                 }
-                style={({ isActive }) => (isActive ? { background: 'var(--surface-3)', color: 'var(--text-1)' } : undefined)}
               >
                 {item.label}
               </NavLink>
@@ -232,6 +261,12 @@ export function AppShell({ children }: { children: ReactNode }) {
           </Notice>
         </div>
       )}
+
+      {/*
+        Global outage surface. The rendering decision lives in `OutageNotice`
+        above so it is testable without running effects in a server render.
+      */}
+      <OutageNotice state={market} />
 
       {config.developmentReason !== undefined && (
         <div style={{ maxWidth: 'var(--shell-max)', margin: '0 auto', padding: 'var(--s-4) var(--s-4) 0', width: '100%' }}>
