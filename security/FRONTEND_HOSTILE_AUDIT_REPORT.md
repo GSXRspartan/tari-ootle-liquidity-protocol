@@ -159,7 +159,7 @@ blocked.
 | — route immutability | `route_immutability` | **8/8** |
 | — packaging | `packaging` | **9/9** |
 | wallet-adapter | `pnpm --filter @tari-ootle/wallet-adapter run test` | **21/21** |
-| frontend, node | `pnpm --filter @tari-ootle/web run test` | **202/202** |
+| frontend, node | `pnpm --filter @tari-ootle/web run test` | **202/202** at the time of this report; **221/221** after the Pixel Canary pass added the bounded-transport, outage-notice and provider-liveness regressions (see `security/PIXEL_CANARY_FULL_ATTACK_MATRIX.md`) |
 | browser flows, Chromium | `playwright test --project=chromium-desktop --project=chromium-mobile` | **96/96** (48 flows × 2 projects) |
 | hosting flows | `playwright test --project=hosting` | **17/17** — headers, clickjacking, CSP enforcement, real Ootle outage |
 | typecheck | `pnpm --filter @tari-ootle/web run typecheck` | clean |
