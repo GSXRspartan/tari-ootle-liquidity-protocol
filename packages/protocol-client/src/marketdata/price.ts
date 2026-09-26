@@ -69,24 +69,26 @@ export function toDisplayPrice(price: PriceRational, maxSignificantDigits = 12):
   const num = BigInt(price.numerator) * 10n ** BigInt(price.baseDecimals);
   const den = BigInt(price.denominator) * 10n ** BigInt(price.quoteDecimals);
   if (den <= 0n) throw new Error('price denominator must be positive');
+  if (num < 0n) throw new Error('price numerator must be non-negative');
   if (num === 0n) return { value: '0', approximate: false };
-  // Determine the decimal exponent by comparing magnitudes, then scale for long division.
-  const digits = (v: bigint): number => v.toString().length;
-  const numDigits = digits(num);
-  const denDigits = digits(den);
-  // value = num/den ≈ 10^(numDigits - denDigits) * (num / 10^numDigits) / (den / 10^denDigits)
-  const scale = numDigits - denDigits;
-  const scaled = num * 10n ** BigInt(Math.max(0, maxSignificantDigits + 2 + denDigits - numDigits));
-  const q = scaled / den;
-  const digitsStr = q.toString().padStart(Math.max(1, numDigits - denDigits + q.toString().length), '0');
-  const intLen = digitsStr.length - (maxSignificantDigits + 2);
-  if (intLen <= 0) {
-    return { value: `0.${digitsStr.padStart(maxSignificantDigits + 2, '0').slice(0, maxSignificantDigits)}`, approximate: true };
+
+  // Exact long division: the integer part is never estimated, and the fraction is
+  // generated digit by digit so a value with many integer digits (for example
+  // 25.0) does not acquire spurious leading digits.
+  const intQ = num / den;
+  let remainder = num % den;
+  const intText = intQ.toString();
+  const digits: string[] = [];
+  for (let i = 0; i < maxSignificantDigits && remainder > 0n; i += 1) {
+    const scaled = remainder * 10n;
+    digits.push((scaled / den).toString());
+    remainder = scaled % den;
   }
-  const intPart = digitsStr.slice(0, intLen);
-  const fracPart = digitsStr.slice(intLen, intLen + maxSignificantDigits).replace(/0+$/, '');
-  const value = fracPart.length > 0 ? `${intPart}.${fracPart}` : intPart;
-  void scale;
+  // Bound the fraction by the significant-digit budget: if the integer part is
+  // wide, fewer fraction digits are meaningful.
+  const fractionBudget = Math.max(0, maxSignificantDigits - intText.length);
+  const fracText = digits.join('').slice(0, fractionBudget).replace(/0+$/, '');
+  const value = fracText.length > 0 ? `${intText}.${fracText}` : intText;
   return { value, approximate: true };
 }
 
