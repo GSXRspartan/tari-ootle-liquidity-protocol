@@ -103,6 +103,7 @@ const AMM_BUILDER = { swap: (i) => ({ kind: 'swap-intent', ...i }) };
 function ammPolicy(over = {}) {
   return {
     intermediateAmount: over.intermediateAmount ?? { mode: 'ACCEPT_IF_AT_LEAST', minimumRaw: '1' },
+    expectedIntermediateRaw: over.expectedIntermediateRaw,
     acceptedMinimumFinalOutputRaw: over.acceptedMinimumFinalOutputRaw ?? '4000000',
     maxRoutePriceDriftBps: over.maxRoutePriceDriftBps ?? '500',
     allowDustInput: over.allowDustInput ?? false,
@@ -464,6 +465,25 @@ test('4.4 a wrong-direction or wrong-pool request is refused by the authoritativ
   assert.match(wrongPool.reason, /not this pool's pair/);
   const feeChanged = await buildHop2({}, { feeBps: '250' });
   assert.equal(feeChanged.status, 'BUILT', 'a different fee tier is still a valid pool; the quote uses the read fee');
+});
+
+test('4.5 ABORT_AND_PAUSE compares the settled amount against the ROUTE expectation, and refuses to build without one', async () => {
+  // Regression (Pixel Canary second pass): the previous implementation compared the settled
+  // amount with ITSELF (the settlement proof it came from), so ABORT_AND_PAUSE was a silent
+  // no-op — a mode that looked like protection and protected nothing.
+  const matching = await buildHop2({}, {}, { intermediateAmount: { mode: 'ABORT_AND_PAUSE' }, expectedIntermediateRaw: '5000000' });
+  assert.equal(matching.status, 'BUILT', 'the exact expected amount builds');
+  const drifted = await buildHop2(
+    { proof: makeProof({ l2BalanceRead: { status: 'FOUND', value: { account: 'acct_taker_1', resourceAddress: TARI.resourceAddress, amountRaw: '4999999' }, freshness: fresh() } }) },
+    {},
+    { intermediateAmount: { mode: 'ABORT_AND_PAUSE' }, expectedIntermediateRaw: '5000000' },
+  );
+  assert.equal(drifted.status, 'REQUOTE_REQUIRED', 'a deviation from the route expectation must pause, not build');
+  assert.match(drifted.reason, /differs from the route expectation/);
+  // selecting the mode without an expectation must fail closed, not silently degrade to "no policy"
+  const noExpectation = await buildHop2({}, {}, { intermediateAmount: { mode: 'ABORT_AND_PAUSE' } });
+  assert.equal(noExpectation.status, 'REQUOTE_REQUIRED', 'ABORT_AND_PAUSE without an expectation refuses to build');
+  assert.match(noExpectation.reason, /requires expectedIntermediateRaw/);
 });
 
 // ===========================================================================

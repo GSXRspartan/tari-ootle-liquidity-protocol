@@ -83,6 +83,16 @@ export type IntermediateAmountPolicy =
 
 export interface AmmSwapPolicy {
   intermediateAmount: IntermediateAmountPolicy;
+  /**
+   * The route's expectation for the intermediate amount (the route-quote hop-2 input).
+   *
+   * ABORT_AND_PAUSE is defined against THIS expectation. Without it the mode would be
+   * vacuous — the settled amount always trivially equals the settlement proof it came from,
+   * so a previous implementation's self-comparison never fired and the mode silently
+   * protected nothing. When ABORT_AND_PAUSE is selected without an expectation the build is
+   * refused (fail closed) rather than allowed to look like protection it does not provide.
+   */
+  expectedIntermediateRaw?: string;
   /** The user's accepted final minimum. A refreshed quote below this forces a requote. */
   acceptedMinimumFinalOutputRaw: string;
   /** Refreshed quote above this relative to the original expected output forces a requote. */
@@ -154,8 +164,19 @@ export async function buildAmmSwapHop(
   // 4. Route-level policy on the intermediate amount, BEFORE spending a read.
   const policy = deps.policy.intermediateAmount;
   if (policy.mode === 'ABORT_AND_PAUSE') {
-    if (settled !== input.settlementProof.resultingAmountRaw) {
-      return { status: 'REQUOTE_REQUIRED', reason: 'intermediate amount policy mismatch', inputAmountRaw: settled };
+    if (deps.policy.expectedIntermediateRaw === undefined) {
+      return {
+        status: 'REQUOTE_REQUIRED',
+        reason: 'ABORT_AND_PAUSE requires expectedIntermediateRaw (the route-quote hop-2 input); without it the mode protects nothing',
+        inputAmountRaw: settled,
+      };
+    }
+    if (BigInt(settled) !== BigInt(deps.policy.expectedIntermediateRaw)) {
+      return {
+        status: 'REQUOTE_REQUIRED',
+        reason: `settled intermediate ${settled} differs from the route expectation ${deps.policy.expectedIntermediateRaw} (ABORT_AND_PAUSE)`,
+        inputAmountRaw: settled,
+      };
     }
   } else if (BigInt(settled) < BigInt(policy.minimumRaw)) {
     return { status: 'REQUOTE_REQUIRED', reason: `settled intermediate ${settled} below the accepted minimum ${policy.minimumRaw}`, inputAmountRaw: settled };
