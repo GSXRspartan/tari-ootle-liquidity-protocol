@@ -80,6 +80,13 @@ jobs:
       - name: Install workspace dependencies
         run: pnpm install --frozen-lockfile
 
+      # wallet-adapter typechecks and tests against protocol-client's BUILT output
+      # (dist/ is not committed), so the dependency must be built first. In the
+      # previous single-job layout this happened implicitly through job ordering;
+      # as a standalone job it must be explicit.
+      - name: Build protocol-client (workspace dependency)
+        run: pnpm --filter @tari-ootle/protocol-client run build
+
       - name: wallet-adapter typecheck + tests
         run: pnpm --filter @tari-ootle/wallet-adapter run typecheck && pnpm --filter @tari-ootle/wallet-adapter run test
 
@@ -104,6 +111,13 @@ jobs:
       - name: Install workspace dependencies
         run: pnpm install --frozen-lockfile
 
+      # The web app typechecks, tests, and builds against both workspace packages'
+      # BUILT output (dist/ is not committed), so both must be built first.
+      - name: Build workspace packages
+        run: |
+          pnpm --filter @tari-ootle/protocol-client run build
+          pnpm --filter @tari-ootle/wallet-adapter run build
+
       - name: web typecheck + tests
         run: pnpm --filter @tari-ootle/web run typecheck && pnpm --filter @tari-ootle/web run test
 
@@ -112,6 +126,11 @@ jobs:
 
       # A build-time existence check is not a delivery guarantee: it proves the file was
       # emitted, not that a host served it. R-1 stays open until the deployed origin is
+      # observed (see docs/TESTNET_HOSTING.md).
+      - name: Verify the deployment headers were emitted
+        run: |
+          test -f apps/web/dist/_headers || { echo "dist/_headers is missing"; exit 1; }
+          grep -q 'frame-ancestors' apps/web/dist/_headers || { echo "frame-ancestors missing"; exit 1; }
 
   browser-security:
     # Real-browser security flows, in three projects: Chromium desktop, Chromium mobile
@@ -138,6 +157,12 @@ jobs:
       - name: Install workspace dependencies
         run: pnpm install --frozen-lockfile
 
+      # The e2e build resolves both workspace packages' built output.
+      - name: Build workspace packages
+        run: |
+          pnpm --filter @tari-ootle/protocol-client run build
+          pnpm --filter @tari-ootle/wallet-adapter run build
+
       - name: Install Playwright browsers
         run: pnpm --filter @tari-ootle/web exec playwright install --with-deps chromium firefox
 
@@ -154,9 +179,3 @@ jobs:
           name: playwright-artifacts
           path: apps/web/test-results/
           retention-days: 7
-
-      # observed (see docs/TESTNET_HOSTING.md).
-      - name: Verify the deployment headers were emitted
-        run: |
-          test -f apps/web/dist/_headers || { echo "dist/_headers is missing"; exit 1; }
-          grep -q 'frame-ancestors' apps/web/dist/_headers || { echo "frame-ancestors missing"; exit 1; }
