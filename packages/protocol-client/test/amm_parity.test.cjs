@@ -78,6 +78,13 @@ test('amm: the highest fee tier the chain permits is still quotable', async () =
 });
 
 test('amm: fee parity is enforced by the quote helper itself', () => {
+  // The chain refuses to create a pool outside 1..=MAX_FEE_BPS, so the quote helper
+  // must refuse the same range at its own boundary — never price impossible state.
+  assert.throws(() => quoteSwapOutput('1000', '1000', '100', '0'), /fee tier/);
+  assert.throws(() => quoteSwapOutput('1000', '1000', '100', '1001'), /fee tier/i);
+  assert.throws(() => quoteSwapOutput('1000', '1000', '100', '9999'), /fee tier/i);
+  assert.equal(MAX_FEE_BPS, 1000n);
+});
 
 // ---------------------------------------------------------------------------
 // 2. Same-resource (A/A) refusal
@@ -127,6 +134,7 @@ test('amm: burning the entire supply is still allowed and returns both sides', a
   assert.equal(result.status, 'ACTIVE');
   assert.equal(result.resolved.expectedA, '1000000000');
   assert.equal(result.resolved.expectedB, '4000000000');
+});
 
 // ---------------------------------------------------------------------------
 // 4. Malformed authoritative numbers never reach BigInt
@@ -173,10 +181,4 @@ test('amm: a hostile readback that returns garbage numbers yields UNAVAILABLE, n
     builder: BUILDER,
   });
   assert.equal(result.status, 'UNAVAILABLE');
-});
-
-});
-
-  assert.throws(() => quoteSwapOutput('1000', '1000', '100', '1001'), /fee tier/i);
-  assert.equal(MAX_FEE_BPS, 1000n);
 });
