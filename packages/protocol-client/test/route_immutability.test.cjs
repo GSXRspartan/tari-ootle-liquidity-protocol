@@ -182,7 +182,20 @@ test('immutability: the input record is also frozen after a transition, closing 
   const a = route.applyRouteEvent(input, { kind: 'ACCEPT_ROUTE' });
   const b = route.applyRouteEvent(input, { kind: 'ACCEPT_ROUTE' });
   assert.notEqual(a, b);
-  assert.deepEqual(JSON.parse(JSON.stringify(a)), JSON.parse(JSON.stringify(b)), 'the same event from the same base yields equal state');
+  // `updatedAtUnixMs` is the wall-clock time of EACH transition by definition,
+  // so two applications a millisecond apart (which a fast CI runner straddles —
+  // observed as the only difference in this assertion's CI failure) must differ
+  // in that field and in nothing else. The comparison normalises the stamp and
+  // keeps the full-depth equality, so a genuine shared-reference mutation of
+  // any nested route object still fails here.
+  const normalise = (record) => {
+    const copy = JSON.parse(JSON.stringify(record));
+    copy.updatedAtUnixMs = '<wall-clock>';
+    return copy;
+  };
+  assert.deepEqual(normalise(a), normalise(b), 'the same event from the same base yields equal state');
+  assert.ok(Number.isFinite(a.updatedAtUnixMs) && a.updatedAtUnixMs >= input.updatedAtUnixMs, 'each transition carries a fresh wall-clock stamp');
+  assert.ok(b.updatedAtUnixMs >= a.updatedAtUnixMs);
 });
 
 test('immutability: cloneRouteRecord produces an independent deep copy', () => {

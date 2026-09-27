@@ -50,7 +50,13 @@ export default defineConfig({
   // The mock provider is installed per page, so tests must not share state.
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
-  retries: process.env.CI ? 1 : 0,
+  // Two CI retries absorb the Playwright/Firefox driver's own "Internal error:
+  // step id not found" — an infrastructure fault that occurs under parallel
+  // load and vanishes on a fresh fixture (the same tests pass when run alone).
+  // It is NOT a licence for a failing assertion: a genuine refusal bypass fails
+  // identically on every attempt, and a flaky-but-real finding still surfaces
+  // as "flaky" in the report.
+  retries: process.env.CI ? 2 : 0,
   // Firefox falls back to software rendering on CI and on machines without GPU
   // acceleration, which is several times slower than Chromium at the same
   // assertions. Workers are capped so the suite degrades predictably rather
