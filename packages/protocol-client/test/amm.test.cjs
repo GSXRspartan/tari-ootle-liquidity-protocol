@@ -211,6 +211,60 @@ test('readback provider surfaces missing components and missing fields fail-clos
   assert.match(bad.reason, /missing field/);
 });
 
+test('readback provider refuses an unrecognized status instead of normalizing it toward execution', async () => {
+  // Regression (Pixel Canary fourth pass): an unrecognized status string used to
+  // normalize to the most permissive value ('ACTIVE'), so a malformed, future, or
+  // tampered readback presented an unknown component state as executable.
+  const marketplaceEnvelope = (templateName, status) => ({
+    address: 'component_1',
+    templateName,
+    substateVersion: '1',
+    fields: {
+      seller_account: 'seller_1', buyer_account: 'buyer_1', collection_resource: 'collection_1', nft_id: 'nft_1',
+      quote_resource: 'quote_1', price: '10', amount: '10', price_per_nft: '10', original_quantity: '1',
+      remaining_quantity: '1', original_escrow: '10', remaining_escrow: '10', created_at_epoch: '1',
+      expires_at_epoch: '2', status,
+    },
+  });
+  for (const status of ['active', 'OPEN', 'PENDING_SETTLEMENT', '', 'SOLD_PENDING']) {
+    const provider = createOotleReadbackProvider(
+      { readComponent: async (address) => marketplaceEnvelope('FixedPriceListing', status) },
+      'WALLET_PROVIDER',
+    );
+    const listing = await provider.readListing('component_1');
+    assert.equal(listing.status, 'UNAVAILABLE', `a listing with status ${JSON.stringify(status)} must not parse as ACTIVE`);
+    assert.match(listing.reason, /unrecognized .* status/);
+    const offerReader = createOotleReadbackProvider(
+      { readComponent: async () => marketplaceEnvelope('ItemOffer', status) },
+      'WALLET_PROVIDER',
+    );
+    const offer = await offerReader.readItemOffer('component_1');
+    assert.equal(offer.status, 'UNAVAILABLE', `an offer with status ${JSON.stringify(status)} must not parse as ACTIVE`);
+    const bidReader = createOotleReadbackProvider(
+      { readComponent: async () => marketplaceEnvelope('CollectionBid', status) },
+      'WALLET_PROVIDER',
+    );
+    const bid = await bidReader.readCollectionBid('component_1');
+    assert.equal(bid.status, 'UNAVAILABLE', `a bid with status ${JSON.stringify(status)} must not parse as ACTIVE`);
+  }
+  // every legitimate status still parses
+  for (const [templateName, reader, statuses] of [
+    ['FixedPriceListing', 'readListing', ['ACTIVE', 'SOLD', 'CANCELLED', 'EXPIRED']],
+    ['ItemOffer', 'readItemOffer', ['ACTIVE', 'ACCEPTED', 'CANCELLED', 'EXPIRED']],
+    ['CollectionBid', 'readCollectionBid', ['ACTIVE', 'PARTIALLY_FILLED', 'FILLED', 'CANCELLED', 'EXPIRED']],
+  ]) {
+    for (const status of statuses) {
+      const provider = createOotleReadbackProvider(
+        { readComponent: async () => marketplaceEnvelope(templateName, status) },
+        'WALLET_PROVIDER',
+      );
+      const read = await provider[reader]('component_1');
+      assert.equal(read.status, 'FOUND', `${templateName} status ${status} must parse`);
+      assert.equal(read.value.status, status);
+    }
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Resource routing policy
 // ---------------------------------------------------------------------------

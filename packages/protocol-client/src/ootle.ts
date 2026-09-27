@@ -159,6 +159,8 @@ export function createOotleReadbackProvider(reader: AuthoritativeSubstateReader,
       const read = await readEnvelope(address, 'FixedPriceListing');
       if (read.status === 'UNAVAILABLE') return { status: 'UNAVAILABLE', reason: read.reason };
       const e = read.value;
+      const parsedStatus = parseStatus(field(e, 'status'), LISTING_STATUSES, 'listing');
+      if (!parsedStatus.ok) return { status: 'UNAVAILABLE', reason: parsedStatus.reason };
       return {
         status: 'FOUND',
         value: {
@@ -170,7 +172,7 @@ export function createOotleReadbackProvider(reader: AuthoritativeSubstateReader,
           price: field(e, 'price'),
           createdAtEpoch: optionalField(e, 'created_at_epoch'),
           expiresAtEpoch: field(e, 'expires_at_epoch'),
-          status: normalizeStatus(field(e, 'status'), ['ACTIVE', 'SOLD', 'CANCELLED', 'EXPIRED'], 'ACTIVE'),
+          status: parsedStatus.value,
         },
         freshness: read.freshness,
       };
@@ -179,6 +181,8 @@ export function createOotleReadbackProvider(reader: AuthoritativeSubstateReader,
       const read = await readEnvelope(address, 'ItemOffer');
       if (read.status === 'UNAVAILABLE') return { status: 'UNAVAILABLE', reason: read.reason };
       const e = read.value;
+      const parsedStatus = parseStatus(field(e, 'status'), ITEM_OFFER_STATUSES, 'item-offer');
+      if (!parsedStatus.ok) return { status: 'UNAVAILABLE', reason: parsedStatus.reason };
       return {
         status: 'FOUND',
         value: {
@@ -190,7 +194,7 @@ export function createOotleReadbackProvider(reader: AuthoritativeSubstateReader,
           amount: field(e, 'amount'),
           createdAtEpoch: field(e, 'created_at_epoch'),
           expiresAtEpoch: field(e, 'expires_at_epoch'),
-          status: normalizeStatus(field(e, 'status'), ['ACTIVE', 'ACCEPTED', 'CANCELLED', 'EXPIRED'], 'ACTIVE'),
+          status: parsedStatus.value,
         },
         freshness: read.freshness,
       };
@@ -199,6 +203,8 @@ export function createOotleReadbackProvider(reader: AuthoritativeSubstateReader,
       const read = await readEnvelope(address, 'CollectionBid');
       if (read.status === 'UNAVAILABLE') return { status: 'UNAVAILABLE', reason: read.reason };
       const e = read.value;
+      const parsedStatus = parseStatus(field(e, 'status'), COLLECTION_BID_STATUSES, 'collection-bid');
+      if (!parsedStatus.ok) return { status: 'UNAVAILABLE', reason: parsedStatus.reason };
       return {
         status: 'FOUND',
         value: {
@@ -213,7 +219,7 @@ export function createOotleReadbackProvider(reader: AuthoritativeSubstateReader,
           remainingEscrow: field(e, 'remaining_escrow'),
           createdAtEpoch: field(e, 'created_at_epoch'),
           expiresAtEpoch: field(e, 'expires_at_epoch'),
-          status: normalizeStatus(field(e, 'status'), ['ACTIVE', 'PARTIALLY_FILLED', 'FILLED', 'CANCELLED', 'EXPIRED'], 'ACTIVE'),
+          status: parsedStatus.value,
         },
         freshness: read.freshness,
       };
@@ -226,8 +232,25 @@ function optionalField(e: EnvelopeInput, name: string): string | undefined {
   return raw === undefined || raw === null ? undefined : String(raw);
 }
 
-function normalizeStatus<T extends string>(raw: string, allowed: T[], fallback: T): T {
-  return (allowed as string[]).includes(raw) ? (raw as T) : fallback;
+/**
+ * Parse a component's status field WITHOUT a default.
+ *
+ * The previous helper normalised any unrecognized status string to the most
+ * permissive value (`ACTIVE`), so a malformed, future, or tampered readback
+ * reporting `"active"`, `"OPEN"`, or `"PENDING_SETTLEMENT"` would present an
+ * unknown component state as executable. The authoritative outcome is still the
+ * chain's (the template re-asserts its own status), but the readback boundary —
+ * whose entire job is to refuse states it cannot vouch for — must never
+ * normalise toward execution. An unrecognized status is therefore UNAVAILABLE,
+ * the same typed outcome as any other unreadable component.
+ */
+function parseStatus<T extends string>(raw: string, allowed: readonly T[], what: string): { ok: true; value: T } | { ok: false; reason: string } {
+  if ((allowed as readonly string[]).includes(raw)) return { ok: true, value: raw as T };
+  return { ok: false, reason: `Authoritative read reports an unrecognized ${what} status ${JSON.stringify(raw)} — refusing to normalize an unknown state toward execution` };
 }
+
+const LISTING_STATUSES = ['ACTIVE', 'SOLD', 'CANCELLED', 'EXPIRED'] as const;
+const ITEM_OFFER_STATUSES = ['ACTIVE', 'ACCEPTED', 'CANCELLED', 'EXPIRED'] as const;
+const COLLECTION_BID_STATUSES = ['ACTIVE', 'PARTIALLY_FILLED', 'FILLED', 'CANCELLED', 'EXPIRED'] as const;
 
 
