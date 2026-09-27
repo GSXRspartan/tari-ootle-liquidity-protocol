@@ -1415,6 +1415,7 @@ test('F-02: the signing gate requires a frozen review, and the requirement is as
     review.walletRequest.transaction.legs[0].args[0].amountRaw = '999999999';
   }, TypeError);
   assert.equal(review.walletRequest.transaction.legs[0].args[0].amountRaw, '1000000');
+});
 
 // ===========================================================================
 // 8. PROVIDER LIVENESS (deadlines, and what must NOT have one)
@@ -1472,6 +1473,4 @@ test('provider liveness: a read that answers in time is unaffected by the deadli
   const view = await tari.fetchNetwork(good);
   assert.equal(view.network, 'esmeralda');
   assert.equal(view.epoch, '7');
-});
-
 });

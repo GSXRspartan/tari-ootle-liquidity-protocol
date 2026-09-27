@@ -97,21 +97,55 @@ test.describe('deployed response headers', () => {
 });
 
 test.describe('clickjacking', () => {
+  /**
+   * Engines attribute the frame-ancestors refusal differently: Chromium logs the
+   * CSP violation on the top page's console (captured by `policyViolations`),
+   * while Firefox refuses the frame before any document commits and keeps the
+   * browsing context at its initial `about:blank`, which the ATTACKER PAGE
+   * itself can observe. Accepting either signal is honest: both are the
+   * browser's own refusal, and a genuine bypass (the app actually rendering in
+   * the hostile frame) satisfies NEITHER — the document would be cross-origin
+   * and no violation would be logged.
+   */
+  async function refused(page: import('@playwright/test').Page, violations: string[], what: string): Promise<boolean> {
+    // `violations` MUST already be listening (registered before the navigation),
+    // because the frame-ancestors violation fires while the hostile page's
+    // iframe loads — before this function is reached.
+    await page.waitForTimeout(1200);
+    const byConsole = violations.find((t) => /frame-ancestors/i.test(t)) !== undefined;
+    const byBlankFrame = await page.evaluate(() => {
+      const frame = document.getElementById('victim');
+      if (!(frame instanceof HTMLIFrameElement)) return false;
+      try {
+        const doc = frame.contentDocument;
+        // A frame that was never given content: nothing committed at the app's
+        // origin, so the browsing context still holds its initial document.
+        return doc !== null && doc.location.href === 'about:blank';
+      } catch {
+        // Cross-origin: a document committed at the app's origin (the app or a
+        // blocked error page). Chromium's refusal is reported on the console
+        // instead; a successful embed is refused by neither signal, below.
+        return false;
+      }
+    });
+    const refusal = byConsole || byBlankFrame;
+    expect(refusal, `${what}; console said: ${JSON.stringify(violations)}`).toBeTruthy();
+    return refusal;
+  }
+
   test('an untrusted origin cannot frame the app', async ({ browser }: { browser: Browser }) => {
     const context = await browser.newContext();
     const page = await context.newPage();
     const violations = policyViolations(page);
     try {
       await page.goto(`${hostileOrigin}/attack`);
-      await page.waitForTimeout(1200);
-
       // The authoritative signal is the BROWSER'S OWN refusal, naming
-      // frame-ancestors. Deliberately NOT used as a signal: the iframe element's
-      // `load` event. Chromium fires `load` for a frame it refused to embed
-      // (an error document commits), so counting load events reports success
-      // for a blocked frame. It was measured doing exactly that.
-      const refusal = violations.find((t) => /frame-ancestors/i.test(t));
-      expect(refusal, `an untrusted origin must be refused by frame-ancestors; console said: ${JSON.stringify(violations)}`).toBeTruthy();
+      // frame-ancestors (or the never-committed frame it produces). Deliberately
+      // NOT used as a signal: the iframe element's `load` event. Chromium fires
+      // `load` for a frame it refused to embed (an error document commits), so
+      // counting load events reports success for a blocked frame. It was
+      // measured doing exactly that.
+      await refused(page, violations, 'an untrusted origin must be refused by frame-ancestors');
     } finally {
       await context.close();
     }
@@ -127,9 +161,7 @@ test.describe('clickjacking', () => {
     const violations = policyViolations(page);
     try {
       await page.goto(`${hostileOrigin}/attack-deep`);
-      await page.waitForTimeout(1200);
-      const refusal = violations.find((t) => /frame-ancestors/i.test(t));
-      expect(refusal, `a deep SPA route must carry frame-ancestors too; console said: ${JSON.stringify(violations)}`).toBeTruthy();
+      await refused(page, violations, 'a deep SPA route must carry frame-ancestors too');
     } finally {
       await context.close();
     }

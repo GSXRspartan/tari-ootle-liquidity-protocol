@@ -302,3 +302,35 @@ matrix (PC-63, PC-64, PC-65).
   was deliberately NOT asserted across swaps: value legitimately leaves the pool
   to traders, so the exact statement is the per-operation proportional bound plus
   k-monotonicity, not a global per-share inequality.
+
+---
+
+## 10. Fifth-pass addendum: what the CI run taught that local green could not
+
+Pushing the branch and watching CI for the first time in a day surfaced four
+facts that local verification could not, which is the strongest argument in this
+repository for treating CI as the arbiter rather than a formality:
+
+1. **Two test files carried the same structural corruption** — a test callback
+   opened and never closed, nesting every following test inside an unawaited
+   synchronous parent. Node 24 (the local runner) waits for outstanding subtests,
+   so both suites were locally green; Node 20 (CI) cancelled them. Fixed in
+   `amm_parity.test.cjs` and `hostile-frontend.test.cjs` (matrix PC-67).
+2. **The per-job CI split dropped an implicit build ordering** — the previous
+   single sequential job built `protocol-client`'s dist as a side effect of
+   running first; standalone jobs typecheck against a fresh checkout, where
+   `dist/` does not exist. Each job now builds its workspace dependencies
+   explicitly, and the web job builds the production bundle before its node
+   suites, several of which assert the shipped artifacts.
+3. **The frontend overflowed under CI's wider font metrics** — an uncapped grid
+   track, `nowrap` metric values, and unbreakable tokens in notices/hints pushed
+   the pool page 11px past a 390px viewport and the pools page 17px past 360px.
+   Fixed with `minmax(0, 1fr)` tracks, wrappable metric values, and
+   `overflow-wrap: anywhere` on notice/hint/mono text, with a regression that
+   forces the wide-font condition on any machine (matrix PC-67 residual).
+4. **The frame-ancestors refusal signal is Chromium-shaped** — Firefox refuses
+   the frame before any document commits and does not surface the CSP violation
+   on the top page's console, so the clickjacking test reported a bypass while
+   the control worked. The assertion now accepts either the console violation or
+   an attacker-visible never-committed frame; a genuine embed satisfies neither
+   (matrix PC-68).
