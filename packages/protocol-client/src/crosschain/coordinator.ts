@@ -537,7 +537,12 @@ export async function revealAndClaimL2(input: { sessionId: string; ports: Coordi
 
 /** Opposite-leg claim (L1 by the provider/taker after the preimage is observable). */
 export async function claimL1(input: { sessionId: string; preimage: string; ports: CoordinatorPorts }): Promise<LegFundOutcome> {
-  const record = await requireState(input.sessionId, input.ports, ['CLAIMING', 'RECOVERY_REQUIRED', 'CLAIMED']);
+  // RECOVERY_REQUIRED is deliberately NOT accepted here (cross-layer invariant 14: recovery
+  // is absorbing and never auto-resumes execution). Accepting it used to submit the claim
+  // and THEN throw on the unrecordable CLAIM_ACKNOWLEDGED transition, so the durable record
+  // lost the claim tx id and a retry had no idempotency key. A session in recovery must be
+  // explicitly resolved (RECOVERY_RESOLVED) into CLAIMING first.
+  const record = await requireState(input.sessionId, input.ports, ['CLAIMING', 'CLAIMED']);
   if (input.ports.l1.capabilities && !input.ports.l1.capabilities().l1ShaClaim) {
     return { outcome: 'REFUSED', reason: 'L1 wallet cannot claim SHA atomic-swap outputs (capability l1ShaClaim unavailable)' };
   }
@@ -545,6 +550,12 @@ export async function claimL1(input: { sessionId: string; preimage: string; port
     // Idempotent: a claim already exists for this session; reconcile it.
     const status = await input.ports.l1.lookupTransaction(record.l1ClaimTxId);
     return { outcome: status === 'COMMITTED' ? 'SUBMITTED' : 'UNKNOWN', txId: record.l1ClaimTxId };
+  }
+  if (record.state === 'CLAIMED') {
+    // A CLAIMED session is terminal: there is no transition that could record a new claim
+    // acknowledgement, so submitting one would throw AFTER the irreversible submission and
+    // strand the evidence. Reconcile by durable id instead of creating an unrecordable claim.
+    return { outcome: 'UNKNOWN', reason: 'session is CLAIMED with no recorded L1 claim id — reconcile by durable id; a new submission could not be recorded' };
   }
   // Never submit a preimage that does not hash to the bound hash (real hashlock refusal).
   requireHashHBound(record);

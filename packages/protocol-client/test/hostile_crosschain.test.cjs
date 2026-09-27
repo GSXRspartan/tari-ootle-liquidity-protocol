@@ -667,6 +667,54 @@ test('12.3 claimL1 is idempotent, never double-submits, and refuses a wrong prei
   assert.equal((await ports.sessions.get('sessAlpha1')).l1ClaimTxId, 'claim_tx_1', 'the same claim tx id is retained — no second claim was created');
 });
 
+test('12.4 claimL1 from RECOVERY_REQUIRED is refused BEFORE any submission — recovery must be resolved first', async () => {
+  // Regression (Pixel Canary second pass): RECOVERY_REQUIRED used to be in claimL1's
+  // allowed set. A submission there succeeded on the port and THEN threw on the
+  // unrecordable CLAIM_ACKNOWLEDGED transition, so the claim tx id was never persisted and
+  // a retry had no idempotency key (a blind double submission).
+  const l1 = makeL1();
+  const submissions = [];
+  const realSubmitClaim = l1.submitClaim;
+  l1.submitClaim = async (...args) => { submissions.push(args); return realSubmitClaim(...args); };
+  // drive to CLAIM_ARMED, then lose the L2 claim response → RECOVERY_REQUIRED
+  const ports = await driveToArmed({ l1, l2Cfg: { claimError: 'transport lost after submission' } });
+  await coord.revealAndClaimL2({ sessionId: 'sessAlpha1', ports, env: ENV_ON, deadlineSafety: DEADLINE_OK, unsafeAllowAssertedDeadlines: true });
+  assert.equal((await ports.sessions.get('sessAlpha1')).state, 'RECOVERY_REQUIRED');
+  await assert.rejects(
+    () => coord.claimL1({ sessionId: 'sessAlpha1', preimage: S_HEX, ports }),
+    /expected one of CLAIMING/,
+    'claimL1 must refuse a session in recovery before touching the network',
+  );
+  assert.equal(submissions.length, 0, 'no L1 claim may be submitted from RECOVERY_REQUIRED');
+  // the explicit path still works: resolve recovery into CLAIMING, then claim
+  const recovered = await ports.sessions.get('sessAlpha1');
+  await ports.sessions.save(sessionMod.applyEvent(recovered, { kind: 'RECOVERY_RESOLVED', resolution: 'CLAIMING' }));
+  const claim = await coord.claimL1({ sessionId: 'sessAlpha1', preimage: S_HEX, ports });
+  assert.equal(claim.outcome, 'SUBMITTED', 'after an explicit recovery resolution the claim is submittable');
+  assert.equal(submissions.length, 1, 'exactly one claim submission across the whole recovery flow');
+});
+
+test('12.5 claimL1 on a CLAIMED session without a recorded claim id reconciles instead of submitting', async () => {
+  // Regression (Pixel Canary second pass): a terminal CLAIMED session has no transition that
+  // could record a new claim acknowledgement, so a submission there would throw AFTER the
+  // irreversible act and strand the evidence.
+  const l1 = makeL1();
+  const submissions = [];
+  const realSubmitClaim = l1.submitClaim;
+  l1.submitClaim = async (...args) => { submissions.push(args); return realSubmitClaim(...args); };
+  const ports = makePorts({ l1 });
+  await ports.sessions.save({
+    sessionId: 'sessAlpha1', state: 'CLAIMED', quoteId: 'q', reservationId: 'resAlpha1', providerId: 'prov_1', direction: 'XTM_TO_TARI',
+    xtmRawAmount: '10000', tariRawAmount: '5000000', hashH: H_OF_S, l1ClaimRecipient: 'a', l2ClaimRecipient: 'b',
+    l1Network: 'esmeralda', l2Network: 'esmeralda', l1RefundDeadlineHeight: '16000', l2RefundDeadlineEpoch: '1200',
+    requiredL1Confirmations: '3', createdAtUnixMs: 1, updatedAtUnixMs: 1, l1TxId: 'tx1', l2TxId: 'tx2',
+  });
+  const r = await coord.claimL1({ sessionId: 'sessAlpha1', preimage: S_HEX, ports });
+  assert.equal(r.outcome, 'UNKNOWN', 'a terminal session must reconcile, not submit');
+  assert.match(r.reason, /CLAIMED with no recorded L1 claim id/);
+  assert.equal(submissions.length, 0, 'no L1 claim may be submitted from a terminal state');
+});
+
 // ===========================================================================
 // 13. RESERVATION RACE ATTACKS
 // ===========================================================================
