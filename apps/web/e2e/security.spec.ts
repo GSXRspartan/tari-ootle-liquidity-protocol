@@ -255,6 +255,25 @@ test('the mobile layout has no horizontal overflow at 390px', async ({ page }) =
   expect(overflow).toBeLessThanOrEqual(1);
 });
 
+test('the mobile layout still has no overflow under wider font metrics', async ({ page }) => {
+  // Regression (Pixel Canary fourth pass, CI finding): CI's Linux headless
+  // Chromium falls back to wider system fonts than a developer machine, which
+  // pushed a `nowrap` market-header metric past the viewport and overflowed the
+  // page by 11px. Forcing a wide font stack here reproduces that environment on
+  // any machine, so the fix (capped grid tracks + wrappable metric values) is
+  // verified against the failure condition itself, not just the happy fonts.
+  await page.setViewportSize({ width: 390, height: 844 });
+  await mockIndexer(page);
+  await page.addInitScript(() => {
+    const style = document.createElement('style');
+    style.textContent = ':root { --font-sans: "Liberation Sans", "DejaVu Sans", "Arial", sans-serif; letter-spacing: 0.04em; }';
+    document.addEventListener('DOMContentLoaded', () => document.head.append(style));
+  });
+  await open(page, `/pools/${POOL_COMPONENT}`);
+  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+  expect(overflow).toBeLessThanOrEqual(1);
+});
+
 test('the desktop layout has no horizontal overflow at 1440px', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
   await mockIndexer(page);

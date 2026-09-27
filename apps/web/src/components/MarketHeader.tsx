@@ -20,7 +20,10 @@ function Metric({ label, value, title, tone }: { label: string; value: string; t
   return (
     <div className="stack" style={{ gap: 2, minWidth: 0 }}>
       <span className="label">{label}</span>
-      <span className={`num ${tone ?? ''}`.trim()} style={{ fontSize: 'var(--text-lg)', fontWeight: 600, whiteSpace: 'nowrap' }} title={title}>
+      {/* No `white-space: nowrap`: a value wider than its grid track must wrap
+          (breaking at the unit boundary), never widen the page. The track itself
+          is capped by `minmax(0, 1fr)` in the stylesheet. */}
+      <span className={`num ${tone ?? ''}`.trim()} style={{ fontSize: 'var(--text-lg)', fontWeight: 600, overflowWrap: 'anywhere' }} title={title}>
         {value}
       </span>
     </div>

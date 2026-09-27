@@ -101,6 +101,10 @@ textarea {
   font-family: var(--font-mono);
   font-size: 0.92em;
   letter-spacing: -0.01em;
+  /* Component addresses, tx ids, and doc paths are single unbreakable "words"
+     that can exceed a narrow viewport; without this they overflow the page
+     instead of wrapping (observed on CI's wider font metrics). */
+  overflow-wrap: anywhere;
 }
 
 .truncate {
@@ -148,6 +152,9 @@ textarea {
   color: var(--text-3);
   font-size: var(--text-sm);
   line-height: 1.45;
+  /* Hints carry env-var names, addresses, and doc paths — single long tokens
+     that must wrap on a narrow viewport, never widen the page. */
+  overflow-wrap: anywhere;
 }
 
 .up {
@@ -510,7 +517,11 @@ textarea {
 .grid-4 {
   display: grid;
   gap: var(--s-3);
-  grid-template-columns: 1fr;
+  /* minmax(0, 1fr), never bare 1fr: `auto` as the minimum lets a `nowrap` metric
+     value widen the track past the viewport on systems whose font metrics run
+     wider than the developer's (CI's Linux headless Chromium did exactly that).
+     The content cap belongs to the track, not to the page. */
+  grid-template-columns: minmax(0, 1fr);
   min-width: 0;
 }
 
@@ -589,6 +600,10 @@ textarea {
   background: var(--surface-2);
   font-size: var(--text-md);
   line-height: 1.5;
+  /* Notice copy carries untrusted-length reason strings — outage reasons,
+     capability names, doc paths. A single long token must wrap, never widen
+     the page (observed on CI's wider font metrics). */
+  overflow-wrap: anywhere;
 }
 
 .notice--warn {
