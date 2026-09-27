@@ -122,14 +122,7 @@ the CI job that owns them (`PC-10`) rather than being claimed green locally.
 
 ## Totals
 
-| Result | Count | IDs |
-| --- | --- | --- |
-| `PASS` | 34 | PC-11, PC-12, PC-13..PC-19, PC-20..PC-27, PC-28..PC-34, PC-36, PC-47, PC-48, PC-50, PC-52, PC-53, PC-55, PC-56, PC-60..PC-62 |
-| `FIXED` | 16 | PC-01..PC-08, PC-35, PC-43..PC-46, PC-57..PC-59 |
-| `N/A_BY_CONSTRUCTION` | 1 | PC-49 |
-| `EXTERNAL_RISK` | 4 | PC-38, PC-42, PC-51, PC-54 |
-| `BLOCKED_EXTERNAL` | 3 | PC-09, PC-37, PC-39 |
-| `BLOCKED_TOOLING` | 3 | PC-10, PC-40, PC-41 |
+*(Maintained at the end of the file, after section J, so the counts reflect every pass.)*
 
 ---
 
@@ -179,17 +172,43 @@ state, rather than taken from `security/CROSS_LAYER_ATTACK_MATRIX.md`.
 | PC-61 | cross-layer | Treat a lost submission response as failure and resubmit | A claim or refund whose response never arrives | `CLAIM_UNKNOWN` → `FAILED` → resubmit | UNKNOWN is never failure; it forces reconciliation | `TRANSITIONS`: `CLAIM_UNKNOWN` and `REFUND_UNKNOWN` both lead to `RECOVERY_REQUIRED`, and no terminal state has an outgoing edge | PASS | CRITICAL | — | Recovery is user- and wallet-driven |
 | PC-62 | cross-layer | Re-drive a session after a crash, or let recovery silently resume the happy path | A crash at any point, or a hostile recovery record | Restart into a non-terminal state and re-run irreversible steps, or resolve recovery into `CLAIMING` | Terminal states are terminal; recovery is absorbing and never auto-resumes execution | `TRANSITIONS`: `CLAIMED` / `REFUNDED` / `FAILED_TERMINAL` have no outgoing edges and `RECOVERY_REQUIRED` only self-loops through `RECOVERY_RESOLVED`; hostile fuzz "a crash after every step never lets recovery re-drive a terminal session or blind-resubmit" (re-executed) | PASS | CRITICAL | — | A user must explicitly continue; that is the intended friction |
 
+---
 
+## J. Fourth-pass findings (irreversible-act bookkeeping, LP sequences, readback status)
 
+These rows come from continuing the whole-protocol review past the second and
+third passes: attacking the *record-keeping around irreversible acts* (a class
+that produces no fund loss but destroys the evidence recovery depends on), and
+re-deriving LP conservation across operation **sequences** rather than single
+transactions.
 
+| ID | Subsystem | Attack | Prerequisite | Exploit sequence | Invariant | Evidence | Result | Severity | Fix | Residual risk |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| PC-63 | cross-layer / bookkeeping | Submit an L1 claim from a state that cannot record it | `claimL1` accepted sessions in `RECOVERY_REQUIRED` (and a `CLAIMED` session with no recorded claim id) | Enter `RECOVERY_REQUIRED` (lost L2-claim response) → call `claimL1` → the port submits the claim → `applyEvent(CLAIM_ACKNOWLEDGED)` finds no edge from `RECOVERY_REQUIRED` and throws AFTER the irreversible submission → the claim tx id is never persisted → a retry has no idempotency key and attempts a second submission | A submission must never be followed by an unrecordable transition; recovery is resolved explicitly before execution resumes (invariant 14) | `crosschain/coordinator.ts` `claimL1`; `hostile_crosschain.test.cjs` → "12.4 claimL1 from RECOVERY_REQUIRED is refused BEFORE any submission", "12.5 claimL1 on a CLAIMED session without a recorded claim id reconciles instead of submitting" | FIXED | MEDIUM | `RECOVERY_REQUIRED` removed from the allowed set (resolve recovery first); a `CLAIMED` session without a claim id reconciles instead of submitting | The L1 claim is credited to the accept-time recipient either way, and the chain refuses a duplicate spend, so the exposure was lost evidence and a blind retry — not theft |
+| PC-64 | multi-hop | A route policy mode that looks like protection and protects nothing | `AmmSwapPolicy.intermediateAmount = ABORT_AND_PAUSE` | The previous check compared the settled amount with ITSELF (the settlement proof it came from) — always equal, so the mode never fired and a deviating settlement built silently | A policy mode must either enforce something real or refuse to build | `multihop/hops.ts` step 4; `multihop_hostile.test.cjs` → "4.5 ABORT_AND_PAUSE compares the settled amount against the ROUTE expectation, and refuses to build without one" | FIXED | LOW | `expectedIntermediateRaw` added to the policy; deviation → `REQUOTE_REQUIRED`; selecting the mode without an expectation is refused instead of degrading to no-policy | The expectation must be supplied by the route layer at composition time (compose.ts now documents it) |
+| PC-65 | LP accounting | Value extraction across a multi-step operation SEQUENCE (swap/add/remove interleaved with fee accrual) | Any LP and trader mix | 200 randomised sequences of 12 interleaved steps; each step re-derived from the template semantics with exact BigInt floor arithmetic | After every step: (1) `k` never decreases across a swap; (2) an add mints at most the weaker proportional side and a removal pays at most the floor-proportional claim (both checked by cross-multiplication before the reserves mutate); (3) reserves never go negative or empty while supply remains | `amm_model.test.cjs` → "multi-step sequences keep per-share backing monotone and never strand remaining LPs" (independent model — the implementation is not used as its own oracle) | PASS | HIGH | — | The model mirrors the template's integer semantics; on-chain execution evidence remains CI-only (PC-10) |
+| PC-66 | protocol / readback boundary | An unrecognized authoritative status is normalised to the most permissive value | A malformed, future-version, or tampered readback reports a status string outside the known set (e.g. `"active"`, `"PENDING_SETTLEMENT"`) | `normalizeStatus(..., fallback: 'ACTIVE')` turned any unknown status into `ACTIVE` → the resolvers' `status !== 'ACTIVE'` guards passed → the user is presented an executable route for a component state the client cannot vouch for (the on-chain template still refuses, so the outcome is a signed transaction that always aborts, not theft) | A readback boundary must never normalise an unknown state toward execution | `ootle.ts` `parseStatus`; `amm.test.cjs` → "readback provider refuses an unrecognized status instead of normalizing it toward execution" (hostile statuses × listing/offer/bid, plus every legitimate status still parses) | FIXED | MEDIUM | Unrecognized status → typed `UNAVAILABLE` with the reason; no fallback default exists any more | The chain remains the final authority either way; this closes the client-side presentation gap |
 
-| **Total rows** | **62** | PC-01..PC-62, sequential, no gaps |
+---
+
+## Totals (updated by the fourth pass)
+
+| Result | Count | IDs |
+| --- | --- | --- |
+| `PASS` | 36 | PC-11, PC-12, PC-13..PC-19, PC-20..PC-27, PC-28..PC-34, PC-36, PC-47, PC-48, PC-50, PC-52, PC-53, PC-55, PC-56, PC-60..PC-62, PC-65 |
+| `FIXED` | 19 | PC-01..PC-08, PC-35, PC-43..PC-46, PC-57..PC-59, PC-63, PC-64, PC-66 |
+| `N/A_BY_CONSTRUCTION` | 1 | PC-49 |
+| `EXTERNAL_RISK` | 4 | PC-38, PC-42, PC-51, PC-54 |
+| `BLOCKED_EXTERNAL` | 3 | PC-09, PC-37, PC-39 |
+| `BLOCKED_TOOLING` | 3 | PC-10, PC-40, PC-41 |
+| **Total rows** | **66** | PC-01..PC-66, sequential, no gaps |
 | `UNKNOWN` | **0** | — |
 
 Open **CRITICAL**: **0**. Open **HIGH** that are code-fixable: **0**. Open HIGH
 that are external: `PC-37` / `PC-09` (R-1, blocked on deployment credentials),
 `PC-38` (wallet connector mechanism, blocked on upstream source), and `PC-39`
-(Ootle unreachable).
+(Ootle unreachable). `PC-65` is classified HIGH as an attack *target* whose
+result is PASS — the invariant held; it is not an open finding.
 
 
 

@@ -106,7 +106,8 @@ from nowhere — and, more importantly, `AppContext` never supplies a
 ever stored in the browser at all**. The protocol-client market-data subsystem
 is complete and tested; the application has not connected it, and the UI does
 not say so. These are honesty defects rather than security ones, and they are
-recorded because "the
+recorded because "the code implies a capability it does not have" is how a
+future reader gets hurt.
 
 ---
 
@@ -165,6 +166,14 @@ for a client that constructs financial transactions. The exceptions found:
   (`MarketDataService` receives `readback: undefined` until a wallet connects).
   Chart data is therefore absent rather than unverified — fail-closed for
   correctness, fail-open for usefulness, and the correct trade.
+- **An unrecognized authoritative status used to normalize to `ACTIVE`**
+  (`ootle.ts` `normalizeStatus`), the most permissive value at the one boundary
+  whose job is to refuse unvouchable state. Fixed in the fourth pass
+  (matrix PC-66): an unknown status is now typed `UNAVAILABLE` with the reason,
+  and no default fallback exists. The on-chain template was never reachable
+  through this gap (it re-asserts its own status), but the signed transaction it
+  would have produced could only abort — a defect of presentation, not of
+  settlement, and closed rather than tolerated.
 
 
 ---
@@ -256,4 +265,40 @@ from scratch — this is a deliberate boundary, not an oversight.
    the buyer keeps them), and not changed here because the fix is a wallet-side
    authority decision rather than a client bug.
 
-code implies a capability it does not have" is how a future reader gets hurt.
+---
+
+## 9. Fourth-pass addendum (irreversible-act bookkeeping, and LP sequences)
+
+Two further findings from continuing the review past the second and third
+passes; both are fixed with retained regressions and classified in the attack
+matrix (PC-63, PC-64, PC-65).
+
+- **A submission may never be followed by an unrecordable transition.**
+  `claimL1` accepted sessions in `RECOVERY_REQUIRED`, where the state machine has
+  no `CLAIM_ACKNOWLEDGED` edge: an L1 claim submitted there succeeded on the port
+  and then threw, so the durable record lost the claim id and a retry had no
+  idempotency key. Recovery must now be explicitly resolved into `CLAIMING`
+  first, and a `CLAIMED` session without a recorded claim id reconciles instead
+  of submitting. No fund loss was possible (the claim credits the accept-time
+  recipient and the chain refuses a duplicate spend), but the failure class —
+  "irreversible act, then a bookkeeping throw that erases the evidence" — is
+  exactly the one this architecture exists to prevent, which is why it is fixed
+  rather than merely recorded.
+
+- **A policy mode that enforces nothing must refuse to build.**
+  `AmmSwapPolicy`'s `ABORT_AND_PAUSE` compared the settled amount against the
+  settlement proof it came from — always equal — so the mode silently protected
+  nothing. It now compares against an explicit `expectedIntermediateRaw`
+  (the route quote's hop-2 input) and refuses the build when the mode is
+  selected without an expectation. The general lesson for this codebase: a
+  fail-open branch behind a safety-sounding name is worse than no branch, because
+  it survives review by looking like the control it replaced.
+
+- **LP conservation is now asserted across sequences, not just round trips.**
+  `amm_model.test.cjs` adds an independent multi-step model (swap/add/remove
+  interleaved with fee accrual, 200 × 12 steps, exact BigInt floor arithmetic)
+  asserting k-monotonicity per swap, proportional bounds per add/remove by
+  cross-multiplication, and non-empty reserves. Per-share backing monotonicity
+  was deliberately NOT asserted across swaps: value legitimately leaves the pool
+  to traders, so the exact statement is the per-operation proportional bound plus
+  k-monotonicity, not a global per-share inequality.
