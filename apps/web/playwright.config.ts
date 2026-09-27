@@ -56,7 +56,7 @@ export default defineConfig({
   // assertions. Workers are capped so the suite degrades predictably rather
   // than timing out under contention.
   workers: process.env.CI ? 2 : 2,
-  reporter: process.env.CI ? [['list'], ['html', { open: 'never', outputFolder: 'test-results/html' }]] : 'list',
+  reporter: process.env.CI ? [['list'], ['html', { open: 'never', outputFolder: 'playwright-report/html' }]] : 'list',
   timeout: 60_000,
   // Generous, because these assertions wait for the ABSENCE of a state (a
   // disabled control, a silent console), which requires the page to settle.

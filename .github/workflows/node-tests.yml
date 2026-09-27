@@ -118,11 +118,19 @@ jobs:
           pnpm --filter @tari-ootle/protocol-client run build
           pnpm --filter @tari-ootle/wallet-adapter run build
 
-      - name: web typecheck + tests
-        run: pnpm --filter @tari-ootle/web run typecheck && pnpm --filter @tari-ootle/web run test
+      - name: web typecheck
+        run: pnpm --filter @tari-ootle/web run typecheck
 
+      # Several node suites assert the PRODUCTION artifacts (dist/_headers, the
+      # source-map policy, the shipped bundle's import surface), so the build
+      # must exist before the tests run — in the previous single-job layout the
+      # same ordering constraint was invisible because dist/ already existed on
+      # the developer machine.
       - name: web production build
         run: pnpm --filter @tari-ootle/web run build
+
+      - name: web tests
+        run: pnpm --filter @tari-ootle/web run test
 
       # A build-time existence check is not a delivery guarantee: it proves the file was
       # emitted, not that a host served it. R-1 stays open until the deployed origin is
