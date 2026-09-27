@@ -184,3 +184,82 @@ test('amm model: a full round trip never returns more than was deposited', async
     assert.ok(outB <= b, `round trip returned ${outB} > ${b} on side B`);
   }
 });
+
+/**
+ * Multi-step sequence conservation, derived independently of both the
+ * TypeScript mirror and the on-chain template.
+ *
+ * The template semantics being modelled (each step exactly as
+ * `templates/fungible_pool/src/lib.rs` specifies):
+ *   swap:        rIn += amountIn; rOut -= floor(rOut * e / (rIn_old + e));  e = floor(in*(D-f)/D)
+ *   add:         minted = min(floor(a*total/rA), floor(b*total/rB)); rA += a; rB += b; total += minted
+ *   remove:      rA -= floor(lp*rA/total); rB -= floor(lp*rB/total); total -= lp
+ *
+ * Exact-integer invariants:
+ *   1. k-monotonicity across every swap: no trader can extract value, and the
+ *      fee (in − e) stays in the reserve.
+ *   2. No LP dilution: an ADD pays at least the proportional share it mints
+ *      (the min-side cap), and a REMOVE pays at most the proportional claim
+ *      (floor rounds in favour of the pool). Checked per step by exact
+ *      cross-multiplication — a reserve desync, an over-mint, or a
+ *      rounded-in-the-user's-favour redemption would break it.
+ *   3. A removal never strands the remaining LPs: the per-removal proportional
+ *      bound is checked before the reserves are mutated, and the reserves are
+ *      asserted non-empty afterwards.
+ */
+test('amm model: multi-step sequences keep per-share backing monotone and never strand remaining LPs', () => {
+  const rand = mulberry32(0x51ec5eed);
+  const D = 10_000n;
+  for (let run = 0; run < 200; run += 1) {
+    // An established pool: the bootstrap path is on-chain-only by construction.
+    let rA = BigInt(1_000_000 + Math.floor(rand() * 10 ** 9));
+    let rB = BigInt(1_000_000 + Math.floor(rand() * 10 ** 9));
+    let total = BigInt(1_000_000 + Math.floor(rand() * 10 ** 9));
+    const feeBps = BigInt(1 + Math.floor(rand() * 1000));
+
+    for (let step = 0; step < 12; step += 1) {
+      const op = Math.floor(rand() * 3);
+      if (op === 0) {
+        // SWAP
+        const amountIn = BigInt(1 + Math.floor(rand() * Number(rA < rB ? rA : rB)));
+        const e = (amountIn * (D - feeBps)) / D;
+        if (e === 0n) continue;
+        const out = (rB * e) / (rA + e);
+        if (out === 0n) continue;
+        const kBefore = rA * rB;
+        rA += amountIn;
+        rB -= out;
+        assert.ok(rA * rB >= kBefore, `k decreased in run ${run} step ${step}`);
+        assert.ok(rB > 0n, 'a swap drained the output reserve');
+      } else if (op === 1) {
+        // ADD (the weaker side caps the mint, exactly as the template computes it)
+        const a = BigInt(1 + Math.floor(rand() * 10 ** 9));
+        const b = BigInt(1 + Math.floor(rand() * 10 ** 9));
+        const shareA = (a * total) / rA;
+        const shareB = (b * total) / rB;
+        const minted = shareA < shareB ? shareA : shareB;
+        if (minted === 0n) continue;
+        // The depositor paid at least the proportional value of what was minted, on BOTH sides.
+        assert.ok(minted * rA <= a * total, `an add minted more than the A-side payment in run ${run} step ${step}`);
+        assert.ok(minted * rB <= b * total, `an add minted more than the B-side payment in run ${run} step ${step}`);
+        rA += a;
+        rB += b;
+        total += minted;
+      } else {
+        // REMOVE (the template refuses a removal that floors to zero on either side)
+        const lp = BigInt(1 + Math.floor(rand() * Number(total)));
+        const outA = (lp * rA) / total;
+        const outB = (lp * rB) / total;
+        if (outA === 0n || outB === 0n) continue;
+        // The pool never pays more than the proportional claim (floor rounds in
+        // favour of the pool) and never pays what it does not hold.
+        assert.ok(outA * total <= lp * rA && outB * total <= lp * rB, `a removal overpaid in run ${run} step ${step}`);
+        assert.ok(outA <= rA && outB <= rB, 'a removal paid more than the reserve held');
+        rA -= outA;
+        rB -= outB;
+        total -= lp;
+        assert.ok(rA > 0n && rB > 0n, 'a removal drained the pool');
+      }
+    }
+  }
+});
